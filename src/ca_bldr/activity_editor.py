@@ -1,0 +1,4015 @@
+import logging
+import time
+import re
+
+from typing import Sequence, Optional
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import (
+    TimeoutException,
+    WebDriverException,
+    StaleElementReferenceException,
+    NoSuchElementException,
+)
+
+from .errors import TableResizeError, FieldPropertiesSidebarTimeout
+from .session import CASession
+from .activity_registry import ActivityRegistry
+from .field_handles import FieldHandle
+from .field_types import FIELD_TYPES
+from .field_configs import (
+    BaseFieldConfig,
+    QuestionFieldConfig,
+    ParagraphConfig,
+    LongAnswerConfig,
+    TableConfig,
+    ShortAnswerConfig,
+    FileUploadConfig,
+    SignatureConfig,
+    DatePickerConfig,
+    LearnerVisibility,
+    AssessorVisibility,
+    MarkingType,
+    TableCellConfig,
+    SingleChoiceConfig,
+)
+from .. import config
+
+FIELD_ID_SUFFIX_RE = re.compile(r"--(\d+)$")
+
+FIELD_CAPS = {
+    "paragraph": {
+        "assessor_visibility_update": False,
+        "required": False,
+        "marking_type": False,
+        "model_answer": False,
+        "assessor_comments": False,
+    },
+    # question-like fields
+    "long_answer": {"assessor_visibility_update": True, "required": True, "marking_type": True, "model_answer": True, "assessor_comments": True},
+    "short_answer": {"assessor_visibility_update": True, "required": True, "marking_type": True, "model_answer": True, "assessor_comments": True},
+    "file_upload": {"assessor_visibility_update": True, "required": True, "marking_type": True, "model_answer": False, "assessor_comments": True},
+    "interactive_table": {"assessor_visibility_update": True, "required": False, "marking_type": True, "model_answer": False, "assessor_comments": False},
+    "signature": {"assessor_visibility_update": True, "required": True, "marking_type": False, "model_answer": False, "assessor_comments": False},
+    "date_field": {"assessor_visibility_update": True, "required": True, "marking_type": False, "model_answer": False, "assessor_comments": False},
+    # default for other question blocks (e.g. single_choice)
+    "question": {"assessor_visibility_update": True, "required": True, "marking_type": True, "model_answer": True, "assessor_comments": True},
+    "unknown": {"assessor_visibility_update": True, "required": True, "marking_type": True, "model_answer": True, "assessor_comments": True},
+}
+
+PROBE_PRESENT = "present"
+PROBE_MISSING = "missing"
+PROBE_UNKNOWN = "unknown"
+
+
+class ActivityEditor:
+    """
+    Edit/update functionality for an *existing* activity on the builder page.
+    This assumes you're already on the Activity Builder screen for a given activity.
+    """
+
+    def __init__(self, session: CASession, registry: ActivityRegistry):
+        """
+        :param session: CASession instance
+        """
+        self.session = session
+        self.driver = session.driver
+        self.wait = session.wait
+        self.logger = session.logger
+        self.registry = registry
+
+        self.ui_state_recovery_count = 0
+
+        self._skip_events: list[dict] = []
+
+    # -------- Field discovery --------
+    
+    def get_field_id_from_element(self, field_el) -> Optional[str]:
+        """
+        Infer the CloudAssess field id (like '27432871') from known id patterns
+        inside a field element.
+
+        Now hardened against stale field_el: if the element is stale, we try to
+        re-locate the currently-selected field and extract the id from there.
+        """
+        logger = self.logger
+
+        def _extract_from_root(root_el):
+            # Try model-answer id first
+            try:
+                model_block = root_el.find_element(
+                    By.CSS_SELECTOR,
+                    "[id^='designer__field__model-answer-description--']",
+                )
+                mid = model_block.get_attribute("id") or ""
+                m = FIELD_ID_SUFFIX_RE.search(mid)
+                if m:
+                    return m.group(1)
+            except NoSuchElementException:
+                pass
+
+            # Fall back to main description id
+            try:
+                desc_block = root_el.find_element(
+                    By.CSS_SELECTOR,
+                    "[id^='designer__field__description--']",
+                )
+                did = desc_block.get_attribute("id") or ""
+                m = FIELD_ID_SUFFIX_RE.search(did)
+                if m:
+                    return m.group(1)
+            except NoSuchElementException:
+                pass
+
+            return None
+
+        # First attempt: use the element we were given
+        try:
+            field_id = _extract_from_root(field_el)
+            if field_id:
+                return field_id
+        except StaleElementReferenceException:
+            logger.debug(
+                "Field element became stale while extracting field id; "
+                "attempting to re-locate selected field."
+            )
+
+        # Second attempt: re-locate the currently selected field in the canvas
+        try:
+            driver = self.driver
+            # Adjust selector if needed: this assumes a selected field has a distinct class
+            selected_root = driver.find_element(
+                By.CSS_SELECTOR,
+                ".designer__field.designer__field--active, .designer__field--selected",
+            )
+            field_id = _extract_from_root(selected_root)
+            if field_id:
+                return field_id
+        except (NoSuchElementException, StaleElementReferenceException) as e:
+            logger.error("Could not re-locate selected field after stale reference: %s", e)
+
+        logger.debug("Could not infer field id for field element.")
+        return None
+    
+    def get_field_by_id(self, field_id: str):
+        """
+        Re-find a field element by its CA field id on the canvas.
+        Assumes the correct section is already active.
+        """
+        driver = self.driver
+
+        # Find any element with an id suffix matching this field_id,
+        # then climb up to the .designer__field root.
+        el = driver.find_element(
+            By.CSS_SELECTOR,
+            f"#section-fields [id$='--{field_id}']",
+        )
+        return el.find_element(
+            By.XPATH,
+            "./ancestor::div[contains(@class,'designer__field')]",
+        )
+
+    def get_fields(self, field_selector: str):
+        """
+        Generic helper: return all fields matching a CSS selector.
+        Typically used with section-scoped selectors, e.g.
+        '#section-fields .designer__field.designer__field--text_area'
+        """
+        elems = self.driver.find_elements(By.CSS_SELECTOR, field_selector)
+        self.logger.info(f"Found {len(elems)} fields with selector '{field_selector}'.")
+        return elems
+
+    def get_last_field(self, field_selector: str):
+        """
+        Generic: get the last field matching selector.
+        Raises TimeoutException if none exist.
+        """
+        elems = self.get_fields(field_selector)
+        if not elems:
+            raise TimeoutException(f"No fields found with selector '{field_selector}'.")
+        last = elems[-1]
+        self.logger.info("Using last field for editing.")
+        return last
+    
+
+    def get_last_field_for_type(self, field_key: str):
+        """
+        Get the last field for the given type key (e.g. 'paragraph', 'long_answer')
+        using that type's canvas_field_selector.
+        """
+        spec = FIELD_TYPES[field_key]
+        return self.get_last_field(spec.canvas_field_selector)
+    
+
+    def get_fields_for_type(self, field_key: str):
+        """
+        Return a list of all fields for the given type (paragraph, long_answer,
+        short_answer, file_upload, etc.) in the *currently selected section*.
+
+        Uses the type's canvas_field_selector, which should already be
+        scoped to '#section-fields'.
+        """
+        spec = FIELD_TYPES[field_key]
+        return self.get_fields(spec.canvas_field_selector)
+
+    def get_nth_field_for_type(self, field_key: str, index: int):
+        """
+        Return the nth field (0-based) of the given type in the current section,
+        or None if index is out of range.
+        """
+        fields = self.get_fields_for_type(field_key)
+        if 0 <= index < len(fields):
+            self.logger.info(
+                f"Using index {index} of {len(fields)} for type '{field_key}'."
+            )
+            return fields[index]
+        self.logger.warning(
+            f"Index {index} out of range for type '{field_key}' "
+            f"(found {len(fields)} fields)."
+        )
+        return None
+
+    def find_field_by_title(
+        self,
+        field_key: str,
+        title_text: str,
+        *,
+        exact: bool = True,
+    ):
+        """
+        Find the first field of the given type whose title matches title_text.
+        - If exact=True, match title text exactly.
+        - If exact=False, do a case-insensitive substring match.
+        """
+        fields = self.get_fields_for_type(field_key)
+        target = title_text.strip()
+        target_lower = target.lower()
+
+        for field in fields:
+            try:
+                title_el = field.find_element(
+                    By.CSS_SELECTOR,
+                    ".designer__field__editable-label--title"
+                )
+                actual = (title_el.text or "").strip()
+                if exact:
+                    if actual == target:
+                        self.logger.info(
+                            f"Matched '{field_key}' field with exact title '{actual}'."
+                        )
+                        return field
+                else:
+                    if target_lower in actual.lower():
+                        self.logger.info(
+                            f"Matched '{field_key}' field with partial title '{actual}'."
+                        )
+                        return field
+            except Exception:
+                continue
+
+        self.logger.warning(
+            f"No '{field_key}' field found with title '{title_text}' "
+            f"(exact={exact})."
+        )
+        return None
+    
+    def get_field_title(self, field_el) -> str | None:
+        """
+        Return the visible title text for a field element, or None if not found.
+        """
+        try:
+            container = field_el.find_element(
+                By.CSS_SELECTOR,
+                ".designer__field__editable-label--title",
+            )
+            title_el = container.find_element(
+                By.CSS_SELECTOR,
+                "h2.field__editable-label",
+            )
+            txt = (title_el.text or "").strip()
+            return txt or None
+        except NoSuchElementException:
+            return None
+        except Exception:
+            self.logger.debug("Could not read field title from element.", exc_info=True)
+            return None
+
+    def try_get_field_id_strict(self, field_el) -> Optional[str]:
+        """
+        Strict id extraction for snapshot/diff logic.
+        Never falls back to '.designer__field--selected' because that can lie during DOM churn.
+        """
+        try:
+            # reuse the internal logic but without the selected-field fallback
+            # (copy the _extract_from_root inner helper from get_field_id_from_element)
+            def _extract_from_root(root_el):
+                try:
+                    model_block = root_el.find_element(By.CSS_SELECTOR, "[id^='designer__field__model-answer-description--']")
+                    mid = model_block.get_attribute("id") or ""
+                    m = FIELD_ID_SUFFIX_RE.search(mid)
+                    if m:
+                        return m.group(1)
+                except NoSuchElementException:
+                    pass
+
+                try:
+                    desc_block = root_el.find_element(By.CSS_SELECTOR, "[id^='designer__field__description--']")
+                    did = desc_block.get_attribute("id") or ""
+                    m = FIELD_ID_SUFFIX_RE.search(did)
+                    if m:
+                        return m.group(1)
+                except NoSuchElementException:
+                    pass
+
+                return None
+
+            return _extract_from_root(field_el)
+        except StaleElementReferenceException:
+            return None
+        except Exception:
+            return None
+        
+    def _observed_field_id_from_settings_frame(self, frame: WebElement) -> str | None:
+        """
+        Extract the field id that the field_settings_frame is currently bound to.
+
+        DO NOT regex innerHTML - it frequently contains multiple /fields/<id> entries
+        (especially for tables), leading to false binding proofs.
+        """
+        try:
+            # Best signal: ajax-input-value url (radio/checkbox/select controls)
+            # Example: /revisions/<rev>/sections/<sid>/fields/<fid>.turbo_stream?field_type=...
+            els = frame.find_elements(By.CSS_SELECTOR, "[data-ajax-input-value-url-value*='/fields/']")
+            for el in els:
+                url = el.get_attribute("data-ajax-input-value-url-value") or ""
+                m = re.search(r"/fields/(\d+)\.turbo_stream\b", url)
+                if m:
+                    return m.group(1)
+
+            # Secondary: sometimes forms/buttons carry a data-url / formaction style attribute
+            for attr in ("data-url", "formaction", "href"):
+                els = frame.find_elements(By.CSS_SELECTOR, f"[{attr}*='/fields/']")
+                for el in els:
+                    url = el.get_attribute(attr) or ""
+                    m = re.search(r"/fields/(\d+)\.turbo_stream\b", url)
+                    if m:
+                        return m.group(1)
+
+            # Fallback: turbo-frame src (if present)
+            src = frame.get_attribute("src") or ""
+            m = re.search(r"/fields/(\d+)\.turbo_stream\b", src)
+            if m:
+                return m.group(1)
+
+            return None
+        except Exception:
+            return None
+        
+    def _reset_canvas_ui_state(self) -> None:
+        """
+        Best-effort: collapse Froala tooltips/overlays and exit any active editor.
+        Cheap + safe to call repeatedly.
+        """
+        driver = self.driver
+        try:
+            driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
+        # Click a neutral canvas area (not inside the table) to defocus cell editors.
+        try:
+            canvas = driver.find_element(By.CSS_SELECTOR, "#section-fields")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", canvas)
+            canvas.click()
+        except Exception:
+            pass
+            
+    # -------- Generic Field configuration --------
+    def configure_field_from_config(
+        self,
+        handle: FieldHandle,
+        config: BaseFieldConfig,
+        last_successful_handle: FieldHandle | None,
+        prop_fault_inject: bool = False,
+    ) -> None:
+        """
+        Apply a FieldConfig dataclass to an existing Activity Builder field.
+
+        This method is the main “edit” entry-point: it locates the field on the
+        canvas using the provided FieldHandle, then applies any non-None settings
+        from the config object.
+
+        Key behaviour / ordering
+        ------------------------
+        1) Locate the field element:
+        - Uses handle.field_id to resolve the field's root WebElement on the canvas.
+        - If needed, derives the field_id from the element for downstream calls.
+
+        2) Generic content:
+        - title (config.title) -> set_field_title()
+        - body_html (config.body_html) -> set_field_body()
+
+        3) Type-specific structure (before properties):
+        - Interactive table: when handle.field_type_key == "interactive_table"
+            and config is a TableConfig, applies table structure/overrides via
+            _configure_table_from_config() BEFORE toggling properties.
+
+        - Signature: when handle.field_type_key == "signature" and config is a
+            SignatureConfig, derives signature-specific visibility/required values
+            via _set_signature_config_specifics().
+
+        4) Visibility / marking / switches:
+        - Applies report visibility and role visibility:
+            hide_in_report, learner_visibility, assessor_visibility
+        - Applies question properties when present:
+            required, marking_type
+        - Applies toggle switches when present:
+            enable_model_answer (derived True when model_answer_html is not None),
+            enable_assessor_comments
+        - Only calls set_field_properties() if at least one of these values is
+            non-None (meaning “change requested”).
+
+        5) Model answer content (if enabled):
+        - If model_answer_html is provided and a field_id is known, injects model
+            answer HTML via set_field_model_answer(field_id, model_answer_html).
+
+        Convention
+        ----------
+        Any attribute that is None means “do not change this setting”.
+
+        Parameters
+        ----------
+        handle:
+            FieldHandle describing the target field (field_id, field_type_key, and
+            any other identifying metadata captured when the field was created or
+            discovered on the canvas).
+        config:
+            BaseFieldConfig instance (or subclass such as ParagraphConfig,
+            LongAnswerConfig, TableConfig, SignatureConfig). Only non-None attributes
+            are applied.
+
+        Raises
+        ------
+        TypeError
+            If config is not an instance of BaseFieldConfig.
+        """
+
+        def _cleanup_canvas() -> WebElement:
+            self._reset_canvas_ui_state()
+            fresh = self.get_field_by_id(handle.field_id)
+            try:
+                self._ensure_field_active(fresh)
+            except Exception:
+                pass
+            return fresh     
+
+        if not isinstance(config, BaseFieldConfig):
+            raise TypeError(
+                f"config must be a BaseFieldConfig, got {type(config).__name__}"
+            )
+
+        # Paragraph fields cannot be assessor update in CA.
+        if isinstance(config, ParagraphConfig) and config.assessor_visibility == "update":
+            config.assessor_visibility = "read"
+
+        field_el = self.get_field_by_id(handle.field_id)
+        pivot_el = None
+        if last_successful_handle and last_successful_handle.section_id == handle.section_id:
+            try:
+                # Only pivot within the same section to avoid cross-section lookup failures
+                pivot_el = self.get_field_by_id(last_successful_handle.field_id)
+            except Exception:
+                pivot_el = None
+
+        # --- 1) Generic title + body ---------------------------------------
+        if config.title is not None:
+            self.set_field_title(field_el, config.title)
+            # field_el = _cleanup_canvas()
+
+        if config.body_html is not None:
+            self.set_field_body(field_el, config.body_html)
+            self._probe_body_persistence(
+                field_id=handle.field_id,
+                field_el=field_el,
+                desired_html=config.body_html,
+                phase="pre-props",
+                allow_refind=True,
+            )
+            field_el = _cleanup_canvas()
+
+        # --- 2) Configure Interactive table structure BEFORE properties ----------
+        if handle.field_type_key == "interactive_table" and isinstance(config, TableConfig):
+            try:
+                self._configure_table_from_config(field_el, config)
+            except Exception as e:
+                self._record_config_skip(
+                    kind="configure",
+                    reason=f"table configure exception: {type(e).__name__}: {e}",
+                    retryable=True,
+                    field_id=handle.field_id,
+                    field_title=config.title,
+                    requested={"field_type_key": handle.field_type_key},
+                )
+                raise                
+            self.logger.debug("Interactive table: %r configured.", config.title)
+            field_el = _cleanup_canvas()
+
+        if handle.field_type_key =="single_choice" and isinstance(config, SingleChoiceConfig):
+            try:
+                self._configure_single_choice_answers(field_el, config.options, config.correct_index)
+            except Exception as e:
+                self._record_config_skip(
+                    kind="configure",
+                    reason=f"single choice configure exception: {type(e).__name__}: {e}",
+                    retryable=True,
+                    field_id=handle.field_id,
+                    field_title=config.title,
+                    requested={"field_type_key": handle.field_type_key},
+                )
+                raise
+            field_el = _cleanup_canvas()
+
+        # --- 3) Visibility + marking properties ----------------------------
+        # Question-like configs extend BaseFieldConfig with these attributes.
+        required = getattr(config, "required", None)
+        marking_type = getattr(config, "marking_type", None)
+        model_answer_html = getattr(config, "model_answer_html", None)
+        enable_assessor_comments = getattr(config, "enable_assessor_comments", None)
+
+        field_el = self.get_field_by_id(handle.field_id)
+        field_id = handle.field_id or self.get_field_id_from_element(field_el)
+
+        # --- 4) Set signature specifics ------------------------
+        if handle.field_type_key == "signature" and isinstance(config, SignatureConfig):
+            learner_visibility, assessor_visibility, sig_required = self._set_signature_config_specifics(config)
+            # Update config with derived values
+            config.learner_visibility = learner_visibility
+            config.assessor_visibility = assessor_visibility
+            required = sig_required
+
+        # Bug out early if we are skipping the property setting because of debug fault injector
+        if prop_fault_inject:
+            return
+
+        # --- Derive "enable_model_answer": ---
+        enable_model_answer = None
+
+        if model_answer_html is not None:
+            enable_model_answer = True
+
+        self.logger.info(f"Switch values: enable_model_answer={enable_model_answer}, enable_assessor_comments={enable_assessor_comments}")
+
+        # Only call set_field_properties if we have *something* to set.
+        if any(
+            value is not None
+            for value in (
+                config.hide_in_report,
+                config.learner_visibility,
+                config.assessor_visibility,
+                required,
+                marking_type,
+                enable_assessor_comments,
+                model_answer_html,
+            )
+        ):
+            self.set_field_properties(
+                field_el,
+                pivot_el,
+                hide_in_report=config.hide_in_report,
+                learner_visibility=config.learner_visibility,
+                assessor_visibility=config.assessor_visibility,
+                required=required,
+                marking_type=marking_type,
+                enable_model_answer=enable_model_answer,
+                enable_assessor_comments=enable_assessor_comments,
+            )
+
+        # 5) Model answer content (canvas Froala)
+        if model_answer_html and field_id:
+            try:
+                self.set_field_model_answer(field_id, model_answer_html)
+            except TimeoutException:
+                self.logger.warning(
+                    "Could not re-locate field after applying properties; "
+                    "skipping model answer configuration."
+                )
+                return
+            except Exception as e:
+                self.logger.warning(f"Error retreiving last field: {e}")
+            return
+        
+        self._verify_body_after_properties_and_recover_once(
+            handle=handle,
+            desired_html=config.body_html,
+        )
+
+    # ---------- title ----------
+
+    def set_field_title(self, field_el, title_text: str) -> None:
+        logger = self.logger
+        desired = self._norm_text(title_text)
+
+        if desired == "":
+            return
+
+        fid = None
+        try:
+            fid = self.get_field_id_from_element(field_el)
+        except Exception:
+            fid = None
+
+        def _refresh_field_el():
+            nonlocal field_el
+            if fid:
+                try:
+                    fresh = self.get_field_by_id(fid)
+                    if fresh is not None:
+                        field_el = fresh
+                except Exception:
+                    pass
+
+        def _read_display_title() -> str:
+            try:
+                h2 = field_el.find_element(By.CSS_SELECTOR, ".designer__field__editable-label--title h2.field__editable-label")
+                return self._norm_text(h2.text or "")
+            except Exception:
+                return ""
+
+        def _read_input_value_if_present() -> str:
+            try:
+                inp = field_el.find_element(By.CSS_SELECTOR, ".designer__field__editable-label--title input[name='title']")
+                if inp.is_displayed():
+                    return self._norm_text(inp.get_attribute("value") or "")
+            except Exception:
+                pass
+            return ""
+
+        # Fast path
+        try:
+            if _read_display_title() == desired:
+                logger.debug("Field title already correct (%r); skipping title set.", desired)
+                return
+        except Exception:
+            pass
+
+        last_err: Exception | None = None
+
+        for attempt in range(1, 4):
+            try:
+                _refresh_field_el()
+
+                title_display = field_el.find_element(
+                    By.CSS_SELECTOR,
+                    ".designer__field__editable-label--title h2.field__editable-label"
+                )
+
+                logger.info("Setting field title (attempt %d/3): %r", attempt, desired)
+
+                # Activate editor
+                if not self.session.click_element_safely(title_display):
+                    title_display.click()
+
+                # Find the input directly (no closure variable)
+                title_input = field_el.find_element(
+                    By.CSS_SELECTOR,
+                    ".designer__field__editable-label--title input[name='title']"
+                )
+
+                WebDriverWait(self.driver, 2.0).until(lambda d: title_input.is_displayed() and title_input.is_enabled())
+
+                try:
+                    title_input.clear()
+                except Exception:
+                    title_input.send_keys(Keys.CONTROL, "a")
+                    title_input.send_keys(Keys.BACKSPACE)
+
+                title_input.send_keys(title_text)
+                title_input.send_keys(Keys.TAB)
+
+                # Verification: prefer input value if still present; else read the display title
+                _refresh_field_el()
+                observed = _read_input_value_if_present() or _read_display_title()
+
+                if observed == desired:
+                    logger.info("Field title verified: %r", desired)
+                    return
+
+                logger.warning(
+                    "Field title not applied after attempt %d/3 (wanted=%r got=%r).",
+                    attempt, desired, observed
+                )
+
+                # Cleanly exit any half-open editor before retry
+                try:
+                    ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                except Exception:
+                    pass
+
+                time.sleep(0.2)
+
+            except Exception as e:
+                last_err = e
+                logger.warning("Field title set attempt %d/3 failed: %s", attempt, e)
+
+                try:
+                    ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                except Exception:
+                    pass
+
+                time.sleep(0.2)
+                _refresh_field_el()
+
+        msg = f"title set failed after retries (wanted={desired!r})"
+        if last_err is not None:
+            msg += f": {type(last_err).__name__}: {last_err}"
+
+        logger.warning("Could not set field title: %s", msg)
+
+        self._record_config_skip(
+            kind="configure",
+            reason=msg,
+            retryable=True,
+            field_id=fid,
+            field_title=title_text,
+            requested={"title": title_text},
+        )
+
+    # ---------- body (Froala) ----------
+    # ---------- Froala helpers ----------
+
+    def _wait_turbo_idle(self, timeout: float = 3.0) -> bool:
+        """
+        Best-effort: wait for Turbo to not be busy.
+        This is not perfect, but it helps us avoid verifying during hydration.
+        """
+        driver = self.driver
+        end = time.time() + timeout
+        last = None
+
+        while time.time() < end:
+            try:
+                data = driver.execute_script(
+                    """
+                    const busyFrames = document.querySelectorAll('turbo-frame[busy]').length;
+                    const progress = !!document.querySelector('[data-turbo-progress-bar], .turbo-progress-bar');
+                    return {busyFrames: busyFrames, progress: progress};
+                    """
+                ) or {}
+                last = data
+                if int(data.get("busyFrames", 0)) == 0 and not bool(data.get("progress", False)):
+                    return True
+            except Exception:
+                pass
+
+            time.sleep(0.08)
+
+        self.logger.debug("Turbo idle wait timed out (last=%r).", last)
+        return False
+
+    def _read_froala_block_state(
+        self,
+        field_el,
+        *,
+        block_selector: str,
+        textarea_selector: str,
+    ) -> dict:
+        """
+        JS-first read of editor.innerHTML and textarea.value (if present).
+        Returns: {ok, editorHtml, textareaVal, reason}
+        """
+        driver = self.driver
+        script_get = """
+        const field = arguments[0];
+        const blockSelector = arguments[1];
+        const textareaSelector = arguments[2];
+
+        if (!field) return {ok:false, reason:'no_field'};
+
+        const block = field.querySelector(blockSelector);
+        if (!block) return {ok:false, reason:'no_block'};
+
+        const container = block.querySelector('.designer__field__editable-label__container') || block;
+        const editor = container.querySelector('.fr-element.fr-view[contenteditable="true"]');
+        if (!editor) return {ok:false, reason:'no_editor'};
+
+        const taPrimary = container.querySelector(textareaSelector);
+
+        // broader fallback: any textarea named description within the whole field
+        const taAny = field.querySelector("textarea[name='description']");
+
+        // helper to describe textarea
+        function taInfo(ta) {
+        if (!ta) return null;
+        const attrs = {};
+        for (const a of ta.attributes) {
+            if (a && a.name) attrs[a.name] = a.value;
+        }
+        return {
+            value: ta.value || "",
+            id: ta.id || null,
+            name: ta.getAttribute("name") || null,
+            classes: ta.className || "",
+            attrs: attrs
+        };
+        }
+
+        return {
+        ok: true,
+        editorHtml: editor.innerHTML || "",
+        textareaPrimary: taInfo(taPrimary),
+        textareaAny: taInfo(taAny),
+        };
+        """
+        try:
+            return driver.execute_script(script_get, field_el, block_selector, textarea_selector) or {}
+        except Exception as e:
+            return {"ok": False, "reason": f"exec_error:{type(e).__name__}"}
+        
+    def _read_description_block_state(self, field_el) -> dict:
+        """
+        Convenience: read the 'description' Froala block (Paragraph/Long Answer body, etc.)
+        using the default selectors used in set_field_body().
+        """
+        return self._read_froala_block_state(
+            field_el,
+            block_selector=(
+                ".designer__field__editable-label--description"
+                "[id^='designer__field__description--']"
+            ),
+            textarea_selector=(
+                "textarea[name='description']"
+                # "textarea.froala-editor[name='description']"
+                # "[data-froala-save-source-value*='field_type=description']"
+            ),
+        )
+    
+    def _probe_body_persistence(
+        self,
+        *,
+        field_id: str | None,
+        field_el=None,
+        desired_html: str | None,
+        phase: str,
+        allow_refind: bool = True,
+        turbo_idle_timeout: float = 3.0,
+        tries: int = 3,
+    ) -> str:
+        """
+        Probe whether desired_html's signature is currently present in the Froala description block.
+        Tri-state probe for Froala description block.
+
+        Returns one of:
+        - PROBE_PRESENT: signature seen (editor or textarea) on a fresh node
+        - PROBE_MISSING: signature not seen on a fresh node
+        - PROBE_UNKNOWN: couldn't read reliably (stale / no editor / turbo churn)
+        """
+        logger = self.logger
+
+        if desired_html is None:
+            return PROBE_PRESENT  # nothing to check
+
+        desired_sig = self._froala_sig(str(desired_html))
+        if not desired_sig:
+            return PROBE_PRESENT  # empty segnature means nothing to check
+
+        last_reason = None
+
+        for attempt in range(1, tries + 1):
+            # Always prefer refind by id to beat Turbo swaps
+            if allow_refind and field_id:
+                try:
+                    field_el = self.get_field_by_id(field_id)
+                except Exception as e:
+                    last_reason = f"refind:{type(e).__name__}"
+                    field_el = field_el  # keep what we had
+
+            if field_el is None:
+                last_reason = "no_field_el"
+                time.sleep(0.12)
+                continue
+
+            self._wait_turbo_idle(timeout=turbo_idle_timeout)
+
+            try:
+                state = self._read_description_block_state(field_el)
+            except StaleElementReferenceException:
+                last_reason = "stale_field_el"
+                time.sleep(0.12)
+                continue
+            except Exception as e:
+                last_reason = f"read_exc:{type(e).__name__}"
+                time.sleep(0.12)
+                continue
+
+            if not state.get("ok"):
+                last_reason = state.get("reason") or "read_not_ok"
+                time.sleep(0.12)
+                continue
+
+            ta_primary = (state.get("textareaPrimary") or {}).get("value") if state.get("textareaPrimary") else None
+            ta_any = (state.get("textareaAny") or {}).get("value") if state.get("textareaAny") else None
+            source = "ta_primary" if ta_primary is not None else "ta_any" if ta_any is not None else "editor"
+            ed_html = state.get("editorHtml") or ""
+
+            if ta_primary is not None:
+                present = desired_sig in self._froala_sig(ta_primary)
+            elif ta_any is not None:
+                present = desired_sig in self._froala_sig(ta_any)
+            else:
+                present = desired_sig in self._froala_sig(ed_html)
+
+            if present:
+                logger.debug(
+                    "Body probe (%s): present (field_id=%r sig=%r attempt=%d source=%s).",
+                    phase, field_id, desired_sig, attempt, source
+                )
+                return PROBE_PRESENT
+
+            # We successfully read a fresh node and it's not there => definite missing
+            ed_len = len(ed_html)
+
+            ta_present = (ta_primary is not None) or (ta_any is not None)
+            ta_val = ta_primary if ta_primary is not None else ta_any
+            ta_len = len(ta_val) if isinstance(ta_val, str) else None
+
+            logger.warning(
+                "Body probe (%s): MISSING (field_id=%r sig=%r attempt=%d) "
+                "source=%s ta_present=%s ta_len=%s ed_len=%d",
+                phase,
+                field_id,
+                desired_sig,
+                attempt,
+                source,        # <-- which source we evaluated
+                ta_present,    # <-- did we find ANY textarea
+                ta_len,        # <-- length of the textarea value we checked (if any)
+                ed_len,        # <-- editor html length
+            )
+            return PROBE_MISSING
+
+        # never got a reliable read
+        logger.debug(
+            "Body probe (%s): UNKNOWN (field_id=%r sig=%r last_reason=%r).",
+            phase, field_id, desired_sig, last_reason
+        )
+        return PROBE_UNKNOWN
+    
+    def _verify_body_after_properties_and_recover_once(
+        self,
+        *,
+        handle,
+        desired_html: str | None,
+    ) -> None:
+        """
+        Post-properties guard: if body was lost, re-apply once to stabilize the build,
+        while still leaving a clear warning trail in logs.
+        """
+        if desired_html is None:
+            return
+
+        fid = getattr(handle, "field_id", None)
+
+        result = self._probe_body_persistence(
+            field_id=fid,
+            desired_html=desired_html,
+            phase="post-props",
+            allow_refind=True,
+            tries=3,
+        )
+
+        if result == PROBE_PRESENT:
+            return
+
+        if result == PROBE_UNKNOWN:
+            # Don't “fix” on uncertainty – that hides real causes and adds churn.        
+            self.logger.warning(
+                "Post-props body probe unknown (field_id=%r). Skipping recovery.",
+                fid,
+            )
+            return
+        
+        # only here if definite
+        self.logger.warning(
+            "Body LOST after properties (definite) field_id=%r. Re-applying body once.",
+            fid,
+        )        
+
+        # Re-apply and let _set_froala_block do its persisted+verified routine
+        field_el = self.get_field_by_id(fid) if fid else None
+        self.set_field_body(field_el, desired_html)
+
+        # signature used for containment checks (Froala normalizes HTML)
+    def _froala_sig(self,s: str, max_len: int = 60) -> str:
+        """
+        Normalize HTML/text to a small stable signature for containment checks.
+        Froala/CA may normalize tags/whitespace, so we compare a text signature.
+        """
+        s = (s or "").strip()
+        s = re.sub(r"<[^>]+>", "", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s[:max_len]
+
+    def audit_bodies_now(
+        self,
+        expected_by_field_id: dict[str, str],
+        *,
+        label: str = "end-audit",
+        max_report: int = 50,
+    ) -> dict:
+        """
+        Re-find each field_id and read its description Froala block *now*.
+        Returns summary dict and logs missing/mismatched bodies.
+
+        expected_by_field_id: {field_id: expected_html}
+        """
+        logger = self.logger
+        self._wait_turbo_idle(timeout=5.0)
+
+        missing = []
+        unknown = []
+        ok = 0
+
+        def sig_full(html: str) -> str:
+            # stronger signature than 60 chars to avoid collisions
+            txt = re.sub(r"<[^>]+>", "", (html or ""))
+            txt = re.sub(r"\s+", " ", txt).strip()
+            # include length + head/tail
+            if not txt:
+                return "0:"
+            head = txt[:80]
+            tail = txt[-40:] if len(txt) > 120 else ""
+            return f"{len(txt)}:{head}|{tail}"
+
+        for field_id, expected_html in expected_by_field_id.items():
+            exp_sig = sig_full(expected_html)
+
+            try:
+                field_el = self.get_field_by_id(field_id)
+            except Exception as e:
+                unknown.append((field_id, f"refind:{type(e).__name__}"))
+                continue
+
+            state = self._read_description_block_state(field_el)
+            if not state.get("ok"):
+                unknown.append((field_id, state.get("reason") or "read_failed"))
+                continue
+
+            act_sig = sig_full(state.get("editorHtml") or state.get("textareaVal") or "")
+
+            if exp_sig == act_sig:
+                ok += 1
+                continue
+
+            # treat empty as missing
+            if act_sig.startswith("0:"):
+                missing.append((field_id, exp_sig, act_sig))
+            else:
+                missing.append((field_id, exp_sig, act_sig))
+
+        # Log summary
+        logger.info(
+            "Body audit (%s): ok=%d missing=%d unknown=%d total=%d",
+            label, ok, len(missing), len(unknown), len(expected_by_field_id)
+        )
+
+        # Log details (bounded)
+        for field_id, exp_sig, act_sig in missing[:max_report]:
+            logger.warning("Body audit (%s): MISMATCH field_id=%s exp=%r act=%r", label, field_id, exp_sig, act_sig)
+
+        for field_id, reason in unknown[:max_report]:
+            logger.debug("Body audit (%s): UNKNOWN field_id=%s reason=%r", label, field_id, reason)
+
+        return {"ok": ok, "missing": missing, "unknown": unknown}
+
+    def _set_froala_block(
+        self,
+        field_el,
+        block_selector: str,
+        textarea_selector: str,
+        html: str,
+        log_label: str = "Froala block",
+    ) -> None:
+        """
+        Robust Froala setter with *persistence* verification.
+
+        Guarantees we only log success after:
+        1) JS inject + commit events
+        2) Turbo idle (best effort)
+        3) Re-find field by id and re-read content (survives stale swap)
+        """
+        driver = self.driver
+        wait = self.wait
+        logger = self.logger
+
+        if html is None:
+            return
+
+        desired = str(html)
+
+        desired_sig = self._froala_sig(desired)
+        if desired_sig == "":
+            return
+
+        fid = None
+        try:
+            fid = self.get_field_id_from_element(field_el)
+        except Exception:
+            fid = None
+
+        def _refind_field():
+            nonlocal field_el
+            if fid:
+                try:
+                    fresh = self.get_field_by_id(fid)
+                    if fresh is not None:
+                        field_el = fresh
+                except Exception:
+                    pass
+
+        def _contains_signature(state: dict) -> bool:
+            if not state or not state.get("ok"):
+                return False
+            editor_html = state.get("editorHtml") or ""
+            textarea_val = state.get("textareaVal") or ""
+            editor_sig = self._froala_sig(editor_html)
+            textarea_sig = self._froala_sig(textarea_val)
+            # Accept if signature shows in either editor DOM or textarea backing store.
+            return (desired_sig in editor_sig) or (desired_sig in textarea_sig)
+
+        script_set = """
+            const field = arguments[0];
+            const value = arguments[1];
+            const blockSelector = arguments[2];
+            const textareaSelector = arguments[3];
+
+            if (!field) return {ok:false, reason:'no_field'};
+
+            const block = field.querySelector(blockSelector);
+            if (!block) return {ok:false, reason:'no_block'};
+
+            const container = block.querySelector('.designer__field__editable-label__container') || block;
+
+            // Prefer textarea as the authoritative "save source"
+            const ta = container.querySelector(textareaSelector);
+
+            // If Froala instance exists, use its API (more likely to trigger CA wiring)
+            let froalaEditor = null;
+            try {
+              if (window.jQuery && ta) {
+                const inst = window.jQuery(ta).data('froala.editor');
+                if (inst) froalaEditor = inst;
+              }
+            } catch (e) {}
+
+            // Editor element for event dispatch / visual state
+            const editorEl = container.querySelector('.fr-element.fr-view[contenteditable="true"]');
+            if (!editorEl) return {ok:false, reason:'no_editor'};
+
+            if (froalaEditor) {
+              try {
+                froalaEditor.html.set(value);
+                froalaEditor.events.trigger('contentChanged');
+                froalaEditor.events.trigger('keyup');
+              } catch (e) {}
+            } else {
+              editorEl.innerHTML = value;
+            }
+
+            // Placeholder cleanup (cosmetic but also avoids "empty" heuristics)
+            const wrapper = editorEl.closest('.fr-wrapper');
+            if (wrapper && wrapper.classList.contains('show-placeholder')) {
+              wrapper.classList.remove('show-placeholder');
+            }
+            const placeholder = wrapper ? wrapper.querySelector('.fr-placeholder') : null;
+            if (placeholder) placeholder.style.display = 'none';
+
+            // Update textarea backing store if present
+            if (ta) {
+              ta.value = value;
+
+              // Mimic other CA inputs: keyup reflect + keydown enter save + blur save fallback
+              try { ta.dispatchEvent(new Event('input', {bubbles:true})); } catch(e) {}
+              try { ta.dispatchEvent(new Event('change', {bubbles:true})); } catch(e) {}
+              try { ta.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true})); } catch(e) {}
+              try { ta.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', keyCode:13, which:13, bubbles:true})); } catch(e) {}
+              try { ta.dispatchEvent(new FocusEvent('blur', {bubbles:true})); } catch(e) {}
+            }
+
+            // Also dispatch on editorEl (some wiring listens here)
+            try { editorEl.dispatchEvent(new Event('input', {bubbles:true})); } catch(e) {}
+            try { editorEl.dispatchEvent(new Event('change', {bubbles:true})); } catch(e) {}
+            try { editorEl.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true})); } catch(e) {}
+            try { editorEl.dispatchEvent(new FocusEvent('blur', {bubbles:true})); } catch(e) {}
+
+            // If we had Froala instance, explicitly blur it (often commits on blur)
+            if (froalaEditor) {
+              try { froalaEditor.events.trigger('blur'); } catch(e) {}
+              try { froalaEditor.$el && froalaEditor.$el.blur && froalaEditor.$el.blur(); } catch(e) {}
+            }
+
+            return {ok:true, reason:'set'};
+        """
+
+        # Wait for block/editor presence (but don't rely on element stability beyond that)
+        def _block_and_editor_present(_):
+            try:
+                block = field_el.find_element(By.CSS_SELECTOR, block_selector)
+                _ = block.find_element(By.CSS_SELECTOR, ".fr-element.fr-view[contenteditable='true']")
+                return True
+            except Exception:
+                return False
+
+        try:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field_el)
+            except Exception:
+                pass
+
+            wait.until(_block_and_editor_present)
+
+            last_state = None
+            last_reason = None
+
+            for attempt in range(1, 4):
+                try:
+                    res = driver.execute_script(script_set, field_el, desired, block_selector, textarea_selector) or {}
+                    if not res.get("ok"):
+                        last_reason = res.get("reason")
+                        logger.debug("%s: JS set failed (attempt %d): %s", log_label, attempt, last_reason)
+                        _refind_field()
+                        time.sleep(0.18)
+                        continue
+
+                    # Defocus to encourage commit
+                    try:
+                        canvas = driver.find_element(By.CSS_SELECTOR, "#section-fields")
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", canvas)
+                        canvas.click()
+                    except Exception:
+                        pass
+
+                    # Best-effort allow Turbo patch/hydration
+                    self._wait_turbo_idle(timeout=2.5)
+
+                    # Read immediately (current node)
+                    state1 = self._read_froala_block_state(
+                        field_el,
+                        block_selector=block_selector,
+                        textarea_selector=textarea_selector,
+                    )
+                    last_state = state1
+                    if not _contains_signature(state1):
+                        logger.debug(
+                            "%s: verify-1 failed (attempt %d). desired_sig=%r state=%r",
+                            log_label,
+                            attempt,
+                            desired_sig,
+                            {k: state1.get(k) for k in ("ok","reason")},
+                        )
+                        _refind_field()
+                        time.sleep(0.18)
+                        continue
+
+                    # Re-find field (forces us to survive Turbo swaps) and verify again
+                    _refind_field()
+                    self._wait_turbo_idle(timeout=2.5)
+
+                    state2 = self._read_froala_block_state(
+                        field_el,
+                        block_selector=block_selector,
+                        textarea_selector=textarea_selector,
+                    )
+                    last_state = state2
+                    if _contains_signature(state2):
+                        logger.info("%s set successfully (persisted + verified).", log_label)
+                        return
+
+                    logger.debug(
+                        "%s: verify-2 failed after refind (attempt %d). desired_sig=%r state=%r",
+                        log_label,
+                        attempt,
+                        desired_sig,
+                        {k: state2.get(k) for k in ("ok","reason")},
+                    )
+
+                except StaleElementReferenceException:
+                    _refind_field()
+                except Exception as e:
+                    last_reason = f"{type(e).__name__}: {e}"
+
+                time.sleep(0.18)
+                _refind_field()
+
+            # If we get here: did not persist
+            logger.warning(
+                "%s: FAILED to persist after retries. desired_sig=%r last_reason=%r last_state_ok=%r",
+                log_label,
+                desired_sig,
+                last_reason,
+                (last_state or {}).get("ok"),
+            )
+
+        except TimeoutException as e:
+            logger.warning(
+                "%s: TIMEOUT waiting for Froala block/editor. block_selector=%r textarea_selector=%r (%s: %s)",
+                log_label,
+                block_selector,
+                textarea_selector,
+                type(e).__name__,
+                e,
+            )
+            raise
+
+    def set_field_body(self, field_el, body_text: str):
+        """
+        Set the main description/body Froala block for this field.
+        """
+        # Only target the main description block, not model answer
+        block_selector = (
+            ".designer__field__editable-label--description"
+            "[id^='designer__field__description--']"
+        )
+        textarea_selector = (
+            "textarea.froala-editor[name='description']"
+            "[data-froala-save-source-value*='field_type=description']"
+        )
+        self._set_froala_block(
+            field_el,
+            block_selector=block_selector,
+            textarea_selector=textarea_selector,
+            html=body_text,
+            log_label="Field body",
+        )
+
+    # ---------- thin wrappers ----------
+
+    def _set_signature_config_specifics(self, config: SignatureConfig):
+        """
+        Internal helper to set signature-field-specific options.
+        Always returns (learner_visibility, assessor_visibility, required).
+        """
+
+        # 1) Start from explicit values if provided
+        learner_visibility = config.learner_visibility
+        assessor_visibility = config.assessor_visibility
+
+        # 2) If either is missing, derive defaults from role (and fill only what's missing)
+        role = (config.role or "").strip().lower()
+
+        if learner_visibility is None or assessor_visibility is None:
+            if role == "learner":
+                default_lv, default_av = "update", "read"
+            elif role == "assessor":
+                default_lv, default_av = "read", "update"
+            elif role == "both":
+                default_lv, default_av = "update", "update"
+            else:
+                # Safe fallback if role is missing/unknown
+                default_lv, default_av = "read", "read"
+
+            if learner_visibility is None:
+                learner_visibility = default_lv
+            if assessor_visibility is None:
+                assessor_visibility = default_av
+
+        # 3) Required default
+        sig_required = config.required if config.required is not None else True
+
+        return learner_visibility, assessor_visibility, sig_required
+
+    def _configure_single_choice_answers(
+        self,
+        field_el,
+        options: list[str] | None,
+        correct_index: int | None,
+    ) -> None:
+        """
+        Configure Single Choice options and the correct answer selection.
+
+        - Ensures the number of options matches `options`.
+        - Sets each option label.
+        - Sets exactly one correct answer (CA warns if none selected).
+
+        Assumes:
+        - field_el is the active single choice field container on canvas
+        - title/description already handled elsewhere (optional)
+        """
+        logger = self.logger
+        driver = self.driver
+        wait = self.wait
+
+        options = options or []
+        if not options:
+            logger.info("Single choice: no options provided; skipping answers config.")
+            return
+
+        field_id = self.get_field_id_from_element(field_el)
+        if not field_id:
+            raise RuntimeError("Could not determine field_id for single choice field.")
+
+        sel = config.BUILDER_SELECTORS["single_choice"]
+        answers_container_css = sel["answers_container"]
+        add_choice_btn_css = sel["add_choice_button"]
+        answer_row_css = sel["answer_rows"]
+        answer_text_input_css = sel["answer_text_input"]
+        correct_checkbox_css = sel["correct_checkbox"]
+        delete_option_link_css = sel["delete_option_link"]
+
+        def get_rows():
+            # Re-scope to container each time to avoid stale references
+            cont = driver.find_element(By.CSS_SELECTOR, answers_container_css)
+            return cont.find_elements(By.CSS_SELECTOR, answer_row_css)
+
+        def click_add_choice() -> None:
+            # The Add choice button is inside the field element, but it’s safe to locate by selector near the field
+            btns = field_el.find_elements(By.CSS_SELECTOR, add_choice_btn_css)
+            if not btns:
+                # fallback: global search (rare)
+                btns = driver.find_elements(By.CSS_SELECTOR, add_choice_btn_css)
+            if not btns:
+                raise RuntimeError("Single choice: could not find 'Add choice' button.")
+            btn = btns[0]
+            before = len(get_rows())
+            self.session.click_element_safely(btn)
+            wait.until(lambda d: len(get_rows()) == before + 1)
+
+        def delete_last_choice() -> None:
+            rows = get_rows()
+            if not rows:
+                return
+            row = rows[-1]
+            links = row.find_elements(By.CSS_SELECTOR, delete_option_link_css)
+            if not links:
+                raise RuntimeError("Single choice: could not find delete link for extra option.")
+            before = len(rows)
+            self.session.click_element_safely(links[0])
+            wait.until(lambda d: len(get_rows()) == before - 1)
+
+        # 1) Ensure correct number of options
+        # Add missing
+        for _ in range(max(0, len(options) - len(get_rows()))):
+            click_add_choice()
+
+        # Remove extras
+        while len(get_rows()) > len(options):
+            delete_last_choice()
+
+        # 2) Set option texts
+        rows = get_rows()
+        for idx, label in enumerate(options):
+            label = (label or "").strip()
+            row = rows[idx]
+
+            # --- Activate edit mode for this option row (prove it) ---
+            # Click the display <h4> (this triggers Helpers.Designer.toggleFieldInput)
+            try:
+                display = row.find_element(By.CSS_SELECTOR, "h4.field__editable-label")
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", display)
+                self.session.click_element_safely(display)
+            except Exception:
+                # best-effort: some layouts need clicking the wrapper
+                try:
+                    wrapper = row.find_element(By.CSS_SELECTOR, ".designer__field__editable-label--question")
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", wrapper)
+                    self.driver.execute_script("arguments[0].click();", wrapper)
+                except Exception:
+                    pass
+
+            # Wait until the wrapper becomes active (designer__field__editable-label--active)
+            def _row_active() -> bool:
+                try:
+                    w = row.find_element(By.CSS_SELECTOR, ".designer__field__editable-label--question")
+                    cls = (w.get_attribute("class") or "")
+                    return "designer__field__editable-label--active" in cls
+                except Exception:
+                    return False
+
+            try:
+                wait.until(lambda d: _row_active())
+            except Exception:
+                logger.debug("Single choice: option row %d did not enter active edit mode promptly.", idx)
+
+            # --- Now locate the real option input (more specific) ---
+            # Prefer field_answers input, which is the option-title input.
+            inputs = row.find_elements(
+                By.CSS_SELECTOR,
+                "input[type='text'][data-ajax-input-value-url-value*='/field_answers/']"
+            )
+            if not inputs:
+                # fallback to your existing selector if needed
+                inputs = row.find_elements(By.CSS_SELECTOR, answer_text_input_css)
+
+            if not inputs:
+                raise RuntimeError(f"Single choice: option row {idx} has no text input.")
+
+            inp = inputs[0]
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+            except Exception:
+                pass
+
+            # Type + blur (blur triggers ajax-input-value#sendRequest in your DOM)
+            self.session.clear_and_type(inp, label)
+            try:
+                self.driver.execute_script("arguments[0].blur();", inp)
+            except Exception:
+                pass
+
+            # Best-effort readback (some UIs update after blur)
+            try:
+                wait.until(lambda d: (inp.get_attribute("value") or "").strip() == label)
+            except Exception:
+                logger.debug("Single choice: option %d value did not read back immediately.", idx)
+
+            # 3) Set correct answer
+            # CA complains if none selected, so default to first if not specified
+            if correct_index is None:
+                correct_index = 0
+            # Normalize correct_index to a definite int
+            ci: int = correct_index if correct_index is not None else 0
+
+            if ci < 0 or ci >= len(options):
+                raise ValueError(
+                    f"Single choice: correct_index {ci} out of range for {len(options)} option(s)."
+                )
+
+            def _get_checkbox_for_row(row_el):
+                checks = row_el.find_elements(By.CSS_SELECTOR, correct_checkbox_css)
+                return checks[0] if checks else None
+
+            def _row_checkbox_selected(row_el) -> bool:
+                cb = _get_checkbox_for_row(row_el)
+                return bool(cb and cb.is_selected())
+
+            # Re-fetch rows (avoid stales)
+            rows = get_rows()
+
+            # First, clear any existing correct selections
+            for i in range(len(rows)):
+                # always re-fetch inside loop to avoid stale rows after ajax
+                rows = get_rows()
+                row = rows[i]
+                cb = _get_checkbox_for_row(row)
+                if not cb:
+                    continue
+
+                try:
+                    if cb.is_selected():
+                        try:
+                            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+                        except Exception:
+                            pass
+
+                        self.session.click_element_safely(cb)
+
+                        # Prove unchecked by re-checking on fresh DOM
+                        wait.until(lambda d: not _row_checkbox_selected(get_rows()[i]))
+                except StaleElementReferenceException:
+                    # If ajax swaps nodes, just continue; next iteration re-fetches
+                    continue
+
+            # Now set the desired correct selection
+            rows = get_rows()
+            target_row = rows[ci]
+            cb = _get_checkbox_for_row(target_row)
+            if not cb:
+                raise RuntimeError("Single choice: could not find correct checkbox on target option row.")
+
+            if not cb.is_selected():
+                try:
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+                except Exception:
+                    pass
+
+                self.session.click_element_safely(cb)
+
+                # Prove checked using fresh DOM element (avoids stale cb reference)
+                def _is_correct_selected() -> bool:
+                    rows = get_rows()
+                    if ci >= len(rows):
+                        return False
+                    return _row_checkbox_selected(rows[ci])
+
+                wait.until(lambda d: _is_correct_selected())
+
+        logger.info(
+            "Single choice answers configured: options=%d correct_index=%d field_id=%s",
+            len(options),
+            correct_index,
+            field_id,
+        )
+
+    # ---------- field settings: open sidebar ----------
+    def _open_field_settings_sidebar(self, field_el, timeout: int = 5, pivot_el=None, force_reopen: bool = False) -> None:
+        driver = self.driver
+        wait = self.session.get_wait(timeout)
+        logger = self.logger
+
+        def _defocus():
+            try:
+                driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+            except Exception:
+                pass
+            try:
+                canvas = driver.find_element(By.CSS_SELECTOR, "#section-fields")
+                canvas.click()
+            except Exception:
+                pass
+
+        def _defocus_and_close_best_effort():
+            try:
+                driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+            except Exception:
+                pass
+            try:
+                canvas = driver.find_element(By.CSS_SELECTOR, "#section-fields")
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", canvas)
+                canvas.click()
+            except Exception:
+                pass
+
+        def _tab_visible(_):
+            try:
+                tab = driver.find_element(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='field-settings']")
+                return tab.is_displayed()
+            except Exception:
+                return False
+
+        def _frame_loaded(_):
+            # Use the looser “open for field” check (now non-fatal on id confirm)
+            try:
+                frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
+                controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
+                if not controls:
+                    return False
+                return self._is_field_settings_open_for_field(field_el)
+            except Exception:
+                return False
+
+        # Fast path
+        try:
+            if (not force_reopen) and self._is_field_settings_open_for_field(field_el):
+                logger.debug("Field settings sidebar already open for this field; skipping open.")
+                return
+        except Exception:
+            pass
+
+        for attempt in range(1, 3):
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field_el)
+                logger.info("Opening Field settings sidebar for selected field... (attempt %d/2)", attempt)
+
+                _defocus()
+                if pivot_el is not None:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pivot_el)
+                        ActionChains(driver).move_to_element(pivot_el).move_by_offset(8, 8).pause(0.05).click().perform()
+                        time.sleep(0.15)
+                    except Exception:
+                        pass                
+                clicked = False
+                try:
+                    # Prefer an offset click (avoids table cells/title editor hit targets)
+                    ActionChains(driver).move_to_element(field_el).move_by_offset(8, 8).pause(0.05).click().perform()
+                    clicked = True
+                except Exception:
+                    clicked = False
+
+                if not clicked:
+                    # fall back to your existing safe click then JS click
+                    try:
+                        clicked = self.session.click_element_safely(field_el)
+                    except Exception:
+                        clicked = False
+                    if not clicked:
+                        driver.execute_script("arguments[0].click();", field_el)
+
+                wait.until(_tab_visible)
+                wait.until(_frame_loaded)
+
+                logger.info("Field settings sidebar is open and settings frame is loaded.")
+                return
+
+            except TimeoutException as e:
+                logger.warning("Timed out waiting for field settings sidebar (attempt %d/2): %s", attempt, e)
+                if attempt < 2:
+                    _defocus_and_close_best_effort()
+                    time.sleep(0.25)
+                    continue
+                raise
+
+            except WebDriverException as e:
+                logger.warning("WebDriver error while opening field settings sidebar (attempt %d/2): %s", attempt, e)
+                if attempt < 2:
+                    _defocus_and_close_best_effort()
+                    time.sleep(0.25)
+                    continue
+                raise
+
+    def _get_field_settings_frame(self, timeout: int = 3):
+        """
+        Return the turbo-frame element that contains the field settings
+        for the currently selected field.
+        """
+        logger = self.logger
+        wait = self.session.get_wait(timeout)
+        try:
+            return wait.until(lambda d: d.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame"))
+        except Exception as e:
+            logger.warning(f"Could not locate field_settings_frame: {e}")
+            raise
+
+    def _is_field_settings_open_for_field(self, field_el) -> bool:
+        """
+        True only if the properties frame is loaded and 
+        the bound field id matches the expected field id
+        """
+        driver = self.driver
+
+        # 1) field-settings tab visible
+        try:
+            tab = driver.find_element(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='field-settings']")
+            if not tab.is_displayed():
+                return False
+        except Exception as e:
+            self.logger.debug("Failed to find tab. Reason: %r", e)
+            return False
+
+        # 2) frame present + loaded-ish (cheap: any inputs exist)
+        try:
+            frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
+        except Exception as e:
+            self.logger.debug("Failed to find frame. Reason: %r", e)
+            return False
+
+        try:
+            # If your "hide_in_report" checkbox isn't universal, use a softer signal:
+            # any input/select/textarea inside frame.
+            loaded_controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
+            if not loaded_controls:
+                return False
+        except Exception as e:
+            self.logger.debug("Failed to load controls. Reason: %r", e)
+            return False
+
+        # 3) STRICT: prove "is this the right field?"
+        try:
+            field_id = self.try_get_field_id_strict(field_el)
+
+            # Optional fallback: if strict couldn't extract, try the non-selected fallback version.
+            # This is still safe because we are NOT using ".designer__field--selected" here.
+            if not field_id:
+                try:
+                    field_id = self.get_field_id_from_element(field_el)
+                except Exception:
+                    field_id = None
+
+            if not field_id:
+                self.logger.warning("UI_STATE: cannot determine expected field_id from field_el.")
+                return False
+
+            html = frame.get_attribute("innerHTML") or ""
+            m = re.search(r"/fields/(\d+)\.turbo_stream", html)
+            if not m:
+                # If the frame doesn't expose a field id, we cannot prove binding.
+                self.logger.warning("UI_STATE: cannot determine observed field_id from settings frame HTML.")
+                return False
+
+            observed = self._observed_field_id_from_settings_frame(frame)
+            if not observed:
+                self.logger.warning("UI_STATE: cannot determine observed field_id from settings frame controls/src.")
+                return False
+
+            if observed != str(field_id):
+                self.logger.warning("UI_STATE: mismatch expected=%s observed=%s.", field_id, observed)
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.warning("UI_STATE: binding proof failed: %r", e)
+            return False
+
+    # ---------- field properties: reporting, permissions etc. ----------
+
+    def set_field_properties(
+        self,
+        field_el,
+        pivot_el = None,
+        *,
+        hide_in_report: bool | None = None,
+        learner_visibility: str | None = None,    # "hidden", "read", "update", "read-on-submit"
+        assessor_visibility: str | None = None,   # "hidden", "read", "update"
+        required: bool | None = None,
+        marking_type: str | None = None,          # "manual", "not marked"
+        enable_model_answer: bool | None = None, 
+        enable_assessor_comments: bool | None = None,
+    ):
+        """
+        Generic property setter that works for both paragraphs and long answer,
+        and gracefully skips options that aren't present on a given field type.
+        """
+        driver = self.driver
+        logger = self.logger
+        props = config.BUILDER_SELECTORS["properties"]
+
+        missed: dict[str, str] = {}  # knob -> reason
+
+        def _infer_field_type_key(field_el) -> str:
+            # Matches your canvas selectors / field classes
+            classes = (field_el.get_attribute("class") or "")
+            if "designer__field--text_area" in classes:
+                return "long_answer"
+            if "designer__field--text_field" in classes:
+                return "short_answer"
+            if "designer__field--upload" in classes:
+                return "file_upload"
+            if "designer__field--table" in classes:
+                return "interactive_table"
+            if "designer__field--signature" in classes:
+                return "signature"
+            if "designer__field--date_field" in classes:
+                return "date_field"
+            if "designer__field--text" in classes:
+                return "paragraph"
+            if "designer__field--question" in classes:
+                # single choice and other auto-marked questions land here; treat as generic question
+                return "question"
+            return "unknown"
+
+        def _defocus_and_close_best_effort():
+            # ESC to close tooltips / panels
+            try:
+                driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+            except Exception:
+                pass
+
+            # Click neutral area to defocus cell editors
+            try:
+                canvas = driver.find_element(By.CSS_SELECTOR, "#section-fields")
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", canvas)
+                canvas.click()
+            except Exception:
+                pass
+
+        def _get_loaded_frame_or_none():
+            try:
+                frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
+                controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
+                return frame if controls else None
+            except Exception:
+                return None
+            
+        def _log_misbind_probes(stage: str, *, attempt: int, retries: int, heavy: bool = False) -> None:
+            """
+            stage: short context label like 'loaded_frame_misbound' or 'sidebar_open_misbound'
+            heavy: True => include frame HTML snippet etc
+            """
+            try:
+                expected_id = self.try_get_field_id_strict(field_el)
+            except Exception:
+                expected_id = None
+            try:
+                expected_title = self.get_field_title(field_el)
+            except Exception:
+                expected_title = None
+
+            # Light probe (always)
+            try:
+                probe = self.session.probe_ui_state(
+                    label=f"{stage} attempt={attempt}/{retries}",
+                    field_el=field_el,
+                    expected_field_id=expected_id,
+                    expected_title=expected_title,
+                    include_frame_html_snippet=False,
+                )
+                self.session.log_ui_probe(probe, level="warning")
+            except Exception:
+                pass
+
+            if not heavy:
+                return
+
+            # Heavy probe (only when asked)
+            try:
+                heavy_probe = self.session.probe_ui_state_heavy(
+                    label=f"{stage} attempt={attempt}/{retries} (heavy)",
+                    expected_field_id=expected_id,
+                    expected_title=expected_title,
+                    field_el=field_el,
+                    include_frame_html_snippet=True,
+                    frame_html_snippet_len=1200,
+                    include_overlay_details=True,
+                    include_canvas_snippet=False,  # keep off unless needed
+                )
+                self.session.log_ui_probe_heavy(heavy_probe, level="warning")
+            except Exception:
+                pass
+
+        def _open_props_frame_with_retry(retries: int = 3):
+            last_err = None
+            saw_loaded_frame = False
+
+            for attempt in range(1, retries + 1):
+                try:
+                    frame = _get_loaded_frame_or_none()
+                    if frame is not None:
+                        saw_loaded_frame = True
+                        if self._is_field_settings_open_for_field(field_el):
+                            logger.debug("UI_STATE: frame loaded and matches this field.")
+                            return frame
+                        logger.warning("UI_STATE: loaded frame is misbound (attempt %d/%d).", attempt, retries)
+                        _log_misbind_probes("loaded_frame_misbound", attempt=attempt, retries=retries, heavy=False)
+
+                    # try to open sidebar for this field
+                    if self._ensure_field_active(field_el):
+                        self._open_field_settings_sidebar(field_el, pivot_el=pivot_el, force_reopen=True)
+                        frame = self._get_field_settings_frame()  # may throw TimeoutException internally
+                        saw_loaded_frame = True
+
+                        # binding proof gate
+                        if self._is_field_settings_open_for_field(field_el):
+                            return frame
+
+                        # mismatch -> log probes then recovery then retry
+                        _log_misbind_probes("sidebar_open_misbound", attempt=attempt, retries=retries, heavy=True)
+
+                        # mismatch -> recovery then retry
+                        self.ui_state_recovery_count += 1
+                        logger.warning(
+                            "UI_STATE: recovery %d (attempt %d/%d) - sidebar misbound; will retry.",
+                            self.ui_state_recovery_count, attempt, retries
+                        )
+                        _defocus_and_close_best_effort()
+                        continue
+
+                    raise Exception("UI_STATE: couldn't make field active to open sidebar")
+
+                except TimeoutException as e:
+                    last_err = e
+                    # This is a real load failure; we didn't get a usable frame
+                    if attempt < retries:
+                        logger.warning("UI_STATE: timeout loading sidebar frame (attempt %d/%d).", attempt, retries)
+                        _defocus_and_close_best_effort()
+                        continue
+                    break
+
+                except Exception as e:
+                    last_err = e
+                    if attempt < retries:
+                        logger.warning("UI_STATE: error opening sidebar (attempt %d/%d): %s", attempt, retries, e)
+                        _defocus_and_close_best_effort()
+                        continue
+                    break
+
+            # End of retries:
+            if not saw_loaded_frame or isinstance(last_err, TimeoutException):
+                # true inability to load the frame/controls
+                raise FieldPropertiesSidebarTimeout(f"Could not open field settings sidebar/frame: {last_err}")
+
+            # We saw a frame, but it never matched the expected field => UI_STATE mismatch => SKIP
+            logger.warning("UI_STATE: could not prove binding after %d attempt(s); skipping property writes.", retries)
+           
+            # One final heavy snapshot (single-shot)
+            _log_misbind_probes("final_misbound_skip", attempt=retries, retries=retries, heavy=True)
+            
+            return None
+
+        def _radio_checked_value(root, name: str) -> str | None:
+            try:
+                el = root.find_element(By.CSS_SELECTOR, f"input[type='radio'][name='{name}']:checked")
+                return el.get_attribute("value")
+            except Exception:
+                return None
+
+        def _set_radio_by_value_with_verify(root, name: str, target_value: str, *, label: str) -> bool:
+            # Find the target radio
+            radios = root.find_elements(By.CSS_SELECTOR, f"input[type='radio'][name='{name}']")
+            radio = next((r for r in radios if r.get_attribute("value") == target_value), None)
+            if radio is None:
+                self.logger.debug("No %s radio found for value %r (skipping).", label, target_value)
+                return False
+
+            # Click + verify (one retry)
+            for attempt in (1, 2):
+                self.logger.info("Setting %s to %r (attempt %d/2)...", label, target_value, attempt)
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", radio)
+                    driver.execute_script("arguments[0].click();", radio)
+                except Exception:
+                    # fallback: native click
+                    try:
+                        radio.click()
+                    except Exception:
+                        pass
+
+                time.sleep(0.1)
+                current = _radio_checked_value(root, name)
+                if current == target_value:
+                    return True
+
+            self.logger.warning("Failed to set %s to %r (checked=%r)", label, target_value, _radio_checked_value(root, name))
+            return False
+        
+        # --- capability gating based on field type ---
+        field_type = _infer_field_type_key(field_el)
+        fid = self.get_field_id_from_element(field_el)
+        title = self.get_field_title(field_el)
+        logger.debug("set_field_properties: field_type=%s field_id=%s title=%r", field_type, fid, title)
+
+        caps = FIELD_CAPS.get(field_type, FIELD_CAPS["unknown"])
+
+        if getattr(config, "INSTRUMENT_UI_STATE", False):
+            probe = self.session.probe_ui_state(
+                label="pre-properties",
+                expected_field_id=fid,
+                expected_title=title,
+                field_el=field_el,
+            )
+            self.session.log_ui_probe(probe, level="debug")
+
+        # Paragraph cannot do assessor update
+        if assessor_visibility == "update" and not caps.get("assessor_visibility_update", True):
+            logger.debug(
+                "Skipping assessor_visibility=update (unsupported) field_type=%s field_id=%s title=%r",
+                field_type, fid, title
+            )
+            assessor_visibility = None  # or force to "read"
+
+        # Skip unsupported knobs entirely (capability gating)
+        if required is not None and not caps.get("required", True):
+            logger.debug("Skipping required for (unsupported) field_type=%s field_id=%s title=%r",
+                field_type, fid, title
+            )
+            required = None
+
+        if marking_type is not None and not caps.get("marking_type", True):
+            logger.debug("Skipping marking_type for (unsupported) field_type=%s field_id=%s title=%r",
+                field_type, fid, title
+            )
+            marking_type = None
+
+        if enable_model_answer is not None and not caps.get("model_answer", True):
+            logger.debug("Skipping model_answer toggle for (unsupported) field_type=%s field_id=%s title=%r",
+                field_type, fid, title
+            )
+            enable_model_answer = None
+
+        if enable_assessor_comments is not None and not caps.get("assessor_comments", True):
+            logger.debug("Skipping assessor_comments toggle for (unsupported) field_type=%s field_id=%s title=%r",
+                field_type, fid, title
+            )
+            enable_assessor_comments = None
+
+        # --- get the properties frame robustly ---
+        frame = _open_props_frame_with_retry(retries=3)
+        if frame is None:
+            fid = None
+            title_txt = None
+            try:
+                fid = self.try_get_field_id_strict(field_el) or self.get_field_id_from_element(field_el)
+            except Exception:
+                pass
+            try:
+                title_txt = self.get_field_title(field_el)
+            except Exception:
+                pass
+
+            logger.warning("UI_STATE: binding not proven; skipping all property writes for field_id=%r title=%r", fid, title_txt)
+
+            # Record for controller reporting/retry
+            self.record_skip({
+                "kind": "properties",
+                "reason": "UI_STATE binding not proven after retries",
+                "retryable": True,  # retry at end of activity
+                "field_id": fid,
+                "field_title": title_txt,
+                "requested": {
+                    "hide_in_report": hide_in_report,
+                    "learner_visibility": learner_visibility,
+                    "assessor_visibility": assessor_visibility,
+                    "required": required,
+                    "marking_type": marking_type,
+                    "enable_model_answer": enable_model_answer,
+                    "enable_assessor_comments": enable_assessor_comments,
+                },
+            })
+            return     
+
+        # --- hide_in_report ---
+        try:
+            if hide_in_report is not None:
+                self._set_checkbox(props["hide_in_report_checkbox"], hide_in_report, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+        except Exception as e:
+            logger.debug(f"hide_in_report not set/available: {e}")
+            missed["hide_in_report"] = f"exception: {type(e).__name__}: {e}"
+
+        # --- learner visibility ---
+        try:
+            if learner_visibility is not None:
+                value_map = {
+                    "hidden": "learners_hidden",
+                    "read": "learners_read",
+                    "update": "learners_update",
+                    "read-on-submit": "learners_read-on-submit",
+                }
+                target_value = value_map.get(learner_visibility)
+                if target_value:
+                    ok = _set_radio_by_value_with_verify(
+                        frame,
+                        name="learners",
+                        target_value=target_value,
+                        label=f"learner visibility ({learner_visibility})",
+                                    )
+                    if not ok:
+                        missed["learner_visibility"] = f"verify failed (wanted={target_value})"
+                else:
+                    logger.warning("Unknown learner_visibility %r", learner_visibility)
+                    missed["learner_visibility"] = f"unknown value {learner_visibility!r}"
+        except Exception as e:
+            logger.debug("Learner visibility not set/available: %s", e)
+            missed["learner_visibility"] = f"exception: {type(e).__name__}: {e}"
+
+        # --- assessor visibility ---
+        try:
+            if assessor_visibility is not None:
+                value_map = {
+                    "hidden": "assessors_hidden",
+                    "read": "assessors_read",
+                    "update": "assessors_update",
+                }
+                target_value = value_map.get(assessor_visibility)
+                if target_value:
+                    ok = _set_radio_by_value_with_verify(
+                        frame,
+                        name="assessors",
+                        target_value=target_value,
+                        label=f"assessor visibility ({assessor_visibility})",
+                    )
+                    if not ok:
+                        missed["assessor_visibility"] = f"verify failed (wanted={target_value})"
+                else:
+                    logger.warning("Unknown assessor_visibility %r", assessor_visibility)
+                    missed["assessor_visibility"] = f"unknown value {assessor_visibility!r}"
+        except Exception as e:
+            logger.debug("Assessor visibility not set/available: %s", e)
+            missed["assessor_visibility"] = f"exception: {type(e).__name__}: {e}"
+
+        # --- required_field ---
+        try:
+            if required is not None:
+                self._set_checkbox(props["required_checkbox"], required, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+        except Exception as e:
+            logger.debug(f"Required field checkbox not set/available: {e}")
+            missed["required_checkbox"] = f"exception: {type(e).__name__}: {e}"
+
+        # --- marking_type (question only) ---
+        try:
+            if marking_type is not None:
+                # This is choices.js; simplest is to set the underlying select value and fire change
+                script = """
+                    var frame = arguments[0];
+                    var value = arguments[1];
+                    var select = frame.querySelector('select[name="marking_type"]');
+                    if (!select) return false;
+                    select.value = value;
+                    var event = new Event('change', { bubbles: true });
+                    select.dispatchEvent(event);
+                    return true;
+                """
+                logger.info(f"Setting marking_type to '{marking_type}'...")
+                ok = driver.execute_script(script, frame, marking_type)
+                if not ok:
+                    missed["marking_type"] = "select[name='marking_type'] not found or change not applied"
+        except Exception as e:
+            logger.debug(f"marking_type not set/available: {e}")
+
+        # --- model_answer switch ---
+        try:
+            if enable_model_answer is not None:
+                self._set_checkbox(props["model_answer_toggle"], enable_model_answer, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+        except Exception as e:
+            logger.debug(f"Model answer switch not set/available: {e}")
+            missed["enable_model_answer"] = f"exception: {type(e).__name__}: {e}"
+
+        # --- assessor_comments switch ---
+        try:
+            if enable_assessor_comments is not None:
+                self._set_checkbox(props["assessor_comments_toggle"], enable_assessor_comments, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+        except Exception as e:
+            logger.debug(f"Assessor comments switch not set/available: {e}")
+            missed["enable_assessor_comments"] = f"exception: {type(e).__name__}: {e}"
+
+        if missed:
+            self.record_skip({
+                "kind": "properties",
+                "reason": f"One or more property writes failed: {missed}",
+                "retryable": True,   # or False if you want purely manual follow-up
+                "field_id": fid,
+                "field_title": title,
+                "requested": {
+                    "hide_in_report": hide_in_report,
+                    "learner_visibility": learner_visibility,
+                    "assessor_visibility": assessor_visibility,
+                    "required": required,
+                    "marking_type": marking_type,
+                    "enable_model_answer": enable_model_answer,
+                    "enable_assessor_comments": enable_assessor_comments,
+                },
+                # optional but very useful:
+                "missed": missed,
+            })
+
+    def set_field_model_answer(
+        self,
+        field_id: str,
+        model_answer_html: str,
+        max_attempts: int = 3,
+    ) -> None:
+        """
+        Set the model answer Froala block for the last field of the given type.
+
+        This helper is robust against Turbo re-renders by re-resolving the field
+        element and retrying a few times if we hit stale element references.
+        """
+        logger = self.logger
+        driver = self.driver
+        if not model_answer_html:
+            return
+
+        block_selector = (
+            ".designer__field__editable-label--description"
+            "[id^='designer__field__model-answer-description--']"
+        )
+        textarea_selector = (
+            "textarea.froala-editor[name='description']"
+            "[data-froala-save-source-value*='field_type=model_answer_description']"
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # 1) Make sure CA has actually toggled the model answer editor into edit mode
+                self._activate_model_answer_editor(field_id)
+                
+                # 2) Wait for a fresh field_el with an initialised Froala editor
+                logger.debug(
+                    "Model answer: waiting for Froala editor for field id %s (attempt %d)...",
+                    field_id,
+                    attempt,
+                )
+                field_el = self._wait_for_model_answer_editor(field_id, block_selector, "Model answer")
+
+                # 3) Inject the HTML via your existing helper
+                self._set_froala_block(
+                    field_el,
+                    block_selector=block_selector,
+                    textarea_selector=textarea_selector,
+                    html=model_answer_html,
+                    log_label="Model answer",
+                )
+
+                # 4) Belt-and-braces: update any model answer textarea for this field id
+                script = """
+                    var fieldId = arguments[0];
+                    var value = arguments[1];
+
+                    // Match only this field's model_answer_description textareas
+                    var selector = "textarea.froala-editor[name='description']" +
+                                "[data-froala-save-source-value*='field_type=model_answer_description']";
+
+                    var textareas = document.querySelectorAll(selector);
+                    textareas.forEach(function (ta) {
+                        var src = ta.getAttribute("data-froala-save-source-value") || "";
+                        if (!src.includes("/fields/" + fieldId + ".turbo_stream")) return;
+
+                        ta.value = value;
+                        ['input', 'change'].forEach(function (name) {
+                            var evt = new Event(name, { bubbles: true });
+                            ta.dispatchEvent(evt);
+                        });
+
+                        // If there is a Froala editor bound to this textarea via the froala controller,
+                        // it will usually mirror the content automatically from textarea -> editor.
+                    });
+
+                    return true;
+                """
+                driver.execute_script(script, field_id, model_answer_html)
+                logger.info("Model answer text synchronised for field id %s.", field_id)
+                return  # success
+            except StaleElementReferenceException:
+                logger.debug(
+                    "Model answer: stale element on attempt %d for %r; retrying...",
+                    attempt,
+                    field_id,
+                )
+                continue
+            except TimeoutException as e:
+                logger.warning(
+                    "Model answer: timeout waiting for editor on attempt %d for %r: %s",
+                    attempt,
+                    field_id,
+                    e,
+                )
+                # no point retrying immediately if editor never appeared
+                break
+            except Exception as e:
+                logger.warning(
+                    "Model answer: unexpected error on attempt %d for %r: %s",
+                    attempt,
+                    field_id,
+                    e,
+                )
+                break
+
+        logger.warning(
+            "Model answer: giving up after %d attempt(s) for field id %r.",
+            max_attempts,
+            field_id,
+        )
+
+    def _wait_for_model_answer_editor(self, field_id: str, block_selector: str, log_label: str) -> WebElement:
+        """
+        Wait until the model answer Froala editor exists for the given field id,
+        returning the *fresh* field element.
+        """
+        logger = self.logger
+        wait = self.wait
+
+        def block_and_editor_present(_):
+            try:
+                field = self.get_field_by_id(field_id)
+            except NoSuchElementException:
+                logger.debug("%s: field for id %s not found yet.", log_label, field_id)
+                return False
+
+            try:
+                block = field.find_element(By.CSS_SELECTOR, block_selector)
+            except NoSuchElementException:
+                logger.debug(
+                    "%s: field %s found but block %r not present yet.",
+                    log_label,
+                    field_id,
+                    block_selector,
+                )
+                return False
+            except StaleElementReferenceException:
+                logger.debug(
+                    "%s: field element for id %s became stale while looking for block %r.",
+                    log_label,
+                    field_id,
+                    block_selector,
+                )
+                return False
+
+            try:
+                editor = block.find_element(
+                    By.CSS_SELECTOR,
+                    ".fr-element.fr-view[contenteditable='true']",
+                )
+                logger.debug("%s: Froala editor present for field id %s.", log_label, field_id)
+                return True
+            except NoSuchElementException:
+                logger.debug(
+                    "%s: block present for field id %s but Froala editor not yet initialised.",
+                    log_label,
+                    field_id,
+                )
+                return False
+            except StaleElementReferenceException:
+                logger.debug(
+                    "%s: block became stale for field id %s.",
+                    log_label,
+                    field_id,
+                )
+                return False
+
+        wait.until(block_and_editor_present)
+        # After wait, re-resolve the fresh field element and return it
+        return self.get_field_by_id(field_id)
+
+    def _activate_model_answer_editor(self, field_id: str, log_label: str = "Model answer") -> None:
+        """
+        Pre-activate model answer editor by clicking its display label.
+
+        Turbo-safe:
+        - Re-finds elements immediately before click.
+        - Retries once on StaleElementReferenceException.
+        - Optionally proves activation by waiting for an 'active' class on the wrapper.
+        """
+        logger = self.logger
+        driver = self.driver
+        session = self.session
+
+        # Prefer a selector that doesn't depend on a stale field root.
+        label_css = f".field__editable-label.designer__field__model-answer-description--{field_id}"
+
+        def _click_label_once() -> bool:
+            # Re-find field + label fresh each time
+            field = self.get_field_by_id(field_id)
+            label = field.find_element(By.CSS_SELECTOR, label_css)
+
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", label)
+            driver.execute_script("arguments[0].click();", label)
+            return True
+
+        try:
+            _click_label_once()
+        except StaleElementReferenceException:
+            # One retry: Turbo likely swapped the node
+            try:
+                _click_label_once()
+            except Exception as e2:
+                logger.debug("%s: could not pre-activate editor for field id %s (stale retry failed): %s",
+                            log_label, field_id, e2)
+                return
+        except Exception as e:
+            logger.debug("%s: could not pre-activate editor for field id %s: %s", log_label, field_id, e)
+            return
+
+        # Best-effort “prove”: wait briefly for active state to appear
+        # (If you have a known wrapper selector for model answer, use it here.)
+        try:
+            # Many editable labels toggle an active wrapper class nearby; this is safe + short.
+            session.get_wait(2).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, label_css))
+            )
+        except Exception:
+            pass
+
+        logger.debug(
+            "%s: pre-activated editor by clicking model answer label for field id %s.",
+            log_label,
+            field_id,
+        )
+
+    def _set_checkbox(
+        self,
+        selector: str,
+        desired: bool,
+        *,
+        root: Optional[WebElement] = None,
+        timeout: float = 3.0,
+        expected_field_id: str | None = None,
+        expected_title: str | None = None,
+        field_el: WebElement | None = None,
+    ) -> None:
+        """
+        Ensure that the checkbox at `selector` is in the desired state.
+        - If `root` is provided (e.g. field_settings_frame), we try it first (fast path).
+        - If `root` is stale / missing selector, we fall back to refinding the settings frame.
+        - Retries on stale elements because the settings turbo-frame often re-renders.
+        """
+        driver = self.driver
+        logger = self.logger
+
+        max_attempts = 3
+
+        def _find_in_root(r: WebElement) -> Optional[WebElement]:
+            try:
+                return r.find_element(By.CSS_SELECTOR, selector)
+            except (StaleElementReferenceException, NoSuchElementException):
+                return None
+
+        def _locate_checkbox() -> Optional[WebElement]:
+            end_time = time.time() + timeout
+            cb = None
+            while time.time() < end_time:
+                # 1) Prefer caller-provided root if available
+                if root is not None:
+                    cb = _find_in_root(root)
+                    if cb is not None:
+                        return cb
+                # 2) Fall back to refinding the frame (turbo-safe)
+                try:
+                    frame = self._get_field_settings_frame()
+                    cb = frame.find_element(By.CSS_SELECTOR, selector)
+                    return cb
+                except (StaleElementReferenceException, NoSuchElementException):
+                    logger.debug("Checkbox %r not ready / stale when locating; retrying...", selector)
+                    time.sleep(0.2)
+            return None
+
+        def _is_checked(el) -> Optional[bool]:
+            try:
+                # Use JS to read .checked for robustness
+                return bool(driver.execute_script("return arguments[0].checked === true;", el))
+            except StaleElementReferenceException:
+                return None
+            
+        def _maybe_probe(label: str, *, heavy: bool = False) -> None:
+            if not getattr(config, "INSTRUMENT_UI_STATE", False):
+                return
+            try:
+                probe = self.session.probe_ui_state(
+                    label=label,
+                    expected_field_id=expected_field_id,
+                    expected_title=expected_title,
+                    field_el=field_el,
+                    include_frame_html_snippet=heavy,
+                )
+                self.session.log_ui_probe(probe, level="warning")
+            except Exception:
+                pass
+
+        for attempt in range(1, max_attempts + 1):
+            checkbox = _locate_checkbox()
+            if checkbox is None:
+                logger.debug("Checkbox %r not found in settings sidebar (attempt %d);", selector, attempt)
+                
+                _maybe_probe(
+                f"checkbox_missing selector={selector} attempt={attempt}/{max_attempts}",
+                heavy=(attempt == max_attempts)
+                )
+
+                if attempt == max_attempts:
+                    logger.debug("Giving up on checkbox %r after %d attempts.", selector, max_attempts)
+                continue
+
+            # Read current state
+            current = _is_checked(checkbox)
+            logger.debug(
+                "Checkbox %r state before attempt %d: %r (desired=%s)",
+                selector,
+                attempt,
+                current,
+                desired,
+            )
+
+            if current is not None and current == desired:
+                logger.debug("Checkbox %r already in desired state (%s).", selector, desired)
+                return
+
+            # Click via JS
+            try:
+                logger.debug("Clicking checkbox %r to set to %s (attempt %d).", selector, desired, attempt)
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
+                driver.execute_script("arguments[0].click();", checkbox)
+
+                # Fire change event for Stimulus, just in case
+                try:
+                    driver.execute_script(
+                        """
+                        const input = arguments[0];
+                        const ev = new Event('change', { bubbles: true });
+                        input.dispatchEvent(ev);
+                        """,
+                        checkbox,
+                    )
+                except Exception:
+                    pass
+
+            except StaleElementReferenceException as e:
+                logger.debug(
+                    "Checkbox %r went stale during click on attempt %d: %s; will retry.",
+                    selector,
+                    attempt,
+                    e,
+                )
+                
+                _maybe_probe(
+                f"checkbox_stale_click selector={selector} attempt={attempt}/{max_attempts}",
+                heavy=(attempt == max_attempts)
+                )
+
+                # retry with a fresh element in next loop iteration
+                if attempt == max_attempts:
+                    logger.debug(
+                        "Giving up on checkbox %r after stale click on final attempt.",
+                        selector,
+                    )
+                continue
+
+            # Confirm window: re-locate and check state
+            confirm_until = time.time() + 1.25  # ~1.25s confirmation window
+            while time.time() < confirm_until:
+                cb2 = _locate_checkbox()
+                if cb2 is None:
+                    time.sleep(0.1)
+                    continue
+                final = _is_checked(cb2)
+                if final is not None and final == desired:
+                    logger.debug("Checkbox %r now in desired state (%s).", selector, desired)
+                    return
+                time.sleep(0.1)
+
+            if attempt == max_attempts:
+                _maybe_probe(
+                    f"checkbox_no_confirm selector={selector} desired={desired} attempt={attempt}/{max_attempts}",
+                    heavy=True
+                )
+            else:
+                _maybe_probe(
+                    f"checkbox_no_confirm selector={selector} desired={desired} attempt={attempt}/{max_attempts}",
+                    heavy=False
+                )
+
+            logger.debug(
+                "Checkbox %r did not reach desired state (%s) within confirmation window on attempt %d.",
+                selector,
+                desired,
+                attempt,
+            )
+
+        logger.debug(
+            "Checkbox %r may not have reached desired state (%s) after %d attempts; continuing.",
+            selector,
+            desired,
+            max_attempts,
+        )
+
+# --- TABLES ---
+
+    def _configure_table_from_config(self, field_el, config: TableConfig) -> None:
+        """
+        Apply a TableConfig to an interactive table field.
+
+        Resilience strategy:
+        - Resolve a stable field_id once.
+        - Between stages, re-find the field element by id to avoid stale anchors.
+        - Retry each stage a few times on stale/DOM churn.
+        """
+        logger = self.logger
+
+        # Resolve a stable id for the field so we can re-find the root element
+        field_id = None
+        try:
+            field_id = self.get_field_id_from_element(field_el)
+        except Exception:
+            field_id = None
+
+        if not field_id:
+            logger.warning("Table config: could not resolve field_id from field_el; proceeding without re-find safeguards.")
+
+        def _fresh_field_el():
+            if not field_id:
+                return field_el
+            return self.get_field_by_id(field_id)
+
+        def _run_stage(stage_name: str, fn, *, attempts: int = 3, sleep_s: float = 0.15) -> bool:
+            """
+            Run a stage with retries. Always re-find the field element before each attempt.
+            """
+            for attempt in range(1, attempts + 1):
+                try:
+                    fresh = _fresh_field_el()
+                    fn(fresh)
+                    return True
+                except StaleElementReferenceException as e:
+                    logger.debug("Table stage %s stale (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+                except NoSuchElementException as e:
+                    logger.debug("Table stage %s missing element (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+                except TableResizeError as e:
+                    logger.debug("Table stage %s resize failed and error raised (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+                    raise
+                except Exception as e:
+                    logger.warning("Table stage %s failed (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+
+                if attempt < attempts:
+                    time.sleep(sleep_s)
+            logger.warning("Table stage %s: giving up after %d attempts.", stage_name, attempts)
+            
+            # Record a configure skip event for controller
+            self._record_config_skip(
+                kind="configure",
+                reason=f"table stage '{stage_name}' failed after {attempts} attempts",
+                retryable=True,
+                field_id=field_id,
+                field_title=(getattr(config, "title", None) or None),  # careful: config is TableConfig here
+                requested={"stage": stage_name},
+            )
+            
+            return False
+
+        # ---- 1) Dimensions ----
+        rows = config.rows
+        cols = config.cols
+        if rows is not None and cols is not None:
+            ok = _run_stage(
+                "dimensions",
+                lambda fresh_field: self.ensure_table_dimensions_strict(fresh_field, rows, cols),
+                attempts=3,
+            )
+            if not ok:
+                return
+
+        # ---- 2) Column types ----
+        col_types = config.column_types
+        if col_types:
+            ok = _run_stage(
+                "column_types",
+                lambda fresh_field: self._set_column_types(fresh_field, col_types),
+                attempts=3,
+            )
+            if not ok:
+                return
+
+        # ---- 3) Column headers ----
+        col_headers = config.column_headers
+        if col_headers:
+            _run_stage(
+                "column_headers",
+                lambda fresh_field: self._set_table_column_headers(fresh_field, col_headers),
+                attempts=3,
+            )
+
+        # ---- 4) Row labels ----
+        row_labels = config.row_labels
+        if row_labels:
+            _run_stage(
+                "row_labels",
+                lambda fresh_field: self._set_table_row_labels(fresh_field, row_labels),
+                attempts=3,
+            )
+
+        # ---- 5) Per-cell overrides ----
+        if config.cell_overrides:
+            def _apply_overrides(fresh_field):
+                table_root = self._get_dynamic_table_root(fresh_field)
+                for (r, c), cell_cfg in (config.cell_overrides or {}).items():
+                    self.logger.info(
+                        "Applying cell_override at (r=%s,c=%s) text=%r",
+                        r, c, cell_cfg.text
+                    )
+                    ok = self._apply_table_cell_override(table_root, r, c, cell_cfg)
+                    self.logger.info("cell_override result at (r=%s,c=%s): ok=%s", r, c, ok)
+
+            _run_stage("cell_overrides", _apply_overrides, attempts=3)
+
+    def _get_dynamic_table_root(self, field_el):
+        """
+        Given a designer__field--table element, return its .dynamic-table root.
+        """
+        return field_el.find_element(
+            By.CSS_SELECTOR,
+            config.BUILDER_SELECTORS["table"]["root"],
+        )
+
+    def ensure_table_dimensions_strict(self, field_el, rows: int, cols: int) -> None:
+        final_rows, final_cols = self.ensure_table_dimensions(field_el, rows, cols)
+
+        if (final_rows, final_cols) != (rows, cols):
+            field_id = None
+            try:
+                field_id = self.get_field_id_from_element(field_el)
+            except Exception:
+                pass
+
+            raise TableResizeError(
+                f"Strict table resize failed"
+                f"{' field_id=' + str(field_id) if field_id else ''}: "
+                f"got {final_rows}x{final_cols}, expected {rows}x{cols}"
+            )
+
+    def ensure_table_dimensions(
+        self,
+        field_el,
+        rows: int,
+        cols: int,
+        timeout: int = 10,
+    ) -> tuple[int, int]:
+        """
+        Ensure the dynamic table attached to this field has at least the given
+        number of body rows and data columns.
+
+        Returns:
+            (final_rows, final_cols) observed at the end.
+
+        Notes:
+        - Only grows; does not shrink.
+        - Uses polling after each add to confirm DOM state change.
+        """
+        logger = self.logger
+        driver = self.driver
+        table_selectors = config.BUILDER_SELECTORS["table"]
+
+        def get_shape():
+            """
+            Return (table_root, header_cells, body_rows, data_cols, body_row_count).
+
+            Always re-query to avoid stale references.
+            """
+            table_root = self._get_dynamic_table_root(field_el)
+            header_cells = table_root.find_elements(By.CSS_SELECTOR, table_selectors["header_cells"])
+            body_rows = table_root.find_elements(By.CSS_SELECTOR, table_selectors["body_rows"])
+
+            # Heuristic: first header cell is row-label / control column
+            data_cols = max(len(header_cells) - 1, 0) if header_cells else 0
+            return table_root, header_cells, body_rows, data_cols, len(body_rows)
+
+        def get_add_wrappers(table_root):
+            """
+            Return (add_column_wrapper, add_row_wrapper) freshly located.
+            """
+            logger.info("Locating and assigning wrappers")
+            add_col_wrapper = table_root.find_element(By.CSS_SELECTOR, table_selectors["add_column_button"])
+            add_row_wrapper = table_root.find_element(By.CSS_SELECTOR, table_selectors["add_row_button"])
+            return add_col_wrapper, add_row_wrapper
+
+        def click_wrapper(elem):
+            """
+            Use a real pointer-style click on the wrapper.
+            """
+            logger.info("Attempting to click wrapper")
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                    elem,
+                )
+            except Exception:
+                pass
+
+            ActionChains(driver).move_to_element(elem).pause(0.1).click().perform()
+
+        def click_add_action(
+            *,
+            table_root,
+            button_el,
+            wrapper_css: str,
+            kind: str,
+            target_value: int,
+        ) -> None:
+            """
+            Robust click for add-row/add-col turbo-post buttons.
+
+            Strategy:
+            1) pointer click button
+            2) quick verify (<= ~1.2s) that shape is moving toward target
+            3) if not, JS click button
+            4) if not, click wrapper div (transparent click region)
+            5) proceed; outer poll loop will confirm.
+            """
+            # Cheap overlay cleanup (helps when a cell editor/tooltip steals focus)
+            try:
+                self._reset_canvas_ui_state()
+            except Exception:
+                pass
+
+            # Ensure visible
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                    button_el,
+                )
+            except Exception:
+                pass
+
+            def _shape_value():
+                # Reuse get_shape() to avoid stale
+                _, _, _, c, r = get_shape()
+                return (r if kind == "row" else c)
+
+            before = None
+            try:
+                before = _shape_value()
+            except Exception:
+                before = None
+
+            # 1) Pointer click
+            try:
+                ActionChains(driver).move_to_element(button_el).pause(0.1).click().perform()
+            except Exception:
+                pass
+
+            # Quick verify
+            quick_deadline = time.time() + 1.2
+            while time.time() < quick_deadline:
+                try:
+                    now = _shape_value()
+                    if now >= target_value:
+                        return
+                    # If at least changed vs before, we consider it "triggered"
+                    if before is not None and now != before:
+                        return
+                except StaleElementReferenceException:
+                    time.sleep(0.1)
+                except Exception:
+                    time.sleep(0.1)
+                time.sleep(0.1)
+
+            # 2) JS click button
+            try:
+                driver.execute_script("arguments[0].click();", button_el)
+            except Exception:
+                pass
+
+            quick_deadline = time.time() + 1.0
+            while time.time() < quick_deadline:
+                try:
+                    now = _shape_value()
+                    if now >= target_value:
+                        return
+                    if before is not None and now != before:
+                        return
+                except Exception:
+                    time.sleep(0.1)
+                time.sleep(0.1)
+
+            # 3) Click wrapper div
+            try:
+                wrapper = table_root.find_element(By.CSS_SELECTOR, wrapper_css)
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                        wrapper,
+                    )
+                except Exception:
+                    pass
+                driver.execute_script("arguments[0].click();", wrapper)
+            except Exception:
+                pass
+
+        # --- Initial shape --------------------------------------------------
+        table_root, header_cells, body_rows, current_cols, current_rows = get_shape()
+        logger.info(
+            "Dynamic table current shape: rows=%d, cols=%d (requested rows=%d, cols=%d).",
+            current_rows, current_cols, rows, cols
+        )
+
+        last_seen_cols = current_cols
+        last_seen_rows = current_rows
+
+        # --- Grow columns ---------------------------------------------------
+        while current_cols < cols:
+            try:
+                logger.info("Fetching table shape")
+                table_root, header_cells, body_rows, current_cols, current_rows = get_shape()
+                last_seen_cols = current_cols
+                add_col_btn, _ = get_add_wrappers(table_root)
+            except NoSuchElementException:
+                logger.warning("Aborting column growth: add_column_wrapper not found.")
+                break
+
+            target_cols = current_cols + 1
+            logger.info("Adding column %d (current=%d).", target_cols, current_cols)
+            # click_wrapper(add_col_wrapper)
+            click_add_action(
+                table_root=table_root,
+                button_el=add_col_btn,
+                wrapper_css=table_selectors["add_column_wrapper"],
+                kind="col",
+                target_value=target_cols,
+            )
+
+            deadline = time.time() + timeout
+            poll_i = 0  # ✅ reset per add attempt
+
+            # Poll until data column count increases
+            while time.time() < deadline:
+                try:
+                    _, _, _, new_cols, _ = get_shape()
+                except StaleElementReferenceException:
+                    time.sleep(0.1)
+                    continue
+
+                last_seen_cols = new_cols
+                # ✅ log first poll + every 10th poll
+                if poll_i == 1 or poll_i % 10 == 0:
+                    logger.debug(
+                        "[table] Polling columns: current=%d, target=%d",
+                        new_cols,
+                        target_cols,
+                    )
+
+                if new_cols >= target_cols:
+                    current_cols = new_cols
+                    break
+
+                time.sleep(0.2)
+            else:
+                logger.warning(
+                    "Timed out waiting for table columns to grow to %d. Last observed cols=%d.",
+                    target_cols,
+                    last_seen_cols,
+                )
+                break
+
+        # --- Grow rows ------------------------------------------------------
+        while current_rows < rows:
+            try:
+                table_root, header_cells, body_rows, current_cols, current_rows = get_shape()
+                last_seen_rows = current_rows
+                _, add_row_btn = get_add_wrappers(table_root)
+            except NoSuchElementException:
+                logger.warning("Aborting row growth: add_row_button not found.")
+                break
+
+            target_rows = current_rows + 1
+            logger.info("Adding row %d (current=%d).", target_rows, current_rows)
+
+            # click_wrapper(add_row_wrapper)
+            click_add_action(
+                table_root=table_root,
+                button_el=add_row_btn,
+                wrapper_css=table_selectors["add_row_wrapper"],
+                kind="row",
+                target_value=target_rows,
+            )
+
+            deadline = time.time() + timeout
+            poll_i = 0  # ✅ reset per add attempt
+
+            # Poll until body row count increases
+            while time.time() < deadline:
+                try:
+                    _, _, _, _, new_rows = get_shape()
+                except StaleElementReferenceException:
+                    time.sleep(0.1)
+                    continue
+
+                last_seen_rows = new_rows
+                # ✅ log first poll + every 10th poll
+                if poll_i == 1 or poll_i % 10 == 0:
+                    logger.debug(
+                        "[table] Polling rows: current=%d, target=%d",
+                        new_rows,
+                        target_rows,
+                    )
+
+                if new_rows >= target_rows:
+                    current_rows = new_rows
+                    break
+
+                time.sleep(0.2)
+            else:
+                logger.warning(
+                    "Timed out waiting for table rows to grow to %d. Last observed rows=%d.",
+                    target_rows,
+                    last_seen_rows,
+                )
+                break
+
+        # Final measure (fresh)
+        try:
+            _, _, _, final_cols, final_rows = get_shape()
+            current_cols, current_rows = final_cols, final_rows
+        except Exception:
+            # If final measure fails, fall back to last known counters.
+            pass
+
+        logger.info("Dynamic table resized to rows=%d, cols=%d.", current_rows, current_cols)
+        return current_rows, current_cols
+    
+    def _get_table_header_cell(self, table_root, *, body_row_index: int, cell_index: int):
+        """
+        Return the WebElement for a specific header cell in the dynamic table.
+        body_row_index is the index within tbody rows where row 0 is the 'header row'.
+        cell_index includes the control column at 0.
+        """
+        selectors = config.BUILDER_SELECTORS["table"]
+
+        # Find body rows fresh
+        body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+        if body_row_index >= len(body_rows):
+            return None
+
+        row = body_rows[body_row_index]
+        # Cells within that row
+        cells = row.find_elements(By.CSS_SELECTOR, selectors["body_cells"])
+        if cell_index >= len(cells):
+            return None
+
+        return cells[cell_index]
+
+    def _set_table_column_headers(self, field_el, column_headers: list[str]) -> None:
+        """
+        Set the column headers using the first body row as the header row.
+
+        Notes:
+        - Some CA tables include an extra leading <td> in the header row that is not editable.
+        We detect this and apply a DOM offset to keep header mapping stable.
+        """
+        logger = self.logger
+        driver = self.driver
+        selectors = config.BUILDER_SELECTORS["table"]
+        max_attempts = 3
+
+        header_row_index = 0  # first body row acts as header row
+        logger.info("Setting %d column header(s) on first body row.", len(column_headers))
+
+        # 0) Mark row 0 as heading (best effort, but do it once)
+        try:
+            self._set_row_type(field_el, row_index=0, type_name="heading")
+            self.session.get_wait(timeout=3).until(lambda d: self._row_looks_like_heading(field_el, 0))
+        except TimeoutException:
+            logger.debug("Header row did not confirm heading; proceeding anyway.")
+        except Exception as e:
+            logger.warning("Failed to set column heading row to heading: %s", e)
+
+        def _get_header_row_tds():
+            table_root = self._get_dynamic_table_root(field_el)
+            rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+            if len(rows) <= header_row_index:
+                return None
+            return rows[header_row_index].find_elements(By.CSS_SELECTOR, "td")
+
+        # 1) Wait until the header row exists and has at least *some* cells.
+        #    We do a small baseline wait here, then we derive exact expectations below.
+        try:
+            self.session.get_wait(timeout=8).until(lambda d: bool(_get_header_row_tds()))
+        except TimeoutException:
+            logger.warning("Header row not present after wait; proceeding with best-effort writes.")
+
+        # 2) Derive DOM offset once: sometimes there is an extra leading TD in the DOM.
+        tds = _get_header_row_tds() or []
+        if not tds:
+            logger.warning("No header row cells found; cannot set column headers.")
+            return
+
+        # If DOM has one extra cell, assume it's a non-editable leading cell.
+        # Example: len(tds)=5 but headers=4 -> dom_offset=1, write into td[1..4]
+        dom_offset = 0
+        if len(tds) == len(column_headers) + 1:
+            dom_offset = 1
+
+        # If DOM has fewer cells than headers, log and proceed; writes will skip missing cells.
+        logger.info(
+            "Header row cells (td)=%d, headers=%d, dom_offset=%d",
+            len(tds),
+            len(column_headers),
+            dom_offset,
+        )
+
+        # 3) For each header cell: stabilise UI + re-find td + write (bounded time)
+        PER_HEADER_DEADLINE_S = 6.0
+
+        for offset, header_text in enumerate(column_headers):
+            target_td_index = offset + dom_offset
+
+            success = False
+            deadline = time.time() + PER_HEADER_DEADLINE_S
+
+            attempt = 0
+            while time.time() < deadline and attempt <= max_attempts:
+                attempt += 1
+                try:
+                    self._reset_canvas_ui_state()
+
+                    # Re-find the target td every attempt (Turbo-safe)
+                    tds = _get_header_row_tds()
+                    if not tds or target_td_index >= len(tds):
+                        logger.debug(
+                            "Skipping header %r: no td at index %d (attempt %d).",
+                            header_text,
+                            target_td_index,
+                            attempt,
+                        )
+                        break
+
+                    td = tds[target_td_index]
+
+                    try:
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                            td,
+                        )
+                    except Exception:
+                        pass
+
+                    # Preferred: locate the dynamic cell container inside this td
+                    # and use your unified cell writer (which now includes contenteditable fallback).
+                    cell = None
+                    try:
+                        cell = td.find_element(By.CSS_SELECTOR, selectors["body_cells"])
+                    except NoSuchElementException:
+                        # Some DOMs may not nest the div; fall back to td itself.
+                        cell = td
+
+                    ok = self._set_table_cell_text(cell, header_text, retries=3)
+                    if ok:
+                        logger.debug(
+                            "Set column header %r at offset=%d (td_index=%d dom_offset=%d) on attempt %d.",
+                            header_text,
+                            offset,
+                            target_td_index,
+                            dom_offset,
+                            attempt,
+                        )
+                        success = True
+                        break
+
+                    # If writer couldn’t find an editable surface, pause briefly and retry.
+                    time.sleep(0.15)
+
+                except StaleElementReferenceException:
+                    logger.debug(
+                        "Header write stale for %r at td_index=%d (attempt %d).",
+                        header_text,
+                        target_td_index,
+                        attempt,
+                    )
+                    time.sleep(0.15)
+                except Exception as e:
+                    logger.debug(
+                        "Header write error for %r at td_index=%d (attempt %d): %s",
+                        header_text,
+                        target_td_index,
+                        attempt,
+                        e,
+                    )
+                    time.sleep(0.15)
+
+            if not success:
+                logger.warning(
+                    "Could not set column header %r (td_index=%d dom_offset=%d).",
+                    header_text,
+                    target_td_index,
+                    dom_offset,
+                )
+                self._record_config_skip(
+                    kind="configure",
+                    reason="table column header not set (no editable control / retries exhausted)",
+                    retryable=False,
+                    field_id=self.get_field_id_from_element(field_el),
+                    field_title=self.get_field_title(field_el),
+                    requested={
+                        "table_part": "column_headers",
+                        "row_index": header_row_index,   
+                        "td_index": target_td_index,
+                        "dom_offset": dom_offset,
+                        "value": header_text,
+                    },
+                )
+
+    def _set_table_row_labels(self, field_el, row_labels: list[str]) -> None:
+        """
+        Set row labels in the first *data* column of body rows.
+
+        Convention:
+        - body row 0 is reserved as the header row
+        - row labels start from body row 1
+        - cell index 0 is a control column
+        - cell index 1 is the first data column (row label column)
+        """
+        selectors = config.BUILDER_SELECTORS["table"]
+        logger = self.logger
+
+        # Best effort: make row-label column "heading" type
+        try:
+            self._set_column_type(field_el, col_index=0, type_name="heading")
+        except Exception as e:
+            logger.warning("Failed to set row-label column to heading: %s", e)
+
+        logger.info("Setting %d row labels via dynamic table cells.", len(row_labels))
+
+        for offset, label in enumerate(row_labels):
+            label_text = label or ""
+
+            # row 0 = header, labels start at row 1
+            target_row_index = 1 + offset
+
+            max_attempts = 4
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    table_root = self._get_dynamic_table_root(field_el)
+                    body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+                    if not body_rows:
+                        logger.warning("No body rows in table; cannot set row labels.")
+                        return
+
+                    if target_row_index >= len(body_rows):
+                        logger.debug(
+                            "Skipping row label %r: no body row at index %d (rows=%d).",
+                            label_text,
+                            target_row_index,
+                            len(body_rows),
+                        )
+                        return  # nothing further to do
+
+                    row = body_rows[target_row_index]
+                    cells = row.find_elements(By.CSS_SELECTOR, "th, td")
+
+                    # Need at least control + first data column
+                    if len(cells) < 2:
+                        logger.debug(
+                            "Body row %d has fewer than 2 cells; skipping label %r.",
+                            target_row_index,
+                            label_text,
+                        )
+                        break
+
+                    data_cell = cells[1]  # first data column
+                    ok = self._set_table_cell_text(data_cell, label, retries=3)
+                    if not ok:
+                        logger.warning(
+                            "Could not set row label %r at cell_index=%d (no editable control).",
+                            label,
+                            target_row_index,
+                        )
+                        if attempt < max_attempts:
+                            time.sleep(0.15)
+                            continue
+
+                        # FINAL FAIL: record manual-fix item (non-retryable)
+                        self._record_config_skip(
+                            kind="configure",
+                            reason="table row label not set (no editable control / retries exhausted)",
+                            retryable=False,
+                            field_id=self.get_field_id_from_element(field_el),          # whatever you have in scope in this method
+                            field_title=self.get_field_title(field_el),    # likewise (or None)
+                            requested={
+                                "table_part": "row_labels",
+                                "row_index": target_row_index,
+                                "col_index": 1,          # first data column per your comment
+                                "value": label,
+                            },
+                        )
+                        break
+
+                    logger.debug(
+                        "Set row label %r at body_row=%d on attempt %d/%d.",
+                        label_text,
+                        target_row_index,
+                        attempt,
+                        max_attempts,
+                    )
+                    break  # success for this label
+
+                except StaleElementReferenceException as e:
+                    logger.debug(
+                        "Stale element while setting row label %r (body_row=%d) attempt %d/%d: %s",
+                        label_text,
+                        target_row_index,
+                        attempt,
+                        max_attempts,
+                        e,
+                    )
+                    if attempt < max_attempts:
+                        time.sleep(0.15)
+                        continue
+                    logger.warning(
+                        "Giving up setting row label %r (body_row=%d) after %d attempts due to repeated staleness.",
+                        label_text,
+                        target_row_index,
+                        max_attempts,
+                    )
+                    break
+
+                except Exception as e:
+                    logger.warning(
+                        "Error setting row label %r (body_row=%d) attempt %d/%d: %s",
+                        label_text,
+                        target_row_index,
+                        attempt,
+                        max_attempts,
+                        e,
+                    )
+                    if attempt < max_attempts:
+                        time.sleep(0.15)
+                        continue
+                    break
+
+    def _set_table_cell_text(self, cell, text: str, *, retries: int = 2) -> bool:
+        """
+        Set the text for a single dynamic table cell (Turbo/Stimulus-safe).
+
+        Attempt order (per retry attempt):
+        1) textarea[name='cell_title'] OR input[name='cell_title']
+        2) [contenteditable='true'] within the cell
+        3) label-like nodes (.field__editable-label / .designer__field__editable-label ...)
+
+        Stale handling:
+        - If the *cell reference* goes stale mid-attempt, we can't "refresh" it here.
+            We treat it as retryable and continue, expecting the caller to re-find the cell
+            (your header writer already re-finds td per attempt).
+        """
+        logger = self.session.logger
+        driver = self.session.driver
+
+        def _dismiss_overlays_best_effort():
+            try:
+                driver.switch_to.active_element.send_keys("\u001b")  # ESC
+            except Exception:
+                pass
+
+        def _js_set_value(el) -> bool:
+            try:
+                driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    const value = arguments[1];
+                    el.focus?.();
+                    el.value = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    """,
+                    el,
+                    text,
+                )
+                return True
+            except Exception as e:
+                logger.debug("[table] JS value-set failed: %s", e)
+                return False
+
+        def _js_set_textcontent(el) -> bool:
+            try:
+                driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    const value = arguments[1];
+                    el.focus?.();
+                    el.textContent = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    """,
+                    el,
+                    text,
+                )
+                return True
+            except Exception as e:
+                logger.debug("[table] JS textContent-set failed: %s", e)
+                return False
+
+        for attempt in range(1, retries + 1):
+            _dismiss_overlays_best_effort()
+
+            # NOTE: Don't return False on stale; just retry the whole attempt.
+            try:
+                # 1) Primary: textarea/input name=cell_title
+                control = None
+                for sel in ("textarea[name='cell_title']", "input[name='cell_title']"):
+                    els = cell.find_elements(By.CSS_SELECTOR, sel)
+                    if els:
+                        control = els[0]
+                        break
+
+                if control is not None and _js_set_value(control):
+                    logger.debug("[table] cell_title set via %s (attempt %d/%d).", control.tag_name, attempt, retries)
+                    return True
+
+                # 2) Fallback: contenteditable within cell
+                eds = cell.find_elements(By.CSS_SELECTOR, "[contenteditable='true']")
+                if eds:
+                    try:
+                        driver.execute_script("arguments[0].click();", eds[0])  # wake click
+                    except Exception:
+                        pass
+
+                    if _js_set_textcontent(eds[0]):
+                        logger.debug("[table] cell set via contenteditable (attempt %d/%d).", attempt, retries)
+                        return True
+
+                # 3) Fallback: label-like elements (for tricky headers, checkbox cols, etc.)
+                for sel in (
+                    ".field__editable-label",
+                    ".designer__field__editable-label",
+                    ".designer__field__editable-label *",
+                ):
+                    els = cell.find_elements(By.CSS_SELECTOR, sel)
+                    if not els:
+                        continue
+
+                    target = els[-1]  # deepest leaf tends to be the writable node
+                    try:
+                        driver.execute_script("arguments[0].click();", target)
+                    except Exception:
+                        pass
+
+                    if _js_set_textcontent(target):
+                        logger.debug("[table] cell set via '%s' (attempt %d/%d).", sel, attempt, retries)
+                        return True
+
+                # 4) Checkbox column header fallback (column-level label)
+                try:
+                    # climb to table root
+                    table = cell.find_element(By.XPATH, "ancestor::table")
+                    labels = table.find_elements(By.CSS_SELECTOR, ".field__editable-label")
+
+                    if labels:
+                        # heuristic: checkbox column header is last label
+                        target = labels[-1]
+                        driver.execute_script("arguments[0].click();", target)
+                        if _js_set_textcontent(target):
+                            logger.debug("[table] cell set via column-level editable-label.")
+                            return True
+                except StaleElementReferenceException:
+                    continue
+                except Exception:
+                    pass
+
+            except StaleElementReferenceException:
+                logger.debug("[table] Cell went stale during attempt %d/%d; will retry.", attempt, retries)
+                # Give Turbo a beat to settle; caller should be re-finding cells between attempts anyway.
+                if attempt < retries:
+                    time.sleep(0.10)
+                continue
+            except Exception as e:
+                # Any other transient issue: retry, but keep it quiet.
+                logger.debug("[table] Unexpected error during attempt %d/%d: %s", attempt, retries, e)
+                if attempt < retries:
+                    time.sleep(0.10)
+                continue
+
+            if attempt < retries:
+                logger.debug("[table] No editable control matched; retrying (%d/%d).", attempt, retries)
+                time.sleep(0.10)
+
+        logger.warning("[table] Could not set cell text %r after %d attempt(s).", text, retries)
+        return False
+    
+    def _set_table_cell_type(self, cell, cell_type: str) -> None:
+        """
+        Change the type of a dynamic table cell using the per-cell dropdown.
+
+        Supported cell_type values (for now): "heading".
+        
+        - Does NOT block the rest of the table config if it fails.
+        - Uses JS clicks to avoid 'element not interactable' as much as possible.
+        """
+        logger = self.logger
+        driver = self.driver
+        table_sel = config.BUILDER_SELECTORS["table"]
+
+        # We currently only implement 'heading'
+        if cell_type != "heading":
+            logger.debug(f"_set_table_cell_type: unsupported type '{cell_type}', skipping.")
+            return
+
+        heading_class = table_sel.get(
+            "cell_heading_class",
+            "designer__field__editable-label--table-cell-heading",
+        )
+        wrapper_selector = table_sel.get(
+            "editable_label_wrapper",
+            ".designer__field__editable-label",
+        )
+
+        # Helper to (re)locate the editable-label wrapper in this cell
+        def get_wrapper():
+            try:
+                return cell.find_element(By.CSS_SELECTOR, wrapper_selector)
+            except NoSuchElementException:
+                return None
+
+        wrapper = get_wrapper()
+        if not wrapper:
+            logger.debug("No editable-label wrapper in cell; cannot set cell type.")
+            return
+
+        # Already heading? Nothing to do.
+        try:
+            current_classes = wrapper.get_attribute("class") or ""
+            if heading_class in current_classes:
+                logger.debug("Cell already has heading class; skipping type change.")
+                return
+        except StaleElementReferenceException:
+            pass
+
+        # 1) Open the dropdown for this cell
+        try:
+            dropdown = cell.find_element(By.CSS_SELECTOR, ".dropdown")
+            toggle = dropdown.find_element(By.CSS_SELECTOR, "button.dropdown-toggle")
+        except NoSuchElementException:
+            logger.debug("No dropdown toggle found in cell; cannot set cell type.")
+            return
+
+        # 2) Open the dropdown (real click to trigger Stimulus)
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                toggle,
+            )
+        except Exception:
+            pass
+
+        try:
+            actions = ActionChains(driver)
+            actions.move_to_element(toggle).pause(0.1).click().perform()
+        except Exception as e:
+            logger.warning(f"Error clicking cell type dropdown toggle: {e}")
+            return
+
+        # 3) Locate the dropdown menu for THIS cell, then its Heading option
+        try:
+            menu = dropdown.find_element(By.CSS_SELECTOR, "ul.dropdown-menu.ca-dropdown-menu")
+            heading_btn = menu.find_element(
+                By.CSS_SELECTOR,
+                "button[data-url*='type=heading']",
+            )
+        except NoSuchElementException:
+            logger.warning("Heading option not found in this cell's dropdown menu.")
+            return
+
+        # 4) Click Heading via JS (bypassing size/visibility quirks)
+        try:
+            driver.execute_script("arguments[0].click();", heading_btn)
+        except Exception as e:
+            logger.warning(f"JS click on 'Heading' menu item failed: {e}")
+            return
+        
+        # 5) Optionally: light-touch check to see if the class appears, but don’t wait long
+        try:
+            wrapper = get_wrapper()
+            if wrapper:
+                classes = wrapper.get_attribute("class") or ""
+                if heading_class in classes:
+                    logger.debug("Cell heading type applied (wrapper has heading class).")
+        except StaleElementReferenceException:
+            # Turbo may have re-rendered; it's fine, we already clicked
+            pass
+
+    def _set_column_types(
+        self,
+        field_el,
+        column_types: Optional[Sequence[Optional[str]]],
+    ) -> None:
+        """
+        Apply column types from a config-driven list.
+
+        `column_types[i]` refers to the i-th *data* column:
+          0 = first data column
+          1 = second data column, etc.
+
+        Supported values (for now):
+          - 'checkbox'
+          - 'text'
+          - 'text_field'
+          - 'date_field'
+          - 'heading'   (use sparingly – usually only col 0 if at all)
+
+        Any value of None is ignored.
+        """
+        if not column_types:
+            return
+
+        logger = self.session.logger
+
+        for idx, col_type in enumerate(column_types):
+            if not col_type:
+                continue  # explicitly skipped
+
+            # Normalise string just in case
+            col_type = col_type.strip().lower()
+
+            # Only act on types we know how to translate directly to CA's type param
+            if col_type in {"checkbox", "text", "text_field", "date_field", "heading"}:
+                try:
+                    self._set_column_type(field_el, col_index=idx, type_name=col_type)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to set column {idx} type to '{col_type}': {e}"
+                    )
+            else:
+                logger.debug(
+                    f"Column {idx} type '{col_type}' not implemented; skipping."
+                )
+
+    def _set_column_type(self, field_el, col_index: int, type_name: str) -> None:
+        """
+        Bulk-update the type for a whole column (using the column header dropdown).
+
+        col_index is 0-based for *data* columns:
+            0 = first data column
+            1 = second data column, etc.
+
+        type_name: "heading", "text", "text_field", "date_field", "checkbox"
+        """
+
+        logger = self.logger
+        selectors = config.BUILDER_SELECTORS["table"]
+
+        logger.info(f"Applying column type '{type_name}' to data column {col_index} via bulk update.")
+
+        # 1. Locate table + header row (fresh each time)
+        try:
+            table_root = self._get_dynamic_table_root(field_el)
+        except Exception as e:
+            logger.warning(f"Cannot locate table root for column update: {e}")
+            return
+
+        # Use the actual header cells in <thead>, safer for column actions
+        header_cells = table_root.find_elements(
+            By.CSS_SELECTOR, selectors["header_cells"]
+        )
+        if not header_cells:
+            logger.warning("No header cells found; cannot set column type.")
+            return
+
+        # Skip control column at index 0
+        th_index = col_index + 1  # column 0 = first data column
+        if th_index >= len(header_cells):
+            logger.warning(f"No header cell for data column {col_index}.")
+            return
+
+        header_cell = header_cells[th_index]
+
+        # 2. Locate column actions container
+        try:
+            column_actions_sel = selectors.get(
+                "column_actions",
+                ".dynamic-table__actions.dynamic-table__actions--columns",
+            )
+            actions_container = header_cell.find_element(
+                By.CSS_SELECTOR,
+                column_actions_sel
+            )
+        except NoSuchElementException as e:
+            logger.warning(f"No column actions container found for data column {col_index}.")
+            return
+
+        # 3. Inside the column actions, find the bulk_update button for the requested type
+        try:
+            menu = actions_container.find_element(
+                By.CSS_SELECTOR, "ul.dropdown-menu.ca-dropdown-menu"
+            )
+            type_btn = menu.find_element(
+                By.CSS_SELECTOR, f"button[data-url*='type={type_name}']"
+            )
+        except NoSuchElementException:
+            logger.warning(
+                f"No bulk-update button for type '{type_name}' found in column {col_index} actions."
+            )
+            return
+        except StaleElementReferenceException:
+            logger.warning(
+                f"Column actions became stale while looking for type '{type_name}' in col {col_index}."
+            )
+            return
+
+        # 5. Dispatch synthetic click on the turbo button
+        self._dispatch_turbo_click(type_btn)
+        logger.info(f"Column {col_index}: requested type '{type_name}' via bulk-update button.")
+
+    def _set_row_type(self, field_el, row_index: int, type_name: str) -> None:
+        """
+        Bulk-update a whole row's cell type (e.g. 'heading') using the row actions menu.
+
+        type_name: 'heading', 'text', 'text_field', 'date_field', 'checkbox'
+        """
+        selectors = config.BUILDER_SELECTORS["table"]
+        logger = self.logger
+    
+        logger.info(f"Applying row type '{type_name}' to row {row_index} via bulk update.")
+
+        try:
+            table_root = self._get_dynamic_table_root(field_el)
+            body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+        except Exception as e:
+            logger.warning(f"Failed to locate table/rows for row type '{type_name}': {e}")
+            return
+        
+        if not body_rows or row_index >= len(body_rows):
+            logger.warning(f"No body row at index {row_index}; cannot set row type.")
+            return
+
+        # row = body_rows[row_index]
+
+        try:
+            # Find row actions container
+            row_actions_sel = selectors.get(
+                "row_actions",
+                ".dynamic-table__actions.dynamic-table__actions--rows",
+            )
+            row_actions_groups = table_root.find_elements(By.CSS_SELECTOR, row_actions_sel)
+            if not row_actions_groups:
+                raise NoSuchElementException("No row actions groups found under table_root")
+            # If CA renders one group per row, index into it. If it renders one shared group,
+            # row_index=0 is fine (and you can ignore the index).
+            actions_container = row_actions_groups[min(row_index, len(row_actions_groups) - 1)]
+        except NoSuchElementException:
+            logger.warning(f"No row actions container found for row {row_index}.")
+            return
+        
+        try:
+            # Menu and type button
+            menu = actions_container.find_element(
+                By.CSS_SELECTOR, "ul.dropdown-menu.ca-dropdown-menu"
+            )
+            type_btn = menu.find_element(
+                By.CSS_SELECTOR, f"button[data-url*='type={type_name}']"
+            )
+        except NoSuchElementException as e:
+            logger.warning(f"Cannot set row type for row {row_index}: {e}")
+            return
+        except StaleElementReferenceException:
+            logger.warning(
+                f"Row actions became stale while looking for type '{type_name}' in row {row_index}."
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Error setting row type '{type_name}' for row {row_index}: {e}")
+            return
+
+        # Dispatch synthetic click (no native click() → no size/location complaints)
+        self._dispatch_turbo_click(type_btn)
+        logger.info(f"Row {row_index}: requested type '{type_name}' via bulk-update button.")        
+        # Post-click settle: wait for the row to actually become heading (best-effort)
+        if type_name == "heading":
+            try:
+                self.session.get_wait(timeout=3).until(lambda d: self._row_looks_like_heading(field_el, row_index))
+            except TimeoutException:
+                logger.debug("Row %d did not confirm as heading within settle window.", row_index)
+
+    def _apply_table_cell_override(
+        self,
+        table_root,
+        row_idx: int,
+        col_idx: int,
+        cell_cfg: TableCellConfig,
+    ) -> bool:
+        """
+        Apply a specific override to a given (row, col) cell:
+        - text
+        - cell_type (heading/text/checkbox/etc)
+        """
+        selectors = config.BUILDER_SELECTORS["table"]
+        body_rows = table_root.find_elements(
+            By.CSS_SELECTOR,
+            selectors["body_rows"],
+        )
+        if row_idx >= len(body_rows):
+            return False
+        row = body_rows[row_idx]
+        cells = row.find_elements(By.CSS_SELECTOR, "td, th")
+
+        # ✅ CloudAssess has a control column at index 0
+        dom_offset = 1
+        dom_col_idx = col_idx + dom_offset
+
+        if dom_col_idx >= len(cells):
+            return False
+
+        cell = cells[dom_col_idx]
+
+        if cell_cfg.text is not None:
+            # 1) Try to activate the cell first
+            try:
+                self.session.click_element_safely(cell)  # or JS click
+            except Exception:
+                try:
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell)
+                    self.driver.execute_script("arguments[0].click();", cell)
+                except Exception:
+                    pass
+
+            # 2) Re-query inputs after activation (important)
+            inputs = cell.find_elements(By.CSS_SELECTOR, "textarea[name='cell_title'], input[name='cell_title']")
+            if inputs:
+                try:
+                    self.session.clear_and_type(inputs[0], cell_cfg.text)
+                    return True
+                except Exception:
+                    # fall through
+                    pass
+
+            # 3) Fallback: set text via editable label (same style as row-label fallback)
+            labels = cell.find_elements(By.CSS_SELECTOR, ".field__editable-label")
+            if labels:
+                self.session.clear_and_type(labels[0], cell_cfg.text)
+                return True
+    
+        if cell_cfg.cell_type is not None:
+            # TODO: similar to column_types; depends on CA's UI
+            pass
+
+        return False
+
+    def _wait_for_header_editors_ready(self, field_el, timeout: int = 4) -> bool:
+        """
+        After setting row 0 to 'heading', wait until the first body row exposes
+        editable header controls (textarea[name='cell_title']) in at least one cell.
+        """
+        driver = self.driver
+        selectors = config.BUILDER_SELECTORS["table"]
+
+        wait = self.session.get_wait(timeout)
+
+        def _ready(_):
+            try:
+                table_root = self._get_dynamic_table_root(field_el)
+                body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+                if not body_rows:
+                    return False
+
+                header_row = body_rows[0]
+                cells = header_row.find_elements(By.CSS_SELECTOR, "th, td")
+                if not cells:
+                    return False
+
+                # If any cell has a cell_title textarea, the row is in the editable state.
+                for c in cells:
+                    if c.find_elements(By.CSS_SELECTOR, "textarea[name='cell_title']"):
+                        return True
+                return False
+            except Exception:
+                return False
+
+        try:
+            wait.until(_ready)
+            return True
+        except Exception:
+            return False
+
+    def _dispatch_turbo_click(self, button_el) -> None:
+        """
+        Dispatch a synthetic click event on a turbo-put/turbo-post button.
+
+        This avoids Chrome's 'element not interactable' restrictions on
+        hidden elements, while still triggering CA's Stimulus controllers.
+        """
+        logger = self.logger
+        driver = self.driver
+
+        if button_el is None:
+            return
+
+        try:
+            driver.execute_script(
+                """
+                const btn = arguments[0];
+                if (!btn) return;
+                const evt = new MouseEvent('click', {
+                  view: window,
+                  bubbles: true,
+                  cancelable: true
+                });
+                btn.dispatchEvent(evt);
+                """,
+                button_el,
+            )
+            logger.debug("Dispatched synthetic click on turbo button.")
+        except Exception as e:
+            logger.warning(f"Failed to dispatch turbo click: {e}")
+
+    def _row_looks_like_heading(self, field_el, row_index: int) -> bool:
+        selectors = config.BUILDER_SELECTORS["table"]
+        table_root = self._get_dynamic_table_root(field_el)
+        body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+        if row_index >= len(body_rows):
+            return False
+
+        row = body_rows[row_index]
+        # Look for a heading marker anywhere in that row
+        return bool(row.find_elements(By.CSS_SELECTOR, f".{selectors['cell_heading_class']}"))
+
+    def _norm_text(self, s: str | None) -> str:
+        return " ".join((s or "").split())
+    
+    def _ensure_field_active(self, field_el, timeout: int = 2) -> bool:
+        driver = self.driver
+        wait = self.session.get_wait(timeout)
+
+        def is_active(_):
+            try:
+                cls = field_el.get_attribute("class") or ""
+                return "designer__field--active" in cls
+            except Exception:
+                return False
+
+        if is_active(None):
+            return True
+
+        # Try clicking the title label (most reliable)
+        try:
+            title = field_el.find_element(By.CSS_SELECTOR, "h2.field__editable-label, .designer__field__editable-label--title")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", title)
+            driver.execute_script("arguments[0].click();", title)
+        except Exception:
+            # Fallback: offset click on the field root
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field_el)
+                ActionChains(driver).move_to_element(field_el).move_by_offset(8, 8).pause(0.05).click().perform()
+            except Exception:
+                return False
+
+        try:
+            wait.until(is_active)
+            return True
+        except Exception:
+            return False
+
+#  --- Recording and tracking skip events in editor process ---
+
+    def _record_config_skip(
+        self,
+        *,
+        kind: str,
+        reason: str,
+        retryable: bool,
+        field_id: str | None = None,
+        field_title: str | None = None,
+        requested: dict | None = None,
+    ) -> None:
+        self.record_skip({
+            "kind": kind,
+            "reason": reason,
+            "retryable": retryable,
+            "field_id": field_id,
+            "field_title": field_title,
+            "requested": requested or {},
+        })
+
+    def record_skip(self, event: dict) -> None:
+        # event should already be structured; keep editor dumb
+        self._skip_events.append(event)
+
+    def pop_skip_events(self) -> list[dict]:
+        ev = self._skip_events
+        self._skip_events = []
+        return ev

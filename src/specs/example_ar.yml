@@ -1,0 +1,451 @@
+# Sources: UoC, IE, WA, CC and AO tools for CPCCCA2002     
+
+unit_code: CPCCCA2002
+unit_title: Use carpentry tools and equipment
+activity_type: assessment_result
+
+mapping:
+  performance_evidence:
+    - group_id: PE1
+      stem: >
+        Use and maintain the following hand tools at least once, across three
+        different carpentry tasks.
+      lines:
+        - id: PE1_a
+          text: retractable tape measure
+          evidence_sources:
+            - IE1
+            - AO12
+            - CC1
+            - CC3
+        - id: PE1_b
+          text: folding or steel ruler
+          evidence_sources:
+            - IE1
+            - AO11
+            - CC1
+            - CC3
+        - id: PE1_c
+          text: combination square
+          evidence_sources:
+            - IE1
+            - AO11
+            - CC1
+            - CC3
+        - id: PE1_d
+          text: string line
+          evidence_sources:
+            - IE1
+            - AO15
+            - CC1
+            - CC3
+        - id: PE1_e
+          text: chalk line
+          evidence_sources:
+            - IE1
+            - AO15
+            - CC1
+            - CC3
+        - id: PE1_f
+          text: hand saw
+          evidence_sources:
+            - IE1
+            - AO12
+            - CC1
+            - CC3
+        - id: PE1_g
+          text: coping saw
+          evidence_sources:
+            - IE1
+            - AO13
+            - CC1
+            - CC3
+        - id: PE1_h
+          text: carpenters hammer / claw hammer
+          evidence_sources:
+            - IE1
+            - AO12
+            - CC1
+            - CC3
+        - id: PE1_i
+          text: wood chisel
+          evidence_sources:
+            - IE1
+            - IE3
+            - AO17
+            - CC1
+            - CC4
+        - id: PE1_j
+          text: hand plane
+          evidence_sources:
+            - IE1
+            - IE3
+            - AO16
+            - CC1
+            - CC4
+        - id: PE1_k
+          text: trimming knife
+          evidence_sources:
+            - IE1
+            - AO11
+            - CC1
+            - CC3
+        - id: PE1_l
+          text: clamps
+          evidence_sources:
+            - IE2
+            - AO12
+            - CC1
+            - CC3
+        - id: PE1_m
+          text: bevels
+          evidence_sources:
+            - IE2
+            - AO12
+            - CC1
+            - CC3
+        - id: PE1_n
+          text: spirit level
+          evidence_sources:
+            - IE2
+            - AO6
+            - CC1
+            - CC3
+        - id: PE1_o
+          text: tin snips
+          evidence_sources:
+            - IE2
+            - AO14
+            - CC1
+            - CC3
+
+    - group_id: PE2
+      stem: >
+        Use and maintain the following power, battery and pneumatic tools and
+        equipment at least once, across three different carpentry tasks.
+      lines:
+        - id: PE2_a
+          text: circular saw
+          evidence_sources:
+            - IE2
+            - AO2
+            - AO8
+            - CC1
+            - CC3
+        - id: PE2_b
+          text: reciprocating saw
+          evidence_sources:
+            - IE2
+            - AO7
+            - CC1
+            - CC3
+        - id: PE2_c
+          text: sliding compound saw
+          evidence_sources:
+            - IE2
+            - AO1
+            - AO7
+            - CC1
+            - CC3
+        - id: PE2_d
+          text: jigsaw
+          evidence_sources:
+            - IE2
+            - AO8
+            - CC1
+            - CC3
+        - id: PE2_e
+          text: angle grinder
+          evidence_sources:
+            - IE2
+            - AO5
+            - AO7
+            - CC1
+            - CC3
+        - id: PE2_f
+          text: planer
+          evidence_sources:
+            - IE2
+            - AO3
+            - AO7
+            - CC1
+            - CC3
+        - id: PE2_g
+          text: laminate trimmer or router
+          evidence_sources:
+            - IE2
+            - AO4
+            - AO9
+            - CC1
+            - CC3
+        - id: PE2_h
+          text: drill
+          evidence_sources:
+            - IE3
+            - AO8
+            - CC1
+            - CC3
+        - id: PE2_i
+          text: rotary hammer drill
+          evidence_sources:
+            - IE3
+            - AO10
+            - CC1
+            - CC3
+        - id: PE2_j
+          text: impact driver
+          evidence_sources:
+            - IE3
+            - AO7
+            - CC1
+            - CC3
+        - id: PE2_k
+          text: nail gun
+          evidence_sources:
+            - IE3
+            - AO7
+            - CC1
+            - CC3
+        - id: PE2_l
+          text: bench grinder
+          evidence_sources:
+            - IE3
+            - AO16
+            - AO17
+            - CC1
+            - CC4
+        - id: PE2_m
+          text: extension lead
+          evidence_sources:
+            - IE3
+            - AO8
+            - CC1
+            - CC3
+        - id: PE2_n
+          text: portable residual current device
+          evidence_sources:
+            - IE3
+            - AO8
+            - CC1
+            - CC3
+        - id: PE2_o
+          text: air compressor and hoses
+          evidence_sources:
+            - IE3
+            - AO9
+            - CC1
+            - CC3
+
+    - group_id: PE3
+      stem: "The candidate must also:"
+      lines:
+        - id: PE3_a
+          text: replace blades/cutters/grinding discs in a power saw
+          evidence_sources:
+            - IE3
+            - AO1
+            - AO2
+            - AO5
+            - CC4
+        - id: PE3_b
+          text: replace blades/cutters/grinding discs in a powered planer
+          evidence_sources:
+            - IE3
+            - AO3
+            - CC4
+        - id: PE3_c
+          text: replace blades/cutters/grinding discs in a router
+          evidence_sources:
+            - IE3
+            - AO4
+            - CC4
+        - id: PE3_d
+          text: replace blades/cutters/grinding discs in grinder
+          evidence_sources:
+            - IE3
+            - AO5
+            - CC4
+        - id: PE3_e
+          text: grind, sharpen and hone a hand plane blade
+          evidence_sources:
+            - IE3
+            - AO16
+            - CC4
+        - id: PE3_f
+          text: grind, sharpen and hone a chisel
+          evidence_sources:
+            - IE3
+            - AO17
+            - CC4
+
+  elements_pcs:
+    - element: 1
+      pc: 1
+      text: 1.1 Review work instructions to use tools and equipment.
+      evidence_sources:
+        - IE1
+        - IE2
+        - IE3
+        - AO1.1
+        - AO7.1
+        - AO11.1
+        - AO16.1
+        - CC2
+    - element: 1
+      pc: 2
+      text: >
+        1.2 Plan all work to comply with laws and regulations, national
+        construction codes, Australian Standards, work health and safety (WHS)
+        and environmental requirements, manufacturers’ specifications and
+        workplace requirements.
+      evidence_sources:
+        - IE1
+        - IE2
+        - IE3
+        - AO1.2
+        - AO7.2
+        - AO11.2
+        - AO16.2
+        - CC2
+    - element: 1
+      pc: 3
+      text: 1.3 Select and use personal protective equipment (PPE) for each part of the task.
+      evidence_sources:
+        - AO1.3
+        - AO2.3
+        - AO7.3
+        - AO8.3
+        - AO11.3
+        - AO16.3
+        - CC2
+    - element: 1
+      pc: 4
+      text: >
+        1.4 Inspect work site, locate services, assess hazards and apply risk
+        controls, including required signage and barricades.
+      evidence_sources:
+        - AO1.4
+        - AO2.4
+        - AO7.4
+        - AO8.4
+        - AO11.4
+        - AO16.4
+        - CC2
+    - element: 2
+      pc: 1
+      text: >
+        2.1 Select equipment and hand, power and pneumatic tools for the
+        carpentry task, identify their functions and operations, check for
+        serviceability and report any faults.
+      evidence_sources:
+        - IE1
+        - IE2
+        - IE3
+        - AO1.5
+        - AO2.5
+        - AO7.5
+        - AO8.5
+        - AO11.5
+        - AO16.5
+        - CC3
+    - element: 2
+      pc: 2
+      text: >
+        2.2 Use equipment and hand, power and pneumatic tools following WHS
+        requirements and manufacturers’ recommendations.
+      evidence_sources:
+        - IE1
+        - IE2
+        - IE3
+        - AO1.6
+        - AO2.6
+        - AO3.6
+        - AO4.6
+        - AO5.6
+        - AO6.6
+        - AO7.6
+        - AO8.6
+        - AO11.6
+        - AO12.6
+        - AO13.6
+        - AO14.6
+        - AO15.6
+        - AO16.6
+        - AO17.6
+        - CC1
+        - CC3
+    - element: 2
+      pc: 3
+      text: 2.3 Sharpen and maintain tools.
+      evidence_sources:
+        - IE3
+        - AO16.7
+        - AO17.7
+        - CC4
+    - element: 3
+      pc: 1
+      text: >
+        3.1 Clean up, meeting all legislative and workplace requirements for
+        safety, waste disposal and materials handling.
+      evidence_sources:
+        - AO1.7
+        - AO2.7
+        - AO7.7
+        - AO8.7
+        - AO11.7
+        - AO12.7
+        - AO16.8
+        - AO17.8
+        - CC5
+    - element: 3
+      pc: 2
+      text: >
+        3.2 Check, maintain, store and secure tools and equipment and report any
+        faults.
+      evidence_sources:
+        - IE1
+        - IE2
+        - IE3
+        - AO1.8
+        - AO2.8
+        - AO7.8
+        - AO8.8
+        - AO11.8
+        - AO12.8
+        - AO16.9
+        - AO17.9
+        - CC5
+
+  knowledge_evidence:
+    - id: KE1
+      text: workplace quality policies and standards for using carpentry tools and equipment
+      evidence_sources:
+        - WA1
+    - id: KE2
+      text: safety requirements for using carpentry tools and equipment
+      evidence_sources:
+        - WA2
+    - id: KE3
+      text: >
+        types of tools and equipment and their characteristics, uses and
+        limitations: hand tools including: retractable tape measure, folding or
+        steel ruler, combination square, spirit level, string line, chalk line,
+        hand saw, coping saw, carpenters hammer/claw hammer, wood chisel, hand
+        plane, metal trimming knife, clamp, bevel, tin snips
+      evidence_sources:
+        - WA3
+    - id: KE4
+      text: >
+        types of tools and equipment and their characteristics, uses and
+        limitations: power/battery/pneumatic tools and equipment: bench grinder,
+        circular saw, reciprocating saw, sliding compound saw, jigsaw, angle
+        grinder, mobile plane, laminate trimmer or router, drill, rotary hammer
+        drill, impact driver, nail gun, extension lead, portable residual
+        current device, air compressor and hoses
+      evidence_sources:
+        - WA4
+        - WA5
+    - id: KE5
+      text: processes to safely grind, sharpen and hone a hand plane blade and a chisel.
+      evidence_sources:
+        - WA6

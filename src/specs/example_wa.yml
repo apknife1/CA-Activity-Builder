@@ -1,0 +1,195 @@
+unit_code: CPCCCA2002
+unit_title: Use carpentry tools and equipment
+activity_type: written_assessment
+
+requirements:
+  elements:
+    - Plan and prepare.
+    - "Select, check and use tools and equipment."
+    - Clean up.
+
+information:
+  instructions: >
+    Answer the questions in your own words. You can use dot points. Think about
+    real jobs you have done. If you are not sure about a question, ask your
+    assessor or RPL Coordinator.
+
+sections:
+  - id: S1
+    title: Workplace quality and safety
+    instructions: >
+      This section checks that you understand your workplace quality rules and
+      safety requirements when using carpentry tools and equipment.
+    questions:
+      - id: Q1
+        display_number: "1"
+        field_type: "long_answer"
+        question_text: >
+          In your workplace, what quality policies and standards apply when you
+          use carpentry tools and equipment, and how do they affect the way you
+          do your work?
+        candidate_help: >
+          This question is to check that you understand your company's quality
+          rules for using tools and equipment. In your answer, talk about things
+          like workmanship standards, tool care and maintenance procedures,
+          reporting damaged tools, and any checklists or sign-off steps you must
+          follow when using carpentry tools and equipment.
+        ke_source: >
+          workplace quality policies and standards for using carpentry tools and
+          equipment
+      - id: Q2
+        display_number: "2"
+        field_type: "long_answer"
+        question_text: >
+          What are the main safety requirements you must follow when using
+          carpentry tools and equipment on site?
+        candidate_help: >
+          This question is to check that you know the key safety rules for using
+          tools and equipment. In your answer, include points such as following
+          WHS procedures, using the right PPE, checking guards and safety
+          devices, keeping leads and hoses safe, keeping your work area tidy and
+          following manufacturers' instructions.
+        ke_source: >
+          safety requirements for using carpentry tools and equipment
+
+  - id: S2
+    title: Hand tools
+    instructions: >
+      This section checks that you know the main hand tools used in carpentry,
+      what they are used for and their limits.
+    questions:
+      - id: Q3
+        display_number: "3"
+        field_type: "long_answer"
+        question_text: >
+          Name some of the main carpentry hand tools you use and explain what
+          each one is used for and one important limitation or safety point for
+          each tool.
+        candidate_help: >
+          This question is to check that you know the types of hand tools and
+          what they can and cannot do. In your answer, choose several tools such
+          as retractable tape measure, folding or steel ruler, combination
+          square, spirit level, string line, chalk line, hand saw, coping saw,
+          carpenters hammer or claw hammer, wood chisel, hand plane, metal
+          trimming knife, clamps, bevels and tin snips. For each tool you choose
+          say what you use it for and mention one limitation or safety issue,
+          such as the type of material it suits, how accurate it is or what can
+          go wrong if it is used incorrectly.
+        ke_source: >
+          types of tools and equipment and their characteristics, uses and
+          limitations:
+          hand tools including:
+          retractable tape measure
+          folding or steel ruler
+          combination square
+          spirit level
+          string line
+          chalk line
+          hand saw
+          coping saw
+          carpenters hammer/claw hammer
+          wood chisel
+          hand plane
+          metal trimming knife
+          clamp
+          bevel
+          tin snips (1/3)
+
+  - id: S3
+    title: Power tools and equipment
+    instructions: >
+      This section checks that you understand the power, battery and pneumatic
+      tools and equipment you use, and how to use them safely and within their
+      limits.
+    questions:
+      - id: Q4
+        display_number: "4"
+        field_type: "long_answer"
+        question_text: >
+          Name some of the main power, battery and pneumatic tools you use for
+          carpentry and explain what each one is used for and one important
+          limitation or safety point for each tool.
+        candidate_help: >
+          This question is to check that you know the common powered carpentry
+          tools, what they are used for and their limits. In your answer,
+          include tools such as bench grinder, circular saw, reciprocating saw,
+          sliding compound saw, jigsaw, angle grinder, mobile plane, laminate
+          trimmer or router, drill, rotary hammer drill, impact driver and nail
+          gun. For each tool you choose, say what job you use it for and mention
+          an important limit or safety point, such as material type, cutting
+          depth, kickback risk, need for guards or dust control.
+        ke_source: >
+          types of tools and equipment and their characteristics, uses and
+          limitations:
+          power/battery/pneumatic tools and equipment:
+          bench grinder
+          circular saw
+          reciprocating saw
+          sliding compound saw
+          jigsaw
+          angle grinder
+          mobile plane
+          laminate trimmer or router
+          drill
+          rotary hammer drill
+          impact driver
+          nail gun (2/3)
+      - id: Q5
+        display_number: "5"
+        field_type: "long_answer"
+        question_text: >
+          Explain how you safely set up and use extension leads, portable
+          residual current devices (RCDs), and air compressors and hoses when
+          using carpentry tools and equipment.
+        candidate_help: >
+          This question is to check that you know how to use electrical and
+          pneumatic supply equipment safely. In your answer, talk about things
+          like checking tags and testing RCDs, keeping leads off sharp edges and
+          out of water, avoiding trip hazards, not overloading leads, matching
+          air hoses and fittings to the compressor, checking pressures, draining
+          condensate and doing regular checks before and after use. Mention any
+          limits, such as maximum lengths, loads or pressures.
+        ke_source: >
+          types of tools and equipment and their characteristics, uses and
+          limitations:
+          power/battery/pneumatic tools and equipment:
+          extension lead
+          portable residual current device
+          air compressor and hoses (3/3)
+
+  - id: S4
+    title: Sharpening and maintenance
+    instructions: >
+      This section checks that you know how to safely grind, sharpen and hone
+      cutting edges on hand tools.
+    questions:
+      - id: Q6
+        display_number: "6"
+        field_type: "long_answer"
+        question_text: >
+          Describe the steps you follow to safely grind, sharpen and hone a hand
+          plane blade and a chisel.
+        candidate_help: >
+          This question is to check that you understand the safe process for
+          keeping cutting tools sharp. In your answer, describe how you prepare
+          the grinder and work area, use the bench grinder safely, keep the
+          correct grinding angle, avoid overheating the steel, and then sharpen
+          and hone the edge using stones or other sharpening systems. Explain
+          any PPE you use and how you check that the blade or chisel is sharp
+          and ready for use.
+        ke_source: >
+          processes to safely grind, sharpen and hone a hand plane blade and a
+          chisel.
+
+marking_guide:
+  model_points:
+    - Candidate explains relevant workplace quality policies and standards for using carpentry tools and equipment, including expectations for workmanship and tool care.
+    - Candidate identifies key safety requirements for using carpentry tools and equipment, including WHS procedures, PPE, guarding, housekeeping and following manufacturers' instructions.
+    - Candidate correctly describes typical uses and basic limitations or safety points for common carpentry hand tools such as measuring, marking, cutting, shaping and holding tools.
+    - Candidate correctly describes typical uses and basic limitations or safety points for common power, battery and pneumatic tools used in carpentry, including saws, grinders, drills, drivers and nail guns.
+    - Candidate explains safe set-up and use of extension leads, portable residual current devices and air compressors and hoses, including checking, positioning and load or pressure limits.
+    - Candidate describes a safe and logical process to grind, sharpen and hone a hand plane blade and a chisel, including preparation, use of a bench grinder, PPE, correct angles, cooling and final honing checks.
+  decision_outcomes:
+    - Satisfactory
+    - Not yet satisfactory
+  notes_label: Assessor marking notes

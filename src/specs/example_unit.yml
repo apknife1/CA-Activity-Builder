@@ -1,0 +1,17 @@
+unit_code: ICTICT201
+unit_name: Use computer operating systems and hardware
+
+activities:
+  - activity_code: ICTICT201_ACT1
+    activity_title: "RPL Evidence – ICTICT201 – Knowledge"
+    intro_text: |
+      This activity collects evidence of your existing skills and knowledge
+      in ICTICT201. Please answer all questions in your own words.
+
+    components:
+      - type: short_answer
+        question_id: Q1
+        label: "Describe your current role and main IT tasks."
+      - type: short_answer
+        question_id: Q2
+        label: "Explain how you ensure data is backed up in your workplace."

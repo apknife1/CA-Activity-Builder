@@ -1,0 +1,39 @@
+unit_code: CPCCCA2002
+unit_title: Use carpentry tools and equipment
+activity_type: competency_conversation
+
+requirements:
+  elements:
+    - Plan and prepare.
+    - "Select, check and use tools and equipment."
+    - Clean up.
+
+conversation:
+  default_questions:
+    - >
+      Tell me about your experience using carpentry hand and power tools on site.
+      What sort of jobs have you been doing and what was your role with the tools
+      on those jobs?
+
+    - >
+      When you are getting ready to use carpentry tools and equipment on a job,
+      how do you plan the work and set up the area? Talk me through how you read
+      the instructions, choose your PPE, and check the work area and services
+      before you start.
+
+    - >
+      Think about a recent carpentry task you have done, like framing or fixing.
+      Walk me through how you chose which hand tools, power tools and pneumatic
+      tools to use, how you checked they were safe and serviceable, and how you
+      used them through the job.
+
+    - >
+      Can you tell me how you look after your tools day to day? Describe how you
+      sharpen and hone your chisels and plane blades, and how you safely change
+      blades, cutters or grinding discs on tools such as circular saws, planers,
+      routers or grinders.
+
+    - >
+      After you finish using tools on a job, what do you do to clean up and pack
+      up? Explain how you deal with waste, check and maintain the tools, store or
+      secure them, and report any faults you find.

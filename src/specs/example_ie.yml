@@ -1,0 +1,221 @@
+unit_code: CPCCCA2002
+unit_title: Use carpentry tools and equipment
+activity_type: industry_evidence
+
+requirements:
+  elements:
+    - Plan and prepare.
+    - "Select, check and use tools and equipment."
+    - Clean up.
+
+information:
+  what_this_is: >
+    You will need to upload substantial evidence of your industry experience, performed
+    to industry accepted quality, of the following: using and maintaining carpentry
+    hand tools, power tools, pneumatic tools and equipment across three different
+    carpentry tasks, including sharpening and replacing blades and cutters.
+  must_cover_points:
+    - Safely and effectively using and maintaining carpentry hand tools, power tools and pneumatic tools and equipment.
+    - Showing that this has been done across three different carpentry tasks in the construction industry.
+    - Showing that you have used and maintained each of the listed hand tools at least once.
+    - Showing that you have used and maintained each of the listed power, battery and pneumatic tools and equipment at least once.
+    - Showing how you replace blades, cutters and grinding discs in a power saw, powered planer, router and grinder.
+    - Showing how you grind, sharpen and hone a hand plane blade and a chisel.
+  notes: >
+    Short videos with your voice are preferred. Photos may be added. Make sure you
+    clearly show the tools, how you are using them, and the condition of the tools
+    before and after any maintenance or sharpening work.
+
+projects:
+  - title: Project A - Carpentry task 1 using tools and equipment
+    uploads:
+      label: Upload area (multiple files allowed)
+      helper_text: >
+        Upload clear photos, short video clips or scanned documents that show you using
+        and maintaining carpentry hand tools on this carpentry task. Short videos with
+        your voice explaining what you are doing are preferred.
+    describe_evidence:
+      intro_text: >
+        Describe the job or activity for which you have uploaded evidence. You can upload
+        a short video explanation instead of writing long answers, if you prefer.
+      short_fields:
+        - "Job(s) or site(s) name:"
+        - "Builder or company:"
+        - "Suburb and state:"
+        - "Type of job:"
+        - "Dates you did the work:"
+        - "What was your role within the project(s)?"
+      long_fields:
+        - "Description of the project(s) for which you uploaded evidence (for example job requirements, steps taken to complete the job, people involved)."
+        - "Other comments:"
+      verifier_fields:
+        - "Verifier's name:"
+        - "Verifier's role or company:"
+        - "Verifier's best contact details (phone or email):"
+    verifier_required: true
+    self_check_table:
+      candidate_columns:
+        - Attached
+        - Partially
+        - Can demo in workshop
+      rows:
+        - "Use and maintain hand tools: retractable tape measure."
+        - "Use and maintain hand tools: folding or steel ruler."
+        - "Use and maintain hand tools: combination square."
+        - "Use and maintain hand tools: string line."
+        - "Use and maintain hand tools: chalk line."
+        - "Use and maintain hand tools: hand saw."
+        - "Use and maintain hand tools: coping saw."
+        - "Use and maintain hand tools: carpenters hammer / claw hammer."
+        - "Use and maintain hand tools: wood chisel."
+        - "Use and maintain hand tools: hand plane."
+        - "Use and maintain hand tools: trimming knife."
+    declaration_text: >
+      I declare that the evidence I have provided for this project is my own work and
+      accurately reflects how I used and maintained carpentry hand tools on this
+      carpentry task.
+
+  - title: Project B - Carpentry task 2 using tools and equipment
+    uploads:
+      label: Upload area (multiple files allowed)
+      helper_text: >
+        Upload clear photos, short video clips or scanned documents that show you using
+        and maintaining carpentry hand tools and selected power tools on this carpentry
+        task. Short videos with your voice explaining what you are doing are preferred.
+    describe_evidence:
+      intro_text: >
+        Describe the job or activity for which you have uploaded evidence. You can upload
+        a short video explanation instead of writing long answers, if you prefer.
+      short_fields:
+        - "Job(s) or site(s) name:"
+        - "Builder or company:"
+        - "Suburb and state:"
+        - "Type of job:"
+        - "Dates you did the work:"
+        - "What was your role within the project(s)?"
+      long_fields:
+        - "Description of the project(s) for which you uploaded evidence (for example job requirements, steps taken to complete the job, people involved)."
+        - "Other comments:"
+      verifier_fields:
+        - "Verifier's name:"
+        - "Verifier's role or company:"
+        - "Verifier's best contact details (phone or email):"
+    verifier_required: true
+    self_check_table:
+      candidate_columns:
+        - Attached
+        - Partially
+        - Can demo in workshop
+      rows:
+        - "Use and maintain hand tools: clamps."
+        - "Use and maintain hand tools: bevels."
+        - "Use and maintain hand tools: spirit level."
+        - "Use and maintain hand tools: tin snips."
+        - "Use and maintain power/battery/pneumatic tools and equipment: circular saw."
+        - "Use and maintain power/battery/pneumatic tools and equipment: reciprocating saw."
+        - "Use and maintain power/battery/pneumatic tools and equipment: sliding compound saw."
+        - "Use and maintain power/battery/pneumatic tools and equipment: jigsaw."
+        - "Use and maintain power/battery/pneumatic tools and equipment: angle grinder."
+        - "Use and maintain power/battery/pneumatic tools and equipment: planer."
+        - "Use and maintain power/battery/pneumatic tools and equipment: laminate trimmer or router."
+    declaration_text: >
+      I declare that the evidence I have provided for this project is my own work and
+      accurately reflects how I used and maintained carpentry hand tools and selected
+      power tools on this carpentry task.
+
+  - title: Project C - Carpentry task 3 using tools and equipment
+    uploads:
+      label: Upload area (multiple files allowed)
+      helper_text: >
+        Upload clear photos, short video clips or scanned documents that show you using
+        and maintaining carpentry power tools, pneumatic tools and equipment, and carrying
+        out sharpening and blade replacement tasks. Short videos with your voice
+        explaining what you are doing are preferred.
+    describe_evidence:
+      intro_text: >
+        Describe the job or activity for which you have uploaded evidence. You can upload
+        a short video explanation instead of writing long answers, if you prefer.
+      short_fields:
+        - "Job(s) or site(s) name:"
+        - "Builder or company:"
+        - "Suburb and state:"
+        - "Type of job:"
+        - "Dates you did the work:"
+        - "What was your role within the project(s)?"
+      long_fields:
+        - "Description of the project(s) for which you uploaded evidence (for example job requirements, steps taken to complete the job, people involved)."
+        - "Other comments:"
+      verifier_fields:
+        - "Verifier's name:"
+        - "Verifier's role or company:"
+        - "Verifier's best contact details (phone or email):"
+    verifier_required: true
+    self_check_table:
+      candidate_columns:
+        - Attached
+        - Partially
+        - Can demo in workshop
+      rows:
+        - "Use and maintain power/battery/pneumatic tools and equipment: drill."
+        - "Use and maintain power/battery/pneumatic tools and equipment: rotary hammer drill."
+        - "Use and maintain power/battery/pneumatic tools and equipment: impact driver."
+        - "Use and maintain power/battery/pneumatic tools and equipment: nail gun."
+        - "Use and maintain power/battery/pneumatic tools and equipment: bench grinder."
+        - "Use and maintain power/battery/pneumatic tools and equipment: extension lead."
+        - "Use and maintain power/battery/pneumatic tools and equipment: portable residual current device."
+        - "Use and maintain power/battery/pneumatic tools and equipment: air compressor and hoses."
+        - "Replace blades/cutters/grinding discs in a power saw, a powered planer, a router and grinder."
+        - "Grind, sharpen and hone a hand plane blade."
+        - "Grind, sharpen and hone a chisel."
+    declaration_text: >
+      I declare that the evidence I have provided for this project is my own work and
+      accurately reflects how I used and maintained carpentry power tools, pneumatic
+      tools and equipment, and carried out sharpening and blade replacement tasks on
+      this carpentry task.
+
+assessor_section:
+  coverage_checks:
+    - "Safely and effectively, across three different carpentry tasks, use and maintain all of the listed tools and equipment at least once."
+    - "Use and maintain hand tools: retractable tape measure."
+    - "Use and maintain hand tools: folding or steel ruler."
+    - "Use and maintain hand tools: combination square."
+    - "Use and maintain hand tools: string line."
+    - "Use and maintain hand tools: chalk line."
+    - "Use and maintain hand tools: hand saw."
+    - "Use and maintain hand tools: coping saw."
+    - "Use and maintain hand tools: carpenters hammer / claw hammer."
+    - "Use and maintain hand tools: wood chisel."
+    - "Use and maintain hand tools: hand plane."
+    - "Use and maintain hand tools: trimming knife."
+    - "Use and maintain hand tools: clamps."
+    - "Use and maintain hand tools: bevels."
+    - "Use and maintain hand tools: spirit level."
+    - "Use and maintain hand tools: tin snips."
+    - "Use and maintain power/battery/pneumatic tools and equipment: circular saw."
+    - "Use and maintain power/battery/pneumatic tools and equipment: reciprocating saw."
+    - "Use and maintain power/battery/pneumatic tools and equipment: sliding compound saw."
+    - "Use and maintain power/battery/pneumatic tools and equipment: jigsaw."
+    - "Use and maintain power/battery/pneumatic tools and equipment: angle grinder."
+    - "Use and maintain power/battery/pneumatic tools and equipment: planer."
+    - "Use and maintain power/battery/pneumatic tools and equipment: laminate trimmer or router."
+    - "Use and maintain power/battery/pneumatic tools and equipment: drill."
+    - "Use and maintain power/battery/pneumatic tools and equipment: rotary hammer drill."
+    - "Use and maintain power/battery/pneumatic tools and equipment: impact driver."
+    - "Use and maintain power/battery/pneumatic tools and equipment: nail gun."
+    - "Use and maintain power/battery/pneumatic tools and equipment: bench grinder."
+    - "Use and maintain power/battery/pneumatic tools and equipment: extension lead."
+    - "Use and maintain power/battery/pneumatic tools and equipment: portable residual current device."
+    - "Use and maintain power/battery/pneumatic tools and equipment: air compressor and hoses."
+    - "Replace blades/cutters/grinding discs in a power saw, a powered planer, a router and grinder."
+    - "Grind, sharpen and hone a hand plane blade."
+    - "Grind, sharpen and hone a chisel."
+  decision_options:
+    - Evidence is sufficient
+    - More evidence required
+    - Schedule observation
+    - Schedule gap training then reassessment
+  notes_label: Notes (point to files used for the decision)
+
+branding:
+  header_text: CTI RPL Kit - Industry Evidence Template
+  logo_path: null
