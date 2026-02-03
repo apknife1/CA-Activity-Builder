@@ -883,6 +883,7 @@ class ActivityBuildController:
                     consecutive_failures = 0
 
                     # ---- 2. Configure field ----
+                with phase_timer(logger, f"{act.activity_code}: configure field {field_key}"):
                     # Build config from spec + defaults and configure the new field
                     cfg = build_field_config(fi)
 
@@ -894,7 +895,6 @@ class ActivityBuildController:
                         sample = next(iter(cfg.cell_overrides.items()), None)
                         logger.info("Table cell_overrides sample=%r", sample)
 
-                with phase_timer(logger, f"{act.activity_code}: configure field {field_key}"):
                     prop_fault_inject: bool = False
                     try:
                         if faults.should_fail_properties(fi_index):
