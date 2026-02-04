@@ -1,6 +1,7 @@
 # controller.py
 from __future__ import annotations
 
+from time import perf_counter
 from typing import List, Any, Optional, Set
 from pathlib import Path
 from datetime import datetime
@@ -18,6 +19,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
 from src.ca_bldr.field_configs import TableConfig
+from src.ca_bldr.instrumentation import Cat
 
 from .errors import TableResizeError, FieldPropertiesSidebarTimeout
 from .spec_reader import ActivityInstruction
@@ -25,7 +27,7 @@ from .context import AppContext
 from .config_builder import build_field_config
 from .instruction_dump import dump_activity_instruction_json
 from .timing import phase_timer
-from .types import FailureRecord
+from .types import FailureRecord, ActivityStatus
 from .failures import make_failure_record
 from .. import config as config
 
@@ -70,8 +72,9 @@ class ActivityBuildController:
         reader = self.reader
 
         # 1. Go to Activity Templates landing page
-        session.go_to_activity_templates()
+        # session.go_to_activity_templates()
 
+        # 1. Initialize run output dir
         run_dir = self._init_run_dir()
         self._attach_run_file_logger(run_dir)
         logger.info("Run output dir: %s", run_dir.as_posix())
@@ -110,73 +113,86 @@ class ActivityBuildController:
             activity_count=len(activities),
         )
 
-        # # 4.For now, let you manually start the process
-        # print("\nActivity template created.")
-        # input(
-        #     "➡ In the browser window, make sure that you are on the Activity Templates page.\n"
-        #     "➡ Once the correct page is loaded, press Enter here to continue..."
-        # )
-
-        # 5. Iterate through Activities
+        # 4. Iterate through Activities
         for act in activities:
             with phase_timer(logger, f"Activity {act.activity_code} full build"):
 
-                title_val = getattr(act, "activity_title", "") or ""
-                code_val  = getattr(act, "activity_code", "") or ""
+                self.session.emit_signal(Cat.NAV, "Activity start", act=act.activity_code)
+                status: ActivityStatus = ActivityStatus.ABORTED
+                reason: str | None = None
+                t0 = perf_counter()
+                start_counters = self.session.counters.snapshot()
 
-                logger.info(
-                    "Preparing to create activity template for code=%r, title=%r",
-                    title_val,
-                    code_val,
-                )
+                try:
+                    with phase_timer(logger, f"{act.activity_code}: locate existing template"):
+                        match = session.find_activity_template_by_title_any_status(act.activity_title or "")
 
-                with phase_timer(logger, f"{act.activity_code}: locate existing template"):
-                    match = session.find_activity_template_by_title_any_status(title_val)
+                    self.session.emit_signal(Cat.NAV, f"Template locate result={('found' if match else 'not_found')}", act=act.activity_code)
 
-                if match:
-                    logger.warning(
-                        "Skipping build: template already exists (%s). title=%r code=%r template_id=%r href=%s",
-                        match.status,
-                        match.title,
-                        getattr(act, "activity_code", None),
-                        match.template_id,
-                        match.href,
-                    )
-                    if match.status == "inactive":
-                        logger.warning(
-                            "Note: inactive templates may be editable unless assigned; assigned templates are locked and require a new revision."
-                        )
-                    continue
+                    if match and match.status != "inactive":
+                        status = ActivityStatus.SKIPPED_EXISTING 
+                        reason = "template_exists"
+                        continue
 
-                else:
-                    # No match found → create new
-                    # 5.1 Create the new activity template via offcanvas
-                    with phase_timer(logger, f"{act.activity_code}: create template"):
-                        created = self._create_activity_from_instruction(act)
-                        if not created:
-                            self.logger.error(
-                                "Aborting build: failed to create activity template for code=%r.",
-                                getattr(act, "activity_code", None),
-                            )
+                    elif match and match.status == "inactive":
+                        # TODO future revision to enable editing of inactive templates 
+                        # that have no students assigned
+                        status = ActivityStatus.SKIPPED_EXISTING 
+                        reason = "template_exists_inactive"
+                        continue
+
+                    else:
+                        # No match found → create new
+                        # 5.1 Create the new activity template via offcanvas
+                        with phase_timer(logger, f"{act.activity_code}: create template"):
+                            created = self._create_activity_from_instruction(act)
+                            if not created:
+                                status = ActivityStatus.FAILED
+                                reason = "create_template"
+                                return
+                        
+                        # 5.2 open the builder page
+                        with phase_timer(logger, f"{act.activity_code}: open Activity Builder"):
+                            if not self._open_activity_builder_for_new_activity():
+                                status = ActivityStatus.FAILED
+                                reason = "open_activity_builder"
+                                return
+
+                        # 5.3 Run the build loop for this single activity
+                        ok = self._build_from_instruction(act, run_dir=run_dir)
+                        if not ok:
+                            status = ActivityStatus.FAILED
+                            reason = "build_activity"
                             return
-                    
-                    # 5.2 open the builder page
-                    with phase_timer(logger, f"{act.activity_code}: open Activity Builder"):
-                        if not self._open_activity_builder_for_new_activity():
-                            logger.error(
-                                "Aborting: could not open Activity Builder for code=%r.",
-                                getattr(act, "activity_code", None),                    
-                            )
-                            return
 
-                    # 5.3 Run the build loop for this single activity
-                    ok = self._build_from_instruction(act, run_dir=run_dir)
-                    if not ok:
-                        logger.error(
-                            "Aborting: build failed critically for activity code=%r.",
-                            getattr(act, "activity_code", None),
+                    status = ActivityStatus.OK
+                    reason = None                        
+
+                finally:        
+                    elapsed = perf_counter() - t0
+                    end_counters = self.session.counters.snapshot()
+
+                    # compute deltas so per-activity summary isn't polluted by previous activities
+                    keys = set(end_counters) | set(start_counters)
+                    delta = {k: end_counters.get(k, 0) - start_counters.get(k, 0) for k in keys}
+
+                    try:
+                        # keep this compact in LIVE:
+                        self.session.emit_signal(
+                            Cat.NAV,
+                            f"Activity end status={status} reason={reason or '-'} elapsed={elapsed:.1f}s "
+                            f"align_checks={delta.get('section.canvas_align_checks',0)} "
+                            f"fields_sidebar={delta.get('sidebar.fields_ensure_calls',0)} "
+                            f"props_opens={delta.get('editor.properties_opens',0)} "
+                            f"drag_attempts={delta.get('drop.drag_attempts',0)} "
+                            f"phantoms={delta.get('phantom.timeouts',0)} "
+                            f"hard_resync={delta.get('section.hard_resyncs',0)} "
+                            f"retries={delta.get('retry.pass_runs',0)}",
+                            act=act.activity_code,
                         )
-                        return
+                    except Exception:
+                        # don't let summary emission break the run shutdown / control flow
+                        pass
 
         input(
             "\nCheck the Activity Builder page:\n"

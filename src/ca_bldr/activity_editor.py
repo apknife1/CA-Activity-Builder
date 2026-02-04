@@ -1933,6 +1933,7 @@ class ActivityEditor:
 
                         # binding proof gate
                         if self._is_field_settings_open_for_field(field_el):
+                            self.session.counters.inc("editor.properties_opens")
                             return frame
 
                         # mismatch -> log probes then recovery then retry

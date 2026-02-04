@@ -20,6 +20,7 @@ from selenium.common.exceptions import (
 
 from .driver import create_driver  # your driver factory
 from .types import UIProbeSnapshot, FieldSettingsFrameInfo, FieldSettingsTabInfo, TemplateMatch
+from .instrumentation import Cat, Counters, InstrumentPolicy, LogMode, RateLimiter, format_ctx
 from .. import config  # src/config.py
 
 Locator = Tuple[str, str]
@@ -41,6 +42,18 @@ class CASession:
             raise ValueError("CA_USERNAME and CA_PASSWORD must be set in .env")
 
         self.wait = WebDriverWait(self.driver, config.WAIT_TIME)
+
+        # Instrumentation setup
+        mode = LogMode(config.LOG_MODE) if config.LOG_MODE in ("live", "debug", "trace") else LogMode.LIVE
+
+        self.instr_policy = InstrumentPolicy(
+            mode=mode,
+            diag_min_mode={},  # we can fill this later; start simple
+            include_ctx=True,
+            rate_limits_s=getattr(config, "LOG_RATE_LIMITS_S", {}) or {},
+        )
+        self.counters = Counters()
+        self._rate = RateLimiter()
 
     def get_wait(self, timeout: int | None = None) -> WebDriverWait:
         """
@@ -982,3 +995,27 @@ class CASession:
         if aria and aria.lower() == "true":
             return True
         return False
+    
+    def emit_signal(self, cat: Cat, msg: str, **ctx):
+        # always allowed
+        prefix = f"[{cat}]"
+        if self.instr_policy.include_ctx:
+            c = format_ctx(**ctx)
+            if c:
+                msg = f"{msg} :: {c}"
+        self.logger.info(f"{prefix} {msg}")
+
+    def emit_diag(self, cat: Cat, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx):
+        # gated by mode; DEBUG+ only for now
+        if self.instr_policy.mode == LogMode.LIVE:
+            return
+        if key and every_s:
+            if not self._rate.allow(key, every_s):
+                return
+
+        prefix = f"[{cat}]"
+        if self.instr_policy.include_ctx:
+            c = format_ctx(**ctx)
+            if c:
+                msg = f"{msg} :: {c}"
+        self.logger.debug(f"{prefix} {msg}")

@@ -792,7 +792,9 @@ class ActivitySections:
         """
         logger = self.logger
         driver = self.driver
-        wait = self.session.get_wait(timeout)  
+        wait = self.session.get_wait(timeout)
+
+        self.session.counters.inc("section.hard_resyncs")
 
         self._sections_cache_invalidate(reason="hard_resync")
 
@@ -1511,6 +1513,8 @@ class ActivitySections:
         """
         logger = self.logger
         driver = self.driver
+
+        self.session.counters.inc("section.canvas_align_checks")
 
         handle = self.current_section_handle
         if not handle or not handle.section_id:

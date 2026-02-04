@@ -86,6 +86,9 @@ class CAActivityBuilder:
         wait: WebDriverWait = self.session.wait
         logger = self.logger
 
+        if kind =="fields":
+            self.session.counters.inc("sidebar.fields_ensure_calls")
+
         sidebars = config.BUILDER_SELECTORS.get("sidebars", {})
         cfg = sidebars.get(kind, {})
 
@@ -790,6 +793,7 @@ class CAActivityBuilder:
                         late_candidates[:8],
                     )
                 else:
+                    self.session.counters.inc("phantom.timeouts")
                     logger.warning(
                         "Field creation not confirmed within timeout for %s (create_attempt %d); attempting DOM-delta recovery.",
                         spec.display_name,
@@ -1277,6 +1281,8 @@ class CAActivityBuilder:
             fi_index=fi_index,
         )
 
+        self.session.counters.inc("builder.fields_added")
+        
         logger.info(
             "Created %s field with id %s, titled %s in section %s (index=%s)",
             spec.display_name,
@@ -1450,6 +1456,8 @@ class CAActivityBuilder:
     ) -> DropGestureResult:
         driver = self.driver
         logger = self.logger
+
+        self.session.counters.inc("drop.drag_attempts")
 
         note = f"type={key} create_attempt={create_attempt} drag_attempt={drag_attempt} loc={drop_location}"
 

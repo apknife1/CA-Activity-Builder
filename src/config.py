@@ -27,6 +27,12 @@ SECTIONS_LIST_CACHE_TTL = 0.75
 # When True, builder will log extra diagnostics around dropzones + placement.
 INSTRUMENT_DROPS: bool = True
 INSTRUMENT_UI_STATE: bool = True
+LOG_MODE = os.getenv("CA_LOG_MODE", "live").lower()  # live | debug | trace
+LOG_RATE_LIMITS_S = {
+    "SECTION.canvas_aligned": 1.0,
+    "SIDEBAR.fields_visible": 1.0,
+}
+
 
 # --- Retry behavior configuration ---
 AUTO_RETRY_FAILURES = True          # unattended mode

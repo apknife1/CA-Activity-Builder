@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import TypedDict, NotRequired, Any, Literal
+from enum import Enum
 from dataclasses import dataclass
 
 class ExpectedInfo(TypedDict):
@@ -25,6 +26,12 @@ class UIProbeSnapshot(TypedDict):
     field_settings_frame: FieldSettingsFrameInfo
     froala_tooltips: int | None
     field_class: str | None
+
+class ActivityStatus(str, Enum):
+    OK = "ok"
+    FAILED = "failed"
+    SKIPPED_EXISTING = "skipped_existing"
+    ABORTED = "aborted"
 
 FailureKind = Literal["add", "configure", "properties", "table_resize", "unknown"]
 
