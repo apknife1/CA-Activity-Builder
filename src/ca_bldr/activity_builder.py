@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 from collections import Counter
 import re
 
@@ -22,6 +22,7 @@ from .field_handles import FieldHandle
 from .activity_sections import ActivitySections
 from .activity_editor import ActivityEditor
 from .activity_registry import ActivityRegistry
+from .instrumentation import Cat
 from .. import config  # src/config.py
 
 @dataclass(frozen=True)
@@ -62,6 +63,16 @@ class CAActivityBuilder:
         self.registry = registry
         self.hard_resync_count = 0
 
+    def _ctx(self, *, kind: str | None = None, sec=None, fid=None, spec=None, fi=None, a: str | None=None) -> dict[str, Any]:
+        return {
+            "sec": sec or (self.sections.current_section_id or ""),
+            "kind": kind or "",
+            "fid": fid,
+            "type": getattr(spec, "key", None) if spec else None,
+            "fi": fi,
+            "a": a,
+        }
+
     def open_dev_unit(self, unit_url: str):
         self.logger.info(f"Opening dev unit at {unit_url}")
         self.driver.get(unit_url)
@@ -83,11 +94,12 @@ class CAActivityBuilder:
             True if the requested sidebar tab is visible by the end, False otherwise.
         """
         driver = self.session.driver
-        wait: WebDriverWait = self.session.wait
-        logger = self.logger
+        wait = self.session.get_wait(timeout)
 
         if kind =="fields":
             self.session.counters.inc("sidebar.fields_ensure_calls")
+
+        ctx = self._ctx(kind=kind)
 
         sidebars = config.BUILDER_SELECTORS.get("sidebars", {})
         cfg = sidebars.get(kind, {})
@@ -96,7 +108,11 @@ class CAActivityBuilder:
         frame_sel = cfg.get("frame")
 
         if not tab_sel:
-            logger.error("No tab selector configured for sidebar kind %r.", kind)
+            self.session.emit_signal(
+                Cat.SIDEBAR,
+                f"Config error: missing tab selector for kind={kind}",
+                kind=kind,
+            )
             return False
 
         def _tab_is_visible() -> bool:
@@ -104,26 +120,37 @@ class CAActivityBuilder:
                 el = driver.find_element(By.CSS_SELECTOR, tab_sel)
                 return el.is_displayed()
             except Exception:
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    f"{kind} sidebar not visible (fast-path)",
+                    key=f"SIDEBAR.{kind}.not_visible",
+                    every_s=1.0,
+                    **ctx,
+                )
                 return False
 
         # Fast path: if the tab is already visible, we're done.
-        try:
-            if _tab_is_visible():
-                logger.info("%s sidebar tab already visible.", kind.capitalize())
-                return True
-        except Exception:
-            logger.info(
-                "%s sidebar tab not currently visible; will try to open it.",
-                kind.capitalize(),
+        if _tab_is_visible():
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                f"{kind} sidebar already visible (fast-path)",
+                key=f"SIDEBAR.{kind}.visible",
+                every_s=1.0,
+                **ctx,
             )
+            return True
 
         # Helper: click the toggle button for this sidebar once
-        def _click_toggle_once() -> bool:
-            nonlocal driver, logger
+        def _click_toggle_once(ctx_attempt: dict) -> bool:
+            nonlocal driver
 
             if kind == "fields":
                 toggle_sel = cfg.get("toggle_button", "button[data-type='fields']")
-                logger.info("Looking for 'Add Fields' button with selector: %s", toggle_sel)
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    f"{kind} sidebar toggle click",
+                    **{**ctx_attempt,"method": "selector"},
+                )
                 btn = driver.find_element(By.CSS_SELECTOR, toggle_sel)
 
                 clicked = False
@@ -143,12 +170,18 @@ class CAActivityBuilder:
                         "toggle_button_onclick",
                         "button[onclick*='toggleSidebar'][onclick*='sections']",
                     )
-                    logger.info("Looking for 'Sections' button by onclick attribute...")
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        f"{kind} sidebar toggle click",
+                        **{**ctx_attempt, "method": "onclick_selector"},
+                    )
                     sections_btn = driver.find_element(By.CSS_SELECTOR, onclick_sel)
                 except Exception:
-                    logger.info(
-                        "No button with toggleSidebar(..., 'sections') found via CSS; "
-                        "falling back to text-based button search."
+                    # fallback to text scan
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        f"{kind} sidebar toggle click",
+                        **{**ctx_attempt, "method": "text_scan"},
                     )
                     candidates = driver.find_elements(By.TAG_NAME, "button")
                     for b in candidates:
@@ -158,11 +191,14 @@ class CAActivityBuilder:
                             text = ""
                         if text and "sections" in text.lower():
                             sections_btn = b
-                            logger.info("Found 'Sections' button by text: %r", text)
                             break
 
                 if sections_btn is None:
-                    logger.error("Could not find any 'Sections' toggle button by onclick or text.")
+                    self.session.emit_signal(
+                        Cat.SIDEBAR,
+                        f"Sections toggle button not found",
+                        **ctx_attempt,
+                    )
                     return False
 
                 clicked = False
@@ -176,24 +212,30 @@ class CAActivityBuilder:
                 return True
 
             else:
-                logger.error("Unknown sidebar kind %r.", kind)
+                self.session.emit_signal(
+                    Cat.SIDEBAR,
+                    f"Unknown sidebar kind: {kind}.",
+                    **ctx_attempt,
+                )
                 return False
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
-            logger.info(
-                "Ensuring %s sidebar is visible (attempt %d)...",
-                kind,
-                attempt,
+            ctx_attempt = self._ctx(kind=kind, a=f"attempt={attempt}/{max_attempts}")
+
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                f"Ensure {kind} sidebar visible",
+                **ctx_attempt,
             )
             try:
                 # 1) Click the toggle
-                if not _click_toggle_once():
+                if not _click_toggle_once(ctx_attempt):
                     if attempt == max_attempts:
-                        logger.error(
-                            "Failed to click %s sidebar toggle after %d attempts.",
-                            kind,
-                            max_attempts,
+                        self.session.emit_signal(
+                            Cat.SIDEBAR,
+                            f"FAILED to click {kind} sidebar toggle after {max_attempts} attempts",
+                            **ctx_attempt,
                         )
                         return False
                     continue  # try again
@@ -203,7 +245,11 @@ class CAActivityBuilder:
                     return _tab_is_visible()
 
                 wait.until(tab_visible)
-                logger.info("%s sidebar tab is now visible.", kind.capitalize())
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    f"{kind} sidebar visible",
+                    **ctx_attempt,
+                )
 
                 # 3) If this sidebar has a turbo-frame, wait for it too
                 if frame_sel:
@@ -216,68 +262,73 @@ class CAActivityBuilder:
                             return False
 
                     wait.until(frame_ready)
-                    logger.info(
-                        "%s sidebar frame %r is loaded.",
-                        kind.capitalize(),
-                        frame_sel,
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        f"{kind} sidebar frame {frame_sel} is loaded",
+                        **ctx_attempt,
                     )
 
                 # If we got here, everything is good
                 return True
 
             except TimeoutException as e:
-                logger.warning(
-                    "Timed out ensuring %s sidebar visibility on attempt %d: %s",
-                    kind,
-                    attempt,
-                    e,
-                )
-                if attempt == max_attempts:
-                    logger.error(
-                        "Timed out ensuring %s sidebar visibility after %d attempts.",
-                        kind,
-                        max_attempts,
+                if attempt < max_attempts:
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        f"Timed out ensuring {kind} sidebar visibility on attempt {attempt}: {str(e)}",
+                        key=f"SIDEBAR.{kind}.timeout",
+                        every_s=1.0,
+                        **ctx_attempt,
+                    )
+                else:
+                    self.session.emit_signal(
+                        Cat.SIDEBAR,
+                        f"Timed out ensuring {kind} sidebar visibility after {max_attempts} attempts",
+                        **ctx_attempt,
                     )
                     return False
-                # else: let the loop retry
             except StaleElementReferenceException as e:
-                logger.warning(
-                    "Stale element while ensuring %s sidebar on attempt %d: %s",
-                    kind,
-                    attempt,
-                    e,
-                )
-                if attempt == max_attempts:
-                    logger.error(
-                        "Giving up ensuring %s sidebar after %d attempts due to stale elements.",
-                        kind,
-                        max_attempts,
+                if attempt < max_attempts:
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        f"Stale element while ensuring {kind} sidebar visibility on attempt {attempt}: {str(e)}",
+                        **ctx_attempt,
+                    )
+                else:
+                    self.session.emit_signal(
+                        Cat.SIDEBAR,
+                        f"Giving up ensuring {kind} sidebar visibility after {max_attempts} attempts due to stale elements.",
+                        **ctx_attempt,
                     )
                     return False
             except WebDriverException as e:
-                logger.warning(
-                    "WebDriver error while ensuring %s sidebar on attempt %d: %s",
-                    kind,
-                    attempt,
-                    e,
-                )
-                if attempt == max_attempts:
-                    logger.error(
-                        "Giving up ensuring %s sidebar after %d attempts due to WebDriver errors.",
-                        kind,
-                        max_attempts,
+                if attempt < max_attempts:
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        f"WebDriver error while ensuring {kind} sidebar visibility on attempt {attempt}: {str(e)}",
+                        **ctx_attempt,
+                    )
+                else:
+                    self.session.emit_signal(
+                        Cat.SIDEBAR,
+                        f"Giving up ensuring {kind} sidebar visibility after {max_attempts} attempts due to WebDriver errors.",
+                        **ctx_attempt,
                     )
                     return False
             except Exception as e:
-                logger.error(
-                    "Unexpected error while ensuring %s sidebar on attempt %d: %s",
-                    kind,
-                    attempt,
-                    e,
+                self.session.emit_signal(
+                    Cat.SIDEBAR,
+                    f"Unexpected error while ensuring {kind} sidebar visibility on attempt {attempt}: {str(e)}",
+                    **ctx_attempt,
                 )
                 return False
 
         # Fallback (shouldn't be reached)
+        self.session.emit_signal(
+            Cat.SIDEBAR,
+            f"Unexpected outcome while ensuring {kind} sidebar visibility. Needs investigation.",
+            **ctx,
+        )
         return False
 
     def _activate_fields_tab_for_spec(self, spec: FieldTypeSpec):
@@ -1282,7 +1333,7 @@ class CAActivityBuilder:
         )
 
         self.session.counters.inc("builder.fields_added")
-        
+
         logger.info(
             "Created %s field with id %s, titled %s in section %s (index=%s)",
             spec.display_name,
