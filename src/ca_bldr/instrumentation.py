@@ -25,6 +25,8 @@ class Cat(str, Enum):
     UISTATE = "UISTATE"
     REG = "REG"
     STARTUP = "STARTUP"
+    CONFIGURE = "CONFIGURE"
+    PROPS = "PROPS"
 
 
 @dataclass(frozen=True)

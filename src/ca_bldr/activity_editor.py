@@ -2,7 +2,7 @@ import logging
 import time
 import re
 
-from typing import Sequence, Optional
+from typing import Any, Sequence, Optional
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -2738,6 +2738,11 @@ class ActivityEditor:
         if not field_id:
             logger.warning("Table config: could not resolve field_id from field_el; proceeding without re-find safeguards.")
 
+        section_id = ""
+        if field_id:
+            field_handle = self.registry.get_field(field_id)
+            section_id = field_handle.section_id if field_handle else ""
+
         def _fresh_field_el():
             if not field_id:
                 return field_el
@@ -2749,7 +2754,7 @@ class ActivityEditor:
             """
             ctx_stage = self._editor_ctx(
                 field_id=field_id,
-                section_id=handle.section_id or "",
+                section_id=section_id,
                 kind="table",
                 stage=stage_name,
             )

@@ -172,6 +172,7 @@ Nothing in this list implies that changes have been made. This is a **review and
 - Finalise the `Cat`/`LogMode` gating rules so that counters stay always-on while diagnostics respect the configured mode (`live`, `debug`, `trace`).
 - Make the per-activity summary the only `LIVE` signal that includes all key counters (`drop.drag_attempts`, `phantom.timeouts`, `retry.pass_runs`) to keep logs manageable.
 - Keep context formatting centralized in `instrumentation.format_ctx` so every signal stays searchable and the whole system can leverage the same keys.
+- Refactor `phase_timer` to emit instrumentation signals/diags instead of `logger.info` phase logs.
 
 ---
 
@@ -180,5 +181,21 @@ Nothing in this list implies that changes have been made. This is a **review and
 - Items **52-58** directly motivated the decision to implement the instrumentation system first.
 - Items **9-51** should not be actioned until instrumentation and counters are complete.
 - This document is intended to live in the repository alongside design and architecture notes and to be referenced during future optimisation passes.
+
+---
+
+## Logging / Instrumentation Matrix
+
+This section inventories the remaining `logger.*` calls and captures which ones should be migrated into structured `Cat.*` instrumentation (to avoid redundant output), kept for narrative context, or dropped.
+
+| Module | Logging focus | Instrumentation analogue | Recommendation |
+| --- | --- | --- | --- |
+| `ActivityBuilder` | Drag/drop phase markers, phantom recovery, section alignment retries | `Cat.DROP`, `Cat.PHANTOM`, `Cat.SECTION` | Migrate the signal-level messages into `emit_signal`/`emit_diag`, then drop the duplicate `logger.*` calls so that instrumentation owns verbosity. Keep one `logger.info` per phase boundary if it still adds narrative value. |
+| `ActivityEditor` | Properties writes, UI_STATE gate proofs, table stage retries | `Cat.UISTATE`, `Cat.PROPS`, `Cat.CONFIGURE`, `Cat.TABLE` | Emit these diagnostics through the instrumentation helpers and remove the noisy `logger.debug` duplicates. Only the higher-level audits or fallback summaries (e.g., body audits) should remain as plain logs. |
+| `ActivitySections` / `ActivityDeleter` | Sidebar visibility, delete modal handling, registry removals | `Cat.SECTION`, `Cat.REG` (pending) | Leave the low-frequency narrative logs (`info`/`warning`) but add structured emits for counters/retries; once instrumentation is enriched, the rest can be trimmed. |
+| `CASession` / `ActivityBuildController` | Navigation start/end, template lookups, login flow | `Cat.NAV`, `Cat.STARTUP` | Keep the current per-activity summaries in plain `logger.info` for readability; instrumentation already owns the counterized data, so no additional migration is needed. |
+| `ActivitySnapshot` & helpers | Registry rebuild / snapshot dumps | `Cat.REG` | Already emitting structured signals; drop any extra `logger.*` that duplicates those counts once we confirm the instrumentation blocks are present. |
+
+We can move this matrix into its own reference document later, but for now keeping it inside this backlog keeps the decisions close to the work.
 
 ---

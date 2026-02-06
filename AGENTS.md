@@ -71,6 +71,7 @@ Env vars live in `.env` (CA_BASE_URL, CA_USERNAME, CA_PASSWORD, etc.)
 ## Repo Hygiene
 Run artifacts currently appear in repo root; planned move to `/runs` or `/out`.
 Treat log/json dumps as transient.
+Codex artifacts should be written to `/runs/codex` (ignored by git).
 
 ## Change Discipline
 If changing builder/editor behavior, read ARCHITECTURE.md first.

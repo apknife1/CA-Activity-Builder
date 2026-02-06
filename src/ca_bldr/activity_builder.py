@@ -74,7 +74,12 @@ class CAActivityBuilder:
         }
 
     def open_dev_unit(self, unit_url: str):
-        self.logger.info(f"Opening dev unit at {unit_url}")
+        self.session.emit_diag(
+            Cat.STARTUP,
+            "Opening dev unit",
+            unit_url=unit_url,
+            **self._ctx(kind="start"),
+        )
         self.driver.get(unit_url)
         # wait for something that proves the page has loaded
 
@@ -346,7 +351,6 @@ class CAActivityBuilder:
         """
         driver = self.session.driver
         wait = self.session.wait
-        logger = self.logger
         ctx = self._ctx(kind="fields_tab")
 
         tab_map = {
@@ -359,8 +363,11 @@ class CAActivityBuilder:
         tab_selector = tab_map.get(spec.sidebar_tab_label)
 
         if not tab_selector:
-            logger.warning(
-                f"Unknown sidebar_tab_label '{spec.sidebar_tab_label}', defaulting to 'Text'."
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                f"Unknown sidebar_tab_label '{spec.sidebar_tab_label}', defaulting to 'Text'.",
+                reason="unknown_tab_label",
+                **ctx,
             )
             tab_selector = config.BUILDER_SELECTORS["fields_sidebar"]["tab_text"]
 
@@ -434,7 +441,6 @@ class CAActivityBuilder:
         """
         driver = self.driver
         wait = self.wait
-        logger = self.logger
         sections = self.sections
         editor = self.editor
         registry = self.registry
@@ -644,12 +650,14 @@ class CAActivityBuilder:
             registry_ids = _registry_ids_for_current_section()
             dom_before_ids = self._get_active_section_field_ids() or []
             dom_before_set = set(dom_before_ids)
-            logger.info(
-                "%s fields in section before adding (create_attempt %d): %d (known_in_registry=%d)",
-                spec.display_name,
-                create_attempt,
-                before_count,
-                len(registry_ids),
+            self.session.emit_diag(
+                Cat.DROP,
+                "Create attempt section snapshot",
+                section=sections.current_section_id,
+                create_attempt=create_attempt,
+                before_count=before_count,
+                registry_known=len(registry_ids),
+                **self._ctx(kind="drop", spec=spec, fi=fi_index, a=f"create={create_attempt}"),
             )
 
             # Ensure correct sidebar tab + toolbox card is visible
@@ -677,14 +685,26 @@ class CAActivityBuilder:
             for drag_attempt in range(1, max_drag_attempts + 1):
                 try:
                     # Resolve + (optionally) enforce true visible location ONCE per drag attempt
+                    drop_ctx = self._ctx(kind="drop", spec=spec, fi=fi_index, a=f"create={create_attempt}/drag={drag_attempt}")
                     if drop_location == "after_field":
                         if not insert_after_field_id:
-                            logger.warning("drop_location='after_field' but no insert_after_field_id provided; falling back to section_bottom")
+                            self.session.emit_diag(
+                                Cat.DROP,
+                                "after_field requested but insert_after_field_id missing",
+                                reason="missing_anchor",
+                                **drop_ctx,
+                            )
                             drop_location = "section_bottom"
                         else:
                             anchor_el = editor.get_field_by_id(str(insert_after_field_id))
                             if anchor_el is None:
-                                logger.warning("insert_after_field_id=%s not found; falling back to section_bottom", insert_after_field_id)
+                                self.session.emit_diag(
+                                    Cat.DROP,
+                                    "after_field anchor not found; falling back",
+                                    reason="anchor_missing",
+                                    anchor_id=insert_after_field_id,
+                                    **drop_ctx,
+                                )
                                 drop_location = "section_bottom"
 
                     dz_id = self._compute_dropzone_dom_id(
@@ -692,9 +712,13 @@ class CAActivityBuilder:
                         anchor_field_id=str(insert_after_field_id) if insert_after_field_id else None,
                     )
                     if not dz_id:
-                        logger.warning(
-                            "Drag-mode dropzone id could not be computed (location=%s anchor=%s); continuing to next attempt.",
-                            drop_location, insert_after_field_id
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Dropzone id could not be computed",
+                            reason="dropzone_missing",
+                            location=drop_location,
+                            anchor=insert_after_field_id,
+                            **drop_ctx,
                         )
                         continue
 
@@ -746,133 +770,139 @@ class CAActivityBuilder:
                         toolbox_item,
                     )
 
-                    logger.info(
-                        "[Create attempt %d / drag attempt %d] dragging %s from toolbox to section dropzone...",
-                        create_attempt,
-                        drag_attempt,
-                        spec.display_name,
+                    drop_ctx = self._ctx(
+                        kind="drop",
+                        spec=spec,
+                        fi=fi_index,
+                        a=f"create={create_attempt}/drag={drag_attempt}",
                     )
-
-                    gesture = self._perform_drag_drop_gesture_by_id(
-                        toolbox_item=toolbox_item,
-                        dz_id=dz_id,
-                        drop_location=drop_location,
-                        key=key,
-                        create_attempt=create_attempt,
-                        drag_attempt=drag_attempt,
-                        fi_index=fi_index,
-                        dump_pre_drop_state=(not pre_drop_dumped),
-                    )
-
-                    pre_drop_dumped = True
-
-                    drop_ctx = self._ctx(kind="drop", spec=spec, fi=fi_index, a=f"create={create_attempt}")
-                    if not gesture.ok:
-                        logger.warning("Drop gesture failed for %s: reason=%s dz_id=%s", spec.display_name, gesture.reason, gesture.dz_id)
-                        continue
-
-                    logger.info(
-                        "Drop gesture released for %s (reason=%s offset=%s js=%s).",
-                        spec.display_name,
-                        gesture.reason,
-                        gesture.offset_used,
-                        gesture.used_js_fallback,
-                    )
-
-                    deadline = time.time() + 2.0
-                    dom_now_ids: list[str] | None = None
-                    while time.time() < deadline:
-                        dom_now_ids = self._get_active_section_field_ids() or []
-                        if len(dom_now_ids) > len(dom_before_ids):
-                            break
-                        time.sleep(0.08)
-
-                    dom_after_release_ids = dom_now_ids or []
-                    dom_changed_after_release = len(dom_after_release_ids) > len(dom_before_ids)
-
-                    if dom_changed_after_release:
-                        logger.info(
-                            "DOM count increased (%d→%d) after drop release for %s.",
-                            len(dom_before_ids),
-                            len(dom_after_release_ids),
-                            spec.display_name,
+                    try:
+                        gesture = self._perform_drag_drop_gesture_by_id(
+                            toolbox_item=toolbox_item,
+                            dz_id=dz_id,
+                            drop_location=drop_location,
+                            key=key,
+                            create_attempt=create_attempt,
+                            drag_attempt=drag_attempt,
+                            fi_index=fi_index,
+                            dump_pre_drop_state=(not pre_drop_dumped),
                         )
-                        self.session.counters.inc("drop.dom_changed")
+
+                        pre_drop_dumped = True
+
+                        if not gesture.ok:
+                            self.session.counters.inc("drop.failures")
+                            self.session.emit_diag(
+                                Cat.DROP,
+                                "Drop gesture failed",
+                                reason=gesture.reason,
+                                dz_id=gesture.dz_id,
+                                **drop_ctx,
+                            )
+                            continue
+
+                        deadline = time.time() + 2.0
+                        dom_now_ids: list[str] | None = None
+                        while time.time() < deadline:
+                            dom_now_ids = self._get_active_section_field_ids() or []
+                            if len(dom_now_ids) > len(dom_before_ids):
+                                break
+                            time.sleep(0.08)
+
+                        dom_after_release_ids = dom_now_ids or []
+                        dom_changed_after_release = len(dom_after_release_ids) > len(dom_before_ids)
+
+                        if dom_changed_after_release:
+                            self.session.counters.inc("drop.dom_changed")
+                            self.session.emit_diag(
+                                Cat.DROP,
+                                "DOM count increased after drop release",
+                                section_id=self.sections.current_section_id or "",
+                                before=len(dom_before_ids),
+                                after=len(dom_after_release_ids),
+                                **drop_ctx,
+                            )
+                        else:
+                            self.session.counters.inc("drop.dom_no_change")
+                            self.session.emit_diag(
+                                Cat.DROP,
+                                "DOM count unchanged after drop release",
+                                section_id=self.sections.current_section_id or "",
+                                before=len(dom_before_ids),
+                                after=len(dom_after_release_ids),
+                                **drop_ctx,
+                            )
+
+                        drag_succeeded = True
+                        break
+                    except StaleElementReferenceException as e:
+                        self.session.counters.inc("drop.stale_elements")
                         self.session.emit_diag(
                             Cat.DROP,
-                            "DOM count increased after drop release",
-                            section_id=self.sections.current_section_id or "",
-                            before=len(dom_before_ids),
-                            after=len(dom_after_release_ids),
+                            "Stale element detected during drag",
+                            exc=str(e),
                             **drop_ctx,
                         )
-                    else:
-                        logger.info(
-                            "DOM count did not increase within 2.0s after drop release for %s.",
-                            spec.display_name,
-                        )
-                        self.session.counters.inc("drop.dom_no_change")
+                    except WebDriverException as e:
+                        self.session.counters.inc("drop.webdriver_errors")
                         self.session.emit_diag(
                             Cat.DROP,
-                            "DOM count unchanged after drop release",
-                            section_id=self.sections.current_section_id or "",
-                            before=len(dom_before_ids),
-                            after=len(dom_after_release_ids),
+                            "WebDriverException during drag",
+                            exc=str(e),
                             **drop_ctx,
                         )
-
-                    drag_succeeded = True
-                    break
-
-                except StaleElementReferenceException as e:
-                    logger.warning(
-                        "Stale element during drag-and-drop for %s on drag attempt %d (create_attempt %d): %s",
-                        spec.display_name,
-                        drag_attempt,
-                        create_attempt,
-                        e,
-                    )
-                except WebDriverException as e:
-                    logger.warning(
-                        "WebDriver error during drag-and-drop for %s on drag attempt %d (create_attempt %d): %s",
-                        spec.display_name,
-                        drag_attempt,
-                        create_attempt,
-                        e,
-                    )
+                    except Exception as e:
+                        self.session.counters.inc("drop.unexpected_errors")
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Unexpected exception during drag",
+                            exc=str(e),
+                            **drop_ctx,
+                        )
+                        return None
                 except Exception as e:
-                    logger.error(
-                        "Unexpected error during drag-and-drop for %s on drag attempt %d (create_attempt %d): %s",
-                        spec.display_name,
-                        drag_attempt,
-                        create_attempt,
-                        e,
+                    self.session.counters.inc("drop.pre_drag_errors")
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Pre-drag setup failed",
+                        exc=str(e),
+                        **self._ctx(kind="drop", spec=spec, fi=fi_index, a=f"create={create_attempt}/drag={drag_attempt}"),
                     )
                     return None
 
             if not drag_succeeded:
                 # This create_attempt failed to drag; either try another create_attempt
                 # (re-sync canvas) or give up entirely if we've exhausted them.
+                create_ctx = self._ctx(
+                    kind="drop",
+                    spec=spec,
+                    fi=fi_index,
+                    a=f"create={create_attempt}",
+                )
                 if create_attempt == max_create_attempts:
-                    logger.error(
-                        "Drag did not succeed for %s after %d create attempts; aborting.",
-                        spec.display_name,
-                        max_create_attempts,
+                    self.session.counters.inc("drop.create_abort")
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Drag did not succeed after max create attempts",
+                        max_attempts=max_create_attempts,
+                        **create_ctx,
                     )
                     return None
-                logger.warning(
-                    "Drag did not succeed for %s on create_attempt %d; "
-                    "re-syncing canvas and retrying.",
-                    spec.display_name,
-                    create_attempt,
+
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Drag did not succeed; re-syncing canvas before retry",
+                    **create_ctx,
                 )
                 try:
                     sections.wait_for_canvas_for_current_section()
                 except Exception as e:
-                    logger.warning(
-                        "Error while re-syncing canvas for %s after drag failure: %s",
-                        spec.display_name,
-                        e,
+                    self.session.counters.inc("drop.canvas_resync_errors")
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Canvas resync failed after drag failure",
+                        exc=str(e),
+                        **create_ctx,
                     )
                 continue  # go to next create_attempt
 
@@ -901,19 +931,25 @@ class CAActivityBuilder:
                 except Exception:
                     late_candidates = []
 
+                phantom_ctx = self._ctx(
+                    kind="phantom",
+                    spec=spec,
+                    fi=fi_index,
+                    a=f"create={create_attempt}",
+                )
                 if late_candidates:
-                    logger.info(
-                        "Creation confirmation timed out for %s (create_attempt %d) but snapshot now shows candidates=%r; proceeding to id-diff.",
-                        spec.display_name,
-                        create_attempt,
-                        late_candidates[:8],
+                    self.session.emit_diag(
+                        Cat.PHANTOM,
+                        "Creation timeout but late candidates appeared; continuing with id-diff",
+                        candidates=late_candidates[:8],
+                        **phantom_ctx,
                     )
                 else:
                     self.session.counters.inc("phantom.timeouts")
-                    logger.warning(
-                        "Field creation not confirmed within timeout for %s (create_attempt %d); attempting DOM-delta recovery.",
-                        spec.display_name,
-                        create_attempt,
+                    self.session.emit_signal(
+                        Cat.PHANTOM,
+                        "Field creation not confirmed within timeout; attempting DOM-delta recovery",
+                        **phantom_ctx,
                     )
 
                     self._debug_dump_section_registry_vs_dom(
@@ -941,10 +977,10 @@ class CAActivityBuilder:
                     )
 
                     if empty_section_phantom:
-                        logger.warning(
-                            "[phantom] Empty-section phantom: drop claimed success but section still has no field wrappers. "
-                            "Will retry locally (no hard resync). create_attempt=%d",
-                            create_attempt,
+                        self.session.emit_signal(
+                            Cat.PHANTOM,
+                            "Empty-section phantom detected; retrying locally before hard resync",
+                            **phantom_ctx,
                         )
 
                         # Best-effort: cancel any lingering drag state
@@ -964,7 +1000,11 @@ class CAActivityBuilder:
                             continue
 
                         # Last attempt: allow a single hard resync as a final escape hatch
-                        logger.warning("[phantom] Empty-section phantom persisted on final create_attempt; allowing hard resync.")
+                        self.session.emit_signal(
+                            Cat.PHANTOM,
+                            "Empty-section phantom persisted on final create attempt; allowing hard resync",
+                            **phantom_ctx,
+                        )
 
                         did_resync = _hard_resync_once_or_bail(
                             reason=f"empty-section phantom persisted: {spec.display_name} section={sections.current_section_id}"
@@ -989,11 +1029,12 @@ class CAActivityBuilder:
                         # If we couldn't (or wouldn't) resync, fall through and handle as failure/skip later.
                         
                     if len(dom_now_ids) > len(dom_before_ids):
-                        logger.info(
-                            "DOM count increased (%d→%d) but typed selector not ready for %s; using DOM-delta recovery.",
-                            len(dom_before_ids),
-                            len(dom_now_ids),
-                            spec.display_name,
+                        self.session.emit_diag(
+                            Cat.PHANTOM,
+                            "DOM count increased but typed selector not ready; using DOM-delta recovery",
+                            before=len(dom_before_ids),
+                            after=len(dom_now_ids),
+                            **phantom_ctx,
                         )
 
                     # registry ids for the whole section (not type-filtered)
@@ -1020,13 +1061,15 @@ class CAActivityBuilder:
                     typed_candidates = [fid for fid in dom_delta_candidates if _wrapper_matches_type(fid)]
                     candidates = typed_candidates or dom_delta_candidates
 
-                    logger.debug(
-                        "[phantom] dom_before=%d dom_now=%d dom_delta=%d typed_delta=%d reg_section=%d",
-                        len(dom_before_ids),
-                        len(dom_now_ids),
-                        len(dom_delta_candidates),
-                        len(typed_candidates),
-                        len(section_reg_ids),
+                    self.session.emit_diag(
+                        Cat.PHANTOM,
+                        "Phantom DOM/reg snapshot",
+                        dom_before=len(dom_before_ids),
+                        dom_now=len(dom_now_ids),
+                        dom_delta=len(dom_delta_candidates),
+                        typed_delta=len(typed_candidates),
+                        reg_section=len(section_reg_ids),
+                        **phantom_ctx,
                     )
 
                     if candidates:
@@ -1041,12 +1084,13 @@ class CAActivityBuilder:
                             except ValueError:
                                 index_in_section = -1
 
-                            logger.info(
-                                "Accepted new %s by DOM-delta phantom recovery: id=%s index=%d candidates=%r",
-                                spec.display_name,
-                                new_id,
-                                index_in_section,
-                                candidates[:8],
+                            self.session.emit_signal(
+                                Cat.PHANTOM,
+                                "Accepted new field by DOM-delta phantom recovery",
+                                new_field_id=new_id,
+                                index=index_in_section,
+                                candidates=candidates[:8],
+                                **phantom_ctx,
                             )
                             break  # success: break out of create_attempt loop
 
@@ -1054,12 +1098,12 @@ class CAActivityBuilder:
                     try:
                         els_now = driver.find_elements(By.CSS_SELECTOR, canvas_sel)
                         if len(els_now) > before_count:
-                            logger.info(
-                                "Count increased for %s despite missing id-diff (before=%d now=%d). "
-                                "Attempting last-element acceptance to avoid duplicate add.",
-                                spec.display_name,
-                                before_count,
-                                len(els_now),
+                            self.session.emit_diag(
+                                Cat.PHANTOM,
+                                "Count increased despite missing id-diff; trying last-element acceptance",
+                                before=before_count,
+                                after=len(els_now),
+                                **phantom_ctx,
                             )
 
                             # Choose the last element and try to extract a strict id, allowing a brief stabilization window.
@@ -1090,27 +1134,30 @@ class CAActivityBuilder:
 
                                     # Compute index safely
                                     index_in_section = 0 if drop_location == "section_top" else len(els_now) - 1
-                                    logger.info(
-                                        "Accepted new %s by last-element fallback: id=%s index=%d",
-                                        spec.display_name,
-                                        new_id,
-                                        index_in_section,
+                                    self.session.emit_signal(
+                                        Cat.PHANTOM,
+                                        "Accepted new field by last-element fallback",
+                                        new_field_id=new_id,
+                                        index=index_in_section,
+                                        **phantom_ctx,
                                     )
 
                                     # ✅ break out of create_attempt loop as success
                                     break
 
-                            logger.warning(
-                                "Last-element acceptance failed for %s (id=%r). Proceeding with phantom recovery.",
-                                spec.display_name,
-                                candidate_id,
+                            self.session.emit_diag(
+                                Cat.PHANTOM,
+                                "Last-element acceptance failed; proceeding with phantom recovery",
+                                candidate_id=candidate_id,
+                                **phantom_ctx,
                             )
 
                             # If we reached here, we couldn't accept a new field via DOM-delta or count-increase fallback.
-                            logger.warning(
-                                "[phantom] No acceptable new field found after drag success. "
-                                "create_attempt=%d/%d type=%s; attempting hard resync (bounded).",
-                                create_attempt, max_create_attempts, spec.display_name
+                            self.session.emit_signal(
+                                Cat.PHANTOM,
+                                "No acceptable new field found after drag success; attempting hard resync",
+                                max_attempts=max_create_attempts,
+                                **phantom_ctx,
                             )
 
                             did_resync = _hard_resync_once_or_bail(
@@ -1134,7 +1181,13 @@ class CAActivityBuilder:
                             # If we can't resync (or are out of attempts), let the outer code treat it as failure/skip.
 
                     except Exception as e:
-                        logger.warning("Error during last-element acceptance attempt: %s", e)
+                        self.session.counters.inc("phantom.last_element_errors")
+                        self.session.emit_diag(
+                            Cat.PHANTOM,
+                            "Error during last-element acceptance attempt",
+                            exc=str(e),
+                            **phantom_ctx,
+                        )
 
                     # ✅ Instrument: capture dropzone state at phantom moment (before resync)
                     if self._instrument():
@@ -1190,19 +1243,24 @@ class CAActivityBuilder:
                     return None
 
             after_fields, after_ids = _snapshot_fields()
-            after_count = len(after_fields)
-
             diff_ids = list(after_ids - before_ids)
             candidate_ids = [i for i in diff_ids if i and i not in registry_ids]
 
-            logger.info(
-                "id-diff for %s: before_ids=%d after_ids=%d diff=%r registry_known=%d candidates=%r",
-                spec.display_name,
-                len(before_ids),
-                len(after_ids),
-                diff_ids,
-                len(registry_ids),
-                candidate_ids,
+            drop_summary_ctx = self._ctx(
+                kind="drop",
+                spec=spec,
+                fi=fi_index,
+                a=f"create={create_attempt}",
+            )
+            self.session.emit_diag(
+                Cat.DROP,
+                "ID-diff after drop",
+                before_ids=len(before_ids),
+                after_ids=len(after_ids),
+                diff=diff_ids,
+                registry_known=len(registry_ids),
+                candidates=candidate_ids,
+                **drop_summary_ctx,
             )
 
             # Choose an id
@@ -1219,26 +1277,31 @@ class CAActivityBuilder:
                         break
             else:
                 # No usable candidate; treat as unstable snapshot and retry
-                logger.warning(
-                    "No usable new id candidate for %s (diff=%r). Retrying create attempt.",
-                    spec.display_name,
-                    diff_ids,
+                self.session.emit_diag(
+                    Cat.PHANTOM,
+                    "No usable new id candidate; retrying create attempt",
+                    diff=diff_ids,
+                    **drop_summary_ctx,
                 )
                 continue
 
             # Verify existence by re-find
             try:
                 new_field = _verify_field_by_id(new_id)
-                logger.debug(
-                    "[state] new field verified id=%s will-add-to-registry fi_index=%s type=%s section_id=%s",
-                    new_id, fi_index, key, self.sections.current_section_id
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "New field verified by id",
+                    new_field_id=new_id,
+                    section_id=self.sections.current_section_id or "",
+                    **drop_summary_ctx,
                 )
             except Exception as e:
-                logger.warning(
-                    "Detected new %s id %s but could not re-find field by id (%s); retrying.",
-                    spec.display_name,
-                    new_id,
-                    e,
+                self.session.emit_diag(
+                    Cat.PHANTOM,
+                    "Detected new id but could not re-find field; retrying",
+                    new_field_id=new_id,
+                    exc=str(e),
+                    **drop_summary_ctx,
                 )
                 new_field = None
                 new_id = ""
@@ -1246,10 +1309,11 @@ class CAActivityBuilder:
 
             # Hard guard: never accept an id already known in registry for this section/type
             if new_id in registry_ids:
-                logger.warning(
-                    "Selected %s id %s but it is already in registry for this section/type; retrying.",
-                    spec.display_name,
-                    new_id,
+                self.session.emit_diag(
+                    Cat.REG,
+                    "Selected id already in registry for section/type; retrying",
+                    new_field_id=new_id,
+                    **drop_summary_ctx,
                 )
                 new_field = None
                 new_id = ""
@@ -1265,11 +1329,12 @@ class CAActivityBuilder:
             # Compute index safely (optional; not critical)
             index_in_section = _dom_index_in_section(new_id)
 
-            logger.info(
-                "New %s field detected + verified by id: %s (index=%d).",
-                spec.display_name,
-                new_id,
-                index_in_section,
+            self.session.emit_signal(
+                Cat.DROP,
+                "New field detected and verified by id",
+                new_field_id=new_id,
+                index=index_in_section,
+                **drop_summary_ctx,
             )
 
             # Enforce bottom placement if we asked for section_bottom
@@ -1301,11 +1366,13 @@ class CAActivityBuilder:
             ok, why = _expected_ok()
             if not ok:
                 try_reorder = True
-                logger.warning(
-                    "Placement mismatch; attempting reorder. id=%s drop_location=%s reason=%s",
-                    new_id,
-                    drop_location,
-                    why,
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Placement mismatch; attempting reorder",
+                    new_field_id=new_id,
+                    drop_location=drop_location,
+                    reason=why,
+                    **drop_summary_ctx,
                 )
 
                 moved = self._reposition_field(
@@ -1356,20 +1423,22 @@ class CAActivityBuilder:
         # -----------------------------
         # Finalize handle
         # -----------------------------
-        if new_field is None or new_id =="":
+        if new_field is None or new_id == "":
             # If we somehow exit the loop without a field, treat as failure.
-            logger.error(
-                "Failed to obtain a new %s field handle after drag-and-drop attempts.",
-                spec.display_name,
+            self.session.emit_signal(
+                Cat.DROP,
+                "Failed to obtain new field handle after drag/drop attempts",
+                **self._ctx(kind="drop", spec=spec, fi=fi_index, a="finalize"),
             )
             return None
 
         # 1) Get field id from the editor
         field_id = editor.try_get_field_id_strict(new_field) or new_id or ""
         if not field_id:
-            logger.warning(
-                "Could not infer field id for newly created %s field.",
-                spec.display_name,
+            self.session.emit_signal(
+                Cat.REG,
+                "Could not infer field id for newly created field",
+                **self._ctx(kind="registry", spec=spec, fi=fi_index, a="finalize"),
             )
             handle = FieldHandle(
                 field_id="",
@@ -1399,13 +1468,14 @@ class CAActivityBuilder:
 
         self.session.counters.inc("builder.fields_added")
 
-        logger.info(
-            "Created %s field with id %s, titled %s in section %s (index=%s)",
-            spec.display_name,
-            handle.field_id,
-            handle.title,
-            handle.section_id,
-            handle.index,
+        self.session.emit_signal(
+            Cat.DROP,
+            "Created field handle",
+            fid=handle.field_id,
+            sec=handle.section_id,
+            type=key,
+            fi=fi_index,
+            index=handle.index,
         )
         self.registry.add_field(handle)
         return handle
@@ -1418,11 +1488,15 @@ class CAActivityBuilder:
             (by, value) locator tuple for the active tab pane, or None on failure.
         """
         wait = self.session.wait
-        logger = self.logger
+        ctx = self._ctx(kind="fields_tab", spec=spec)
 
         # 1. Make sure the Fields sidebar is open
         if not self._ensure_sidebar_visible("fields", timeout=timeout):
-            logger.error("Fields sidebar could not be shown; cannot select tab.")
+            self.session.emit_signal(
+                Cat.SIDEBAR,
+                "Fields sidebar could not be shown; cannot select tab",
+                **ctx,
+            )
             return None
 
         # === CHANGED: wrap tab activation + pane detection in a retry loop ===
@@ -1430,10 +1504,12 @@ class CAActivityBuilder:
             # 2. Activate the appropriate tab and get its button element
             tab_btn = self._activate_fields_tab_for_spec(spec)
             if tab_btn is None:
-                logger.error(
-                    "Could not activate '%s' tab in Fields sidebar (attempt %d).",
-                    spec.sidebar_tab_label,
-                    attempt,
+                self.session.emit_signal(
+                    Cat.SIDEBAR,
+                    "Could not activate fields tab",
+                    a=f"attempt={attempt}/3",
+                    tab=spec.sidebar_tab_label,
+                    **ctx,
                 )
                 if attempt == 3:
                     return None
@@ -1443,21 +1519,25 @@ class CAActivityBuilder:
             try:
                 raw_target = tab_btn.get_attribute("data-bs-target") or ""
             except StaleElementReferenceException:
-                logger.warning(
-                    "Tab button for '%s' went stale while reading data-bs-target "
-                    "(attempt %d); retrying activation.",
-                    spec.sidebar_tab_label,
-                    attempt,
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    "Tab button went stale while reading data-bs-target",
+                    a=f"attempt={attempt}/3",
+                    tab=spec.sidebar_tab_label,
+                    **ctx,
                 )
                 continue  # go to next attempt
 
             raw_target = raw_target.strip()
 
             # Debug log so we can see what CA is actually giving us
-            logger.info(
-                "Tab '%s' data-bs-target raw value: '%s'",
-                spec.sidebar_tab_label,
-                raw_target,
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                "Tab data-bs-target value read",
+                a=f"attempt={attempt}/3",
+                tab=spec.sidebar_tab_label,
+                target=raw_target,
+                **ctx,
             )
 
             if raw_target and raw_target.startswith("#"):
@@ -1465,24 +1545,31 @@ class CAActivityBuilder:
                 pane_id = raw_target[1:]
                 pane_by = By.ID
                 pane_value = pane_id
-                logger.info(
-                    "Using pane ID selector (By.ID, '%s') for '%s' tab.",
-                    pane_value,
-                    spec.sidebar_tab_label,
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    "Using pane ID selector for tab",
+                    a=f"attempt={attempt}/3",
+                    tab=spec.sidebar_tab_label,
+                    pane=pane_value,
+                    **ctx,
                 )
             else:
                 if raw_target:
-                    logger.warning(
-                        "Tab button for '%s' has unexpected data-bs-target='%s'; "
-                        "falling back to generic active tab pane selector.",
-                        spec.sidebar_tab_label,
-                        raw_target,
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        "Unexpected data-bs-target; falling back to generic active pane selector",
+                        a=f"attempt={attempt}/3",
+                        tab=spec.sidebar_tab_label,
+                        target=raw_target,
+                        **ctx,
                     )
                 else:
-                    logger.warning(
-                        "Tab button for '%s' has no data-bs-target; "
-                        "falling back to generic active tab pane selector.",
-                        spec.sidebar_tab_label,
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        "No data-bs-target on tab button; falling back to generic active pane selector",
+                        a=f"attempt={attempt}/3",
+                        tab=spec.sidebar_tab_label,
+                        **ctx,
                     )
                 pane_by = By.CSS_SELECTOR
                 pane_value = config.BUILDER_SELECTORS["fields_sidebar"]["active_tab_pane"]
@@ -1493,7 +1580,13 @@ class CAActivityBuilder:
             try:
                 def tab_active(_):
                     if tab_btn is None:
-                        logger.info("tab_btn is None; treating tab as not active yet.")
+                        self.session.emit_diag(
+                            Cat.SIDEBAR,
+                            "Tab button missing while checking active state",
+                            a=f"attempt={attempt}/3",
+                            tab=spec.sidebar_tab_label,
+                            **ctx,
+                        )
                         return False
                     try:
                         # 1) Check the tab button itself
@@ -1515,9 +1608,12 @@ class CAActivityBuilder:
                         return tab_ok and pane_ok
 
                     except StaleElementReferenceException:
-                        logger.debug(
-                            "Tab button for '%s' went stale while checking active state.",
-                            spec.sidebar_tab_label,
+                        self.session.emit_diag(
+                            Cat.SIDEBAR,
+                            "Tab button stale while checking active state",
+                            a=f"attempt={attempt}/3",
+                            tab=spec.sidebar_tab_label,
+                            **ctx,
                         )
                         return False
                     except Exception:
@@ -1526,36 +1622,42 @@ class CAActivityBuilder:
                 wait.until(tab_active)
                 wait.until(EC.visibility_of_element_located(pane_locator))
 
-                logger.info(
-                    "%s toolbox tab '%s' is active.",
-                    spec.display_name,
-                    spec.sidebar_tab_label,
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    "Toolbox tab active",
+                    a=f"attempt={attempt}/3",
+                    tab=spec.sidebar_tab_label,
+                    **ctx,
                 )
                 return pane_locator
 
             except TimeoutException:
-                logger.error(
-                    "Timed out waiting for '%s' tab and its pane to become active "
-                    "(attempt %d).",
-                    spec.sidebar_tab_label,
-                    attempt,
+                self.session.emit_signal(
+                    Cat.SIDEBAR,
+                    "Timed out waiting for tab and pane to become active",
+                    a=f"attempt={attempt}/3",
+                    tab=spec.sidebar_tab_label,
+                    **ctx,
                 )
                 # try again if attempts remain
                 continue
 
             except StaleElementReferenceException:
-                logger.warning(
-                    "Tab button for '%s' went stale while waiting for tab to become active "
-                    "(attempt %d); retrying.",
-                    spec.sidebar_tab_label,
-                    attempt,
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    "Tab button stale while waiting for active pane; retrying",
+                    a=f"attempt={attempt}/3",
+                    tab=spec.sidebar_tab_label,
+                    **ctx,
                 )
                 continue
 
         # === END RETRY LOOP ===
-        logger.error(
-            "Failed to ensure field tab '%s' is visible after retries.",
-            spec.sidebar_tab_label,
+        self.session.emit_signal(
+            Cat.SIDEBAR,
+            "Failed to ensure field tab visible after retries",
+            tab=spec.sidebar_tab_label,
+            **ctx,
         )
         return None
 
@@ -1572,8 +1674,6 @@ class CAActivityBuilder:
         dump_pre_drop_state: bool = False,
     ) -> DropGestureResult:
         driver = self.driver
-        logger = self.logger
-
         self.session.counters.inc("drop.drag_attempts")
         ctx = self._ctx(kind="drop", spec=FIELD_TYPES.get(key), fi=fi_index, a=f"create={create_attempt}/drag={drag_attempt}")
         self.session.emit_diag(Cat.DROP, "Starting drag/drop gesture", **ctx)
@@ -1708,7 +1808,13 @@ class CAActivityBuilder:
                     dropzone
                 )
                 if not active_ok:
-                    logger.debug("Dropzone not active (%s) at offset (%d,%d); trying next.", note, ox, oy)
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Dropzone not active during offset retry",
+                        note=note,
+                        offset=f"{ox},{oy}",
+                        **ctx,
+                    )
                     continue
 
                 # Winner motion: element center + relative offset
@@ -1717,14 +1823,6 @@ class CAActivityBuilder:
                 actions.move_by_offset(int(ox), int(oy))
                 actions.release()
                 actions.perform()
-
-                logger.debug("Drop gesture released (%s) dz_id=%s offset=(%d,%d) huge=%s",
-                    note,
-                    dz_id,
-                    ox,
-                    oy,
-                    huge,
-                )
 
                 self.session.counters.inc("drop.successes")
                 self.session.emit_diag(
@@ -1773,7 +1871,14 @@ class CAActivityBuilder:
                     except Exception:
                         pass
 
-                logger.debug("Drop offset failed (%s) at (%d,%d): %s", note, ox, oy, e)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Drop offset attempt exception",
+                    note=note,
+                    offset=f"{ox},{oy}",
+                    exception=str(e),
+                    **ctx,
+                )
                 continue
 
         try:
@@ -1796,7 +1901,11 @@ class CAActivityBuilder:
         - Uses container scroll if a scroll container exists; otherwise window scroll.
         """
         driver = self.driver
-        logger = self.logger
+        ctx_scroll = self._ctx(
+            kind="drop",
+            sec=self.sections.current_section_id or "",
+            a="scroll_dropzone",
+        )
 
         def _scroll_by(delta: float, *, container=None) -> None:
             try:
@@ -1816,17 +1925,33 @@ class CAActivityBuilder:
                     block,
                 )
             except StaleElementReferenceException:
-                logger.debug("Dropzone went stale during scrollIntoView.")
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Dropzone went stale during scrollIntoView",
+                    block=block,
+                    **ctx_scroll,
+                )
                 return False
             except Exception as e:
-                logger.debug("scrollIntoView failed for dropzone: %s", e)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "scrollIntoView failed for dropzone",
+                    exception=str(e),
+                    block=block,
+                    **ctx_scroll,
+                )
                 return False
 
             # 2) Measure
             try:
                 r = self._rect_info(dropzone)
             except Exception as e:
-                logger.debug("Could not read dropzone bounding rect: %s", e)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Could not read dropzone bounding rect",
+                    exception=str(e),
+                    **ctx_scroll,
+                )
                 return False
 
             top = float(r.get("top", 0))
@@ -1838,9 +1963,19 @@ class CAActivityBuilder:
             huge = height > (vh * 0.85)
             intersects = (bottom >= 10) and (top <= vh - 10)
 
-            logger.debug(
-                "[dropzone] rect attempt=%d top=%.1f bottom=%.1f height=%.1f vh=%.1f within=%s huge=%s intersects=%s block=%s",
-                attempt, top, bottom, height, vh, within, huge, intersects, block
+            self.session.emit_diag(
+                Cat.DROP,
+                "Dropzone rect metrics",
+                attempt=attempt,
+                top=top,
+                bottom=bottom,
+                height=height,
+                viewport_height=vh,
+                within=within,
+                huge=huge,
+                intersects=intersects,
+                block=block,
+                **ctx_scroll,
             )
 
             # ✅ Normal success: fully within and not huge
@@ -1850,13 +1985,21 @@ class CAActivityBuilder:
             # ✅ Huge success condition:
             # We can’t make it fully "within", but we *can* make it usable by ensuring TOP is visible (non-negative).
             if huge and (top >= -5) and intersects:
-                logger.debug("[dropzone] huge but top-visible; treating as usable.")
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Dropzone huge but top visible; treating as usable",
+                    **ctx_scroll,
+                )
                 return True
 
             if attempt == 1:
-                logger.info(
-                    "Dropzone not confidently visible; correcting scroll (attempt %d/%d, block=%s).",
-                    attempt, max_attempts, block
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Dropzone not confidently visible; correcting scroll",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    block=block,
+                    **ctx_scroll,
                 )
 
             # 3) Nudge deterministically
@@ -1940,9 +2083,19 @@ class CAActivityBuilder:
                 pass
 
             if not huge:
-                logger.warning("Dropzone could not be verified as visible after scrolling; drag may be ambiguous.")
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Dropzone still not verified as visible after scrolling",
+                    block=block,
+                    **ctx_scroll,
+                )
             else:
-                logger.debug("Huge dropzone not fully within viewport (expected); proceeding with huge-zone targeting.")
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Huge dropzone not fully within viewport (expected)",
+                    block=block,
+                    **ctx_scroll,
+                )
             
         return False
 
@@ -2024,10 +2177,16 @@ class CAActivityBuilder:
             """)
             ids = [str(x) for x in (data.get("ids") or [])]
             if self._instrument() and not ids:
-                self.logger.debug(
-                    "[section_ids] empty ids (reason=%s emptyDz=%s)",
-                    data.get("reason"),
-                    data.get("emptyDz"),
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Active section field ids empty",
+                    reason=data.get("reason"),
+                    empty_dropzone=data.get("emptyDz"),
+                    **self._ctx(
+                        kind="drop",
+                        sec=self.sections.current_section_id or "",
+                        a="section_id_snapshot",
+                    ),
                 )
             return ids
         except Exception:
@@ -2048,16 +2207,18 @@ class CAActivityBuilder:
 
         This is instrumentation only; no control flow depends on this.
         """
-        logger = self.logger
+        ctx = self._ctx(kind="drop", sec=section_id, fid=new_field_id, a="placement_check")
 
         ids = self._get_active_section_field_ids()
         if not ids:
-            logger.warning(
-                "Placement check: no section-field ids found. new_field_id=%s drop_location=%s section_id=%s anchor=%s",
-                new_field_id,
-                drop_location,
-                section_id,
-                anchor_field_id,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Placement check: no section-field ids found",
+                new_field_id=new_field_id,
+                drop_location=drop_location,
+                section_id=section_id,
+                anchor_field_id=anchor_field_id,
+                **ctx,
             )
             return False
 
@@ -2067,14 +2228,16 @@ class CAActivityBuilder:
         try:
             idx = ids.index(new_field_id)
         except ValueError:
-            logger.warning(
-                "Placement check: new_field_id not found in DOM list. new_field_id=%s total=%d drop_location=%s section_id=%s anchor=%s tail=%s",
-                new_field_id,
-                total,
-                drop_location,
-                section_id,
-                anchor_field_id,
-                tail,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Placement check: new_field_id not in DOM list",
+                new_field_id=new_field_id,
+                total=total,
+                drop_location=drop_location,
+                section_id=section_id,
+                anchor_field_id=anchor_field_id,
+                tail=tail,
+                **ctx,
             )
             return False
 
@@ -2105,44 +2268,50 @@ class CAActivityBuilder:
 
         # Log outcome
         if expected_idx is None:
-            logger.warning(
-                "Placement UNVERIFIABLE: %s. new_field_id=%s index=%d total=%d drop_location=%s section_id=%s anchor=%s tail=%s",
-                expectation,
-                new_field_id,
-                idx,
-                total,
-                drop_location,
-                section_id,
-                anchor_field_id,
-                tail,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Placement unverified",
+                expectation=expectation,
+                new_field_id=new_field_id,
+                index=idx,
+                total=total,
+                drop_location=drop_location,
+                section_id=section_id,
+                anchor_field_id=anchor_field_id,
+                tail=tail,
+                **ctx,
             )
             return False
 
         if idx == expected_idx:
-            logger.info(
-                "Placement OK: expected %s. new_field_id=%s index=%d total=%d drop_location=%s section_id=%s anchor=%s tail=%s",
-                expectation,
-                new_field_id,
-                idx,
-                total,
-                drop_location,
-                section_id,
-                anchor_field_id,
-                tail,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Placement OK",
+                expectation=expectation,
+                new_field_id=new_field_id,
+                index=idx,
+                total=total,
+                drop_location=drop_location,
+                section_id=section_id,
+                anchor_field_id=anchor_field_id,
+                tail=tail,
+                **ctx,
             )
             return True
         else:
-            logger.warning(
-                "Placement MISMATCH: expected %s. new_field_id=%s index=%d expected_index=%d total=%d drop_location=%s section_id=%s anchor=%s tail=%s",
-                expectation,
-                new_field_id,
-                idx,
-                expected_idx,
-                total,
-                drop_location,
-                section_id,
-                anchor_field_id,
-                tail,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Placement mismatch after reorder",
+                expectation=expectation,
+                new_field_id=new_field_id,
+                index=idx,
+                expected_index=expected_idx,
+                total=total,
+                drop_location=drop_location,
+                section_id=section_id,
+                anchor_field_id=anchor_field_id,
+                tail=tail,
+                **ctx,
             )
         return False
 
@@ -2159,39 +2328,45 @@ class CAActivityBuilder:
         Logs whether the chosen dropzone is covered and what is on top of it.
         Call this immediately before drag and/or immediately after a misplaced insertion.
         """
-        logger = self.logger
+        ctx = self._ctx(kind="drop", sec=section_id, a="drop_diagnostics")
 
         if dropzone_el is None:
-            logger.warning(
-                "Drop diagnostics: dropzone_el=None drop_location=%s section_id=%s anchor=%s note=%s",
-                drop_location,
-                section_id,
-                anchor_field_id,
-                note,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Drop diagnostics: dropzone missing",
+                drop_location=drop_location,
+                section_id=section_id,
+                anchor_field_id=anchor_field_id,
+                note=note,
+                **ctx,
             )
             return
 
         probe = self._probe_dropzone(dropzone_el)
         if probe is None:
-            logger.warning(
-                "Drop diagnostics: probe failed (stale/JS). drop_location=%s section_id=%s anchor=%s note=%s",
-                drop_location,
-                section_id,
-                anchor_field_id,
-                note,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Drop diagnostics: probe failed",
+                drop_location=drop_location,
+                section_id=section_id,
+                anchor_field_id=anchor_field_id,
+                note=note,
+                **ctx,
             )
             return
 
-        logger.info(
-            "Drop diagnostics: location=%s section_id=%s anchor=%s covered=%s topmost=%s turbo=%s rect=%s note=%s",
-            drop_location,
-            section_id,
-            anchor_field_id,
-            (not probe.center_topmost_ok),
-            probe.topmost_summary,
-            probe.turbo_busy_hint,
-            probe.rect,
-            note,
+        self.session.emit_diag(
+            Cat.DROP,
+            "Drop diagnostics: coverage snapshot",
+            drop_location=drop_location,
+            section_id=section_id,
+            anchor_field_id=anchor_field_id,
+            covered=not probe.center_topmost_ok,
+            topmost_summary=probe.topmost_summary,
+            turbo_hint=probe.turbo_busy_hint,
+            rect=probe.rect,
+            note=note,
+            **ctx,
         )
 
     def _reposition_field(
@@ -2210,8 +2385,12 @@ class CAActivityBuilder:
         - dragged wrapper gains 'sortable-ghost' / 'sortable-chosen'
         """
         driver = self.driver
-        logger = self.logger
         sections = self.sections
+        ctx_base = self._ctx(
+            kind="drop",
+            sec=sections.current_section_id or "",
+            a="sortable_reorder",
+        )
 
         def _js_drag(handle: WebElement, target_el: WebElement, dx: int, dy: int) -> None:
             driver.execute_script(
@@ -2356,13 +2535,30 @@ class CAActivityBuilder:
             return bool(ids2) and _ok(ids2)
 
         for attempt in range(1, max_attempts + 1):
+            ctx_attempt = {
+                **ctx_base,
+                "attempt": attempt,
+                "target": target,
+                "field_id": field_id,
+                "anchor_field_id": anchor_field_id,
+            }
             ids_now = self._get_active_section_field_ids() or []
             if not ids_now:
-                logger.warning("Sortable reorder: no DOM field ids available (attempt %d/%d).", attempt, max_attempts)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder aborted: no DOM field ids available",
+                    max_attempts=max_attempts,
+                    **ctx_attempt,
+                )
                 return False
 
             if field_id not in ids_now:
-                logger.warning("Sortable reorder: field_id=%s not found in DOM order (attempt %d/%d).", field_id, attempt, max_attempts)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder aborted: field_id missing from DOM order",
+                    max_attempts=max_attempts,
+                    **ctx_attempt,
+                )
                 return False
 
             # Determine target wrapper + drop offset intent
@@ -2374,28 +2570,45 @@ class CAActivityBuilder:
                 drop_bias = "after"
             elif target == "after_field":
                 if not anchor_field_id or anchor_field_id not in ids_now:
-                    logger.warning(
-                        "Sortable reorder: after_field missing/invalid anchor=%s (attempt %d/%d).",
-                        anchor_field_id,
-                        attempt,
-                        max_attempts,
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Sortable reorder aborted: invalid anchor for after_field",
+                        anchor_field_id=anchor_field_id,
+                        max_attempts=max_attempts,
+                        **ctx_attempt,
                     )
                     return False
                 else:
                     target_id = anchor_field_id
                     drop_bias = "after"
             else:
-                logger.warning("Sortable reorder: unknown target=%r", target)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder aborted: unknown target",
+                    target=target,
+                    **ctx_attempt,
+                )
                 return False
             
             if target_id == field_id:
-                logger.debug("Sortable reorder: target_id == field_id (%s); nothing to do.", field_id)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder: target equals field_id; skipping",
+                    **ctx_attempt,
+                )
                 return True
+
+            ctx_zone = {**ctx_attempt, "target_id": target_id, "drop_bias": drop_bias}
 
             wrapper = _get_wrapper(field_id)
             target_wrapper = _get_wrapper(target_id)
             if wrapper is None or target_wrapper is None:
-                logger.warning("Sortable reorder: wrapper missing. field_id=%s target_id=%s", field_id, target_id)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder aborted: wrapper missing",
+                    target_id=target_id,
+                    **ctx_attempt,
+                )
                 return False
 
             # Scroll both into view
@@ -2407,11 +2620,12 @@ class CAActivityBuilder:
 
             handle = _pick_handle(wrapper)
             if handle is None or not _is_sized(handle):
-                logger.warning(
-                    "Sortable reorder: drag handle not found or not sized for field_id=%s (attempt %d/%d).",
-                    field_id,
-                    attempt,
-                    max_attempts
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder: drag handle unavailable",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    **ctx_attempt,
                 )
                 continue
 
@@ -2420,7 +2634,13 @@ class CAActivityBuilder:
             w = float(tr.get("width", 0) or 0)
             h = float(tr.get("height", 0) or 0)
             if w < 10 or h < 10:
-                logger.warning("Sortable reorder: target wrapper has unusable rect target_id=%s rect=%r", target_id, tr)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder: target wrapper rect unusable",
+                    target_id=target_id,
+                    rect=tr,
+                    **ctx_attempt,
+                )
                 return False
 
             safe = 8
@@ -2428,16 +2648,17 @@ class CAActivityBuilder:
             band = int(max(safe, min((h / 2) - safe, h * 0.30)))
             dy = -band if drop_bias == "before" else band
 
-            logger.info(
-                "Sortable reorder attempt %d/%d: field_id=%s -> target=%s target_id=%s bias=%s offset=(%d,%d)",
-                attempt,
-                max_attempts,
-                field_id,
-                target,
-                target_id,
-                drop_bias,
-                dx,
-                dy,
+            self.session.emit_diag(
+                Cat.DROP,
+                "Sortable reorder attempt",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                target=target,
+                target_id=target_id,
+                drop_bias=drop_bias,
+                dx=dx,
+                dy=dy,
+                **ctx_attempt,
             )
 
             # Perform drag using handle -> target wrapper offsets
@@ -2445,7 +2666,13 @@ class CAActivityBuilder:
 
                 vw = driver.execute_script("return window.innerWidth")
                 vh = driver.execute_script("return window.innerHeight")
-                logger.debug("Sortable target rect=%r viewport=(%s,%s)", tr, vw, vh)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder: target rect + viewport",
+                    rect=tr,
+                    viewport=(vw, vh),
+                    **ctx_zone,
+                )
 
                 # Step A: start drag (native)
                 try:
@@ -2454,20 +2681,29 @@ class CAActivityBuilder:
                         .click_and_hold(handle)\
                         .move_by_offset(0, 12)\
                         .perform()
-                    logger.debug("Sortable reorder: drag start OK field_id=%s (attempt %d/%d)", field_id, attempt, max_attempts)
-                except Exception as e_start:
-                    logger.warning(
-                        "Sortable reorder: drag start FAILED field_id=%s (attempt %d/%d): %s",
-                        field_id, attempt, max_attempts, e_start,
-                        exc_info=True,
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Sortable reorder: native drag start OK",
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        **ctx_zone,
                     )
-                    # try to cancel any partial state
+                except Exception as e_start:
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Sortable reorder: native drag start failed",
+                        exception=str(e_start),
+                        **ctx_zone,
+                    )
                     try:
                         ActionChains(driver).send_keys(Keys.ESCAPE).perform()
                     except Exception:
                         pass
-                    # JS fallback for full drag
-                    logger.info("Using JS fallback for sortable drag (start failed). field_id=%s (attempt %d/%d)", field_id, attempt, max_attempts)
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Sortable reorder: falling back to JS drag (start failed)",
+                        **ctx_zone,
+                    )
                     _js_drag(handle, target_wrapper, dx, dy)
                     # regardless, clear residue and go to confirm
                     self._clear_sortable_residue(note="start-failed->js")
@@ -2475,7 +2711,11 @@ class CAActivityBuilder:
 
                 # Step B: if native drag started, attempt native drop, else JS already ran
                 if _wait_sortable_started(timeout=1.0):
-                    logger.info("Sortable reorder: native drag started field_id=%s (attempt %d/%d)", field_id, attempt, max_attempts)
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Sortable reorder: native drag stage entered",
+                        **ctx_zone,
+                    )
                     try:
                         ActionChains(driver)\
                             .move_to_element(target_wrapper)\
@@ -2483,51 +2723,74 @@ class CAActivityBuilder:
                             .pause(0.08)\
                             .release()\
                             .perform()
-                        logger.debug("Sortable reorder: native drop OK field_id=%s (attempt %d/%d)", field_id, attempt, max_attempts)
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Sortable reorder: native drop succeeded",
+                            **ctx_zone,
+                        )
                     
                     except MoveTargetOutOfBoundsException as e:
-                        logger.warning(
-                            "Sortable reorder: native drop OOB field_id=%s target_id=%s offset=(%d,%d) (attempt %d/%d)",
-                            field_id, target_id, dx, dy, attempt, max_attempts
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Sortable reorder: native drop out of bounds",
+                            exception=str(e),
+                            dx=dx,
+                            dy=dy,
+                            **ctx_zone,
                         )
                         try:
                             ActionChains(driver).send_keys(Keys.ESCAPE).perform()
                         except Exception:
                             pass
-                        logger.info("Using JS fallback for sortable drag (native drop OOB). field_id=%s (attempt %d/%d)", field_id, attempt, max_attempts)
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Sortable reorder: falling back to JS drag (native drop OOB)",
+                            **ctx_zone,
+                        )
                         _js_drag(handle, target_wrapper, dx, dy)
 
                     except Exception as e_drop:
-                        logger.warning(
-                            "Sortable reorder: native drop FAILED field_id=%s target_id=%s offset=(%d,%d) (attempt %d/%d): %s",
-                            field_id, target_id, dx, dy, attempt, max_attempts, e_drop,
-                            exc_info=True,
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Sortable reorder: native drop failed",
+                            exception=str(e_drop),
+                            dx=dx,
+                            dy=dy,
+                            **ctx_zone,
                         )
-                        # Cancel + JS fallback
                         try:
                             ActionChains(driver).send_keys(Keys.ESCAPE).perform()
                         except Exception:
                             pass
-                        logger.info("Using JS fallback for sortable drag (drop failed). field_id=%s (attempt %d/%d)", field_id, attempt, max_attempts)
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Sortable reorder: falling back to JS drag (drop failed)",
+                            **ctx_zone,
+                        )
                         _js_drag(handle, target_wrapper, dx, dy)
                 else:
-                    # Sortable did not enter dragging mode; cancel and JS fallback
                     try:
                         ActionChains(driver).send_keys(Keys.ESCAPE).perform()
                     except Exception:
                         pass
-                    logger.info("Using JS fallback for sortable drag (did not start). field_id=%s (attempt %d/%d)", field_id, attempt, max_attempts)
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "Sortable reorder: falling back to JS drag (did not start)",
+                        **ctx_zone,
+                    )
                     _js_drag(handle, target_wrapper, dx, dy)
 
                 # Always clear residue after any drag attempt (success or failure)
                 self._clear_sortable_residue(note="after-drag")
 
             except Exception as e:
-                # Truly unexpected exception in the overall drag attempt
-                logger.warning(
-                    "Sortable reorder: drag attempt FAILED (unexpected) field_id=%s (attempt %d/%d): %s",
-                    field_id, attempt, max_attempts, e,
-                    exc_info=True,
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder: drag attempt failed unexpectedly",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    exception=str(e),
+                    **ctx_zone,
                 )
                 try:
                     ActionChains(driver).send_keys(Keys.ESCAPE).perform()
@@ -2538,10 +2801,24 @@ class CAActivityBuilder:
 
             try:
                 WebDriverWait(driver, 2.0).until(lambda d: _confirm())
-                logger.info("Sortable reorder: field_id=%s target=%s ok=True (attempt %d/%d)", field_id, target, attempt, max_attempts)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder: confirmation success",
+                    attempt=attempt,
+                    target=target,
+                    ok=True,
+                    **ctx_zone,
+                )
                 return True
             except TimeoutException:
-                logger.info("Sortable reorder: field_id=%s target=%s ok=False (attempt %d/%d)", field_id, target, attempt, max_attempts)
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Sortable reorder: confirmation still pending (timeout)",
+                    attempt=attempt,
+                    target=target,
+                    ok=False,
+                    **ctx_zone,
+                )
 
             try:
                 self.sections.wait_for_canvas_for_current_section(timeout=2)
@@ -2556,7 +2833,11 @@ class CAActivityBuilder:
         interfering with subsequent clicks/edits.
         """
         driver = self.driver
-        logger = self.logger
+        ctx_cleanup = self._ctx(
+            kind="drop",
+            sec=self.sections.current_section_id or "",
+            a="sortable_cleanup",
+        )
 
         # 1) ESC a couple times (often cancels drag mode)
         try:
@@ -2610,7 +2891,12 @@ class CAActivityBuilder:
                 return
             time.sleep(0.05)
 
-        logger.debug("Sortable residue still detected after cleanup%s.", f" ({note})" if note else "")
+        self.session.emit_diag(
+            Cat.DROP,
+            "Sortable residue still detected after cleanup",
+            note=note,
+            **ctx_cleanup,
+        )
 
     def _find_scroll_container_for(self, el):
         """
@@ -2686,7 +2972,11 @@ class CAActivityBuilder:
         - Verifies active dropzone state (draggable-dropzone--active) when present.
         """
         driver = self.driver
-        logger = self.logger
+        ctx_resolve = self._ctx(
+            kind="drop",
+            sec=self.sections.current_section_id or "",
+            a="dropzone_resolve",
+        )
 
         if not dz_id:
             return None
@@ -2752,8 +3042,14 @@ class CAActivityBuilder:
             .map(el => el.id)
             .filter(Boolean);
         """)
-        logger.debug("Dropzone resolve by id failed: dz_id=%s last_exc=%r", dz_id, last_exc)
-        logger.debug("Active dropzones at failure time: %r", ids)
+        self.session.emit_diag(
+            Cat.DROP,
+            "Dropzone resolve by id failed",
+            dz_id=dz_id,
+            last_exc=repr(last_exc),
+            active_dropzones=ids,
+            **ctx_resolve,
+        )
         return None
         
     def _compute_dropzone_dom_id(
@@ -2829,6 +3125,7 @@ class CAActivityBuilder:
 
             # Registry intent (usually correct if prior add confirmed)
             section_id = self.sections.current_section_id or ""
+            ctx_anchor = self._ctx(kind="drop", sec=section_id, a="dropzone_anchor")
             reg_ids = [
                 fh.field_id
                 for fh in self.registry.fields_for_section(section_id)
@@ -2842,9 +3139,12 @@ class CAActivityBuilder:
             #   (until reorder is fully reliable, this prevents anchor drift)
             anchor = reg_last or dom_last
             if reg_last and dom_last and reg_last != dom_last:
-                self.logger.debug(
-                    "Bottom anchor mismatch: registry_last=%s dom_last=%s; using dom_last for dropzone id.",
-                    reg_last, dom_last
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Bottom anchor mismatch; using DOM last",
+                    registry_last=reg_last,
+                    dom_last=dom_last,
+                    **ctx_anchor,
                 )
                 anchor = dom_last
 
@@ -2872,6 +3172,7 @@ class CAActivityBuilder:
             dom_first = dom_ids[0] if dom_ids else None
 
             section_id = self.sections.current_section_id or ""
+            ctx_anchor = self._ctx(kind="drop", sec=section_id, a="dropzone_anchor")
             reg_ids = [
                 fh.field_id
                 for fh in self.registry.fields_for_section(section_id)
@@ -2881,9 +3182,12 @@ class CAActivityBuilder:
 
             anchor = reg_first or dom_first
             if reg_first and dom_first and reg_first != dom_first:
-                self.logger.debug(
-                    "Top anchor mismatch: registry_first=%s dom_first=%s; using dom_first for dropzone id.",
-                    reg_first, dom_first
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Top anchor mismatch; using DOM first",
+                    registry_first=reg_first,
+                    dom_first=dom_first,
+                    **ctx_anchor,
                 )
                 anchor = dom_first
 
@@ -2914,8 +3218,8 @@ class CAActivityBuilder:
         if not self._instrument():
             return
 
-        logger = self.logger
         sid = section_id or (self.sections.current_section_id or "")
+        ctx_dump = self._ctx(kind="registry", sec=sid, a="debug_dump_registry")
 
         # --- DOM snapshot (order matters) ---
         dom_ids = self._get_active_section_field_ids() or []
@@ -2939,27 +3243,25 @@ class CAActivityBuilder:
 
         reg_type_counts = Counter([fh.field_type_key for fh in reg_fields if fh.field_type_key])
 
-        # Keep logs bounded
         dom_ids_disp = dom_ids[:max_items]
         reg_triplets_disp = reg_triplets[:max_items]
 
-        logger.debug(
-            "[state] %s section_id=%s dom_count=%d reg_count=%d dom_only=%d reg_only=%d reg_types=%s",
-            note,
-            sid,
-            len(dom_ids),
-            len(reg_ids),
-            len(dom_only),
-            len(reg_only),
-            dict(reg_type_counts),
+        self.session.emit_diag(
+            Cat.REG,
+            "Section registry vs DOM snapshot",
+            note=note,
+            section_id=sid,
+            dom_count=len(dom_ids),
+            reg_count=len(reg_ids),
+            dom_only_count=len(dom_only),
+            reg_only_count=len(reg_only),
+            reg_type_counts=dict(reg_type_counts),
+            dom_ids=dom_ids_disp,
+            reg_triplets=reg_triplets_disp,
+            dom_only_sample=dom_only[:20],
+            reg_only_sample=reg_only[:20],
+            **ctx_dump,
         )
-        logger.debug("[state] %s DOM ids (first %d): %s", note, len(dom_ids_disp), dom_ids_disp)
-        logger.debug("[state] %s REG (id,type,fi_index) first %d: %s", note, len(reg_triplets_disp), reg_triplets_disp)
-
-        if dom_only:
-            logger.debug("[state] %s DOM-only ids (sample): %s", note, dom_only[:20])
-        if reg_only:
-            logger.debug("[state] %s REG-only ids (sample): %s", note, reg_only[:20])
 
     def _debug_dump_section_order_alignment(
         self,
@@ -2980,8 +3282,8 @@ class CAActivityBuilder:
         if not self._instrument():
             return
 
-        logger = self.logger
         sid = section_id or (self.sections.current_section_id or "")
+        ctx_order = self._ctx(kind="registry", sec=sid, a="debug_dump_order")
 
         dom_ids = self._get_active_section_field_ids() or []
 
@@ -3014,22 +3316,23 @@ class CAActivityBuilder:
         reg_spec_disp = reg_triplets_spec[:max_items]
         dom_annotated_disp = dom_annotated[:max_items]
 
-        logger.debug(
-            "[order] %s section_id=%s dom_count=%d reg_count=%d",
-            note, sid, len(dom_ids), len(reg_triplets_append)
-        )
-        logger.debug("[order] %s DOM ids (first %d): %s", note, len(dom_ids_disp), dom_ids_disp)
-        logger.debug("[order] %s REG append (fi,type,id) first %d: %s", note, len(reg_append_disp), reg_append_disp)
-        logger.debug("[order] %s REG by-fi (fi,type,id) first %d: %s", note, len(reg_spec_disp), reg_spec_disp)
-        logger.debug("[order] %s DOM annotated (id,fi,type) first %d: %s", note, len(dom_annotated_disp), dom_annotated_disp)
-
-        # If we want a quick “how different” signal:
         dom_set = set(dom_ids)
         reg_set = set([t[2] for t in reg_triplets_append])
         dom_only = list(dom_set - reg_set)
         reg_only = list(reg_set - dom_set)
 
-        if dom_only:
-            logger.debug("[order] %s DOM-only ids (sample): %s", note, dom_only[:20])
-        if reg_only:
-            logger.debug("[order] %s REG-only ids (sample): %s", note, reg_only[:20])
+        self.session.emit_diag(
+            Cat.REG,
+            "Section order alignment snapshot",
+            note=note,
+            section_id=sid,
+            dom_count=len(dom_ids),
+            reg_append_count=len(reg_triplets_append),
+            dom_ids=dom_ids_disp,
+            reg_append=reg_append_disp,
+            reg_spec=reg_spec_disp,
+            dom_annotated=dom_annotated_disp,
+            dom_only_sample=dom_only[:20],
+            reg_only_sample=reg_only[:20],
+            **ctx_order,
+        )
