@@ -15,6 +15,7 @@ from .session import CASession
 from .activity_deleter import ActivityDeleter
 from .section_handles import SectionHandle
 from .activity_registry import ActivityRegistry
+from .instrumentation import Cat
 from .. import config  # src/config.py
 
 _SECTION_ID_RE = re.compile(r"--(\d+)$")
@@ -55,6 +56,15 @@ class ActivitySections:
 
         self._sections_list_cache = None
 
+    def _section_ctx(self, *, action: str, attempt: str | None = None) -> dict[str, str]:
+        ctx: dict[str, str] = {
+            "sec": self.current_section_id or "",
+            "kind": action,
+        }
+        if attempt:
+            ctx["a"] = attempt
+        return ctx
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -92,6 +102,8 @@ class ActivitySections:
         wait = self.session.get_wait(timeout)
         logger = self.logger
 
+        self.session.counters.inc("section.sidebar_ensure_calls")
+
         sidebars = config.BUILDER_SELECTORS.get("sidebars", {})
         cfg = sidebars.get("sections", {})
 
@@ -115,15 +127,21 @@ class ActivitySections:
             try:
                 tab = driver.find_element(By.CSS_SELECTOR, tab_sel)
                 if tab.is_displayed():
+                    self.session.counters.inc("section.sidebar_fastpath_hits")
+                    ctx = self._section_ctx(action="ensure_sidebar", attempt="fastpath")
+                    self.session.emit_diag(
+                        Cat.SECTION,
+                        "Sections sidebar already visible",
+                        key="SECTION.sidebar.fastpath",
+                        every_s=1.0,
+                        **ctx,
+                    )
                     if not frame_sel:
-                        logger.info("Sections sidebar tab is already visible (no frame selector configured).")
                         return True
 
-                    # if frame is visible and items are present, we’re truly good
                     try:
                         frame = driver.find_element(By.CSS_SELECTOR, frame_sel)
                         if frame.is_displayed() and _items_present():
-                            logger.info("Sections sidebar already visible and populated.")
                             return True
                     except Exception:
                         pass
@@ -438,6 +456,14 @@ class ActivitySections:
         # This avoids a lot of Turbo-stale churn.
         try:
             if self.wait_for_canvas_for_current_section(timeout=3):
+                self.session.counters.inc("section.fastpath_hits")
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Canvas already aligned for current section",
+                    key="SECTION.canvas.fastpath",
+                    every_s=1.0,
+                    **self._section_ctx(action="select", attempt="fastpath"),
+                )
                 logger.debug(
                     "_select_from_current_handle fast-path: canvas already aligned for section id=%s title=%r.",
                     handle.section_id,

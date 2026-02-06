@@ -4,6 +4,7 @@ from .activity_registry import ActivityRegistry
 from .activity_sections import ActivitySections
 from .activity_editor import ActivityEditor
 from .field_types import FIELD_TYPES
+from .instrumentation import Cat
 
 from selenium.webdriver.common.by import By
 
@@ -19,7 +20,10 @@ def build_registry_from_current_activity(
       - You're already on the Activity Builder page for a given activity.
     """
 
-    logger = sections.logger
+    session = sections.session
+    logger = session.logger
+    session.counters.inc("registry.rebuilds")
+    session.emit_signal(Cat.REG, "Registry rebuild started", reason="snapshot_rebuild")
 
     # 1. List all section <li> elements
     li_list = sections.list()
@@ -93,6 +97,14 @@ def build_registry_from_current_activity(
             )
             registry.add_field(fh)
 
+    section_count, field_count = registry.stats()
+    session.emit_signal(
+        Cat.REG,
+        "Registry rebuild completed",
+        reason="snapshot_rebuild",
+        sections=section_count,
+        fields=field_count,
+    )
     logger.info("Activity registry rebuilt from current activity snapshot.")
 
 

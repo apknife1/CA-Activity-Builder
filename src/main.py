@@ -30,7 +30,7 @@ def main():
     logger = setup_logging()
 
     session = CASession(logger)
-    registry = ActivityRegistry()
+    registry = ActivityRegistry(session=session)
 
     try:
         session.login()

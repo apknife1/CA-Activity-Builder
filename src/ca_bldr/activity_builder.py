@@ -100,6 +100,12 @@ class CAActivityBuilder:
             self.session.counters.inc("sidebar.fields_ensure_calls")
 
         ctx = self._ctx(kind=kind)
+        self.session.emit_diag(
+            Cat.SIDEBAR,
+            f"Ensure {kind} sidebar visibility",
+            key=f"SIDEBAR.{kind}.ensure.start",
+            **ctx,
+        )
 
         sidebars = config.BUILDER_SELECTORS.get("sidebars", {})
         cfg = sidebars.get(kind, {})
@@ -341,6 +347,7 @@ class CAActivityBuilder:
         driver = self.session.driver
         wait = self.session.wait
         logger = self.logger
+        ctx = self._ctx(kind="fields_tab")
 
         tab_map = {
             "Auto marked": config.BUILDER_SELECTORS["fields_sidebar"]["tab_auto_marked"],
@@ -364,33 +371,38 @@ class CAActivityBuilder:
                 EC.visibility_of_element_located((By.CSS_SELECTOR, fields_root_sel))
             )
         except Exception as e:
-            logger.error(f"Fields sidebar root not visible when activating tab: {e}")
+            self.session.emit_signal(
+                Cat.SIDEBAR,
+                "Fields sidebar root not visible when activating tab",
+                **ctx,
+            )
             return None
 
         try:
             tab_btn = fields_root.find_element(By.CSS_SELECTOR, tab_selector)
-        except Exception as e:
-            logger.error(
-                f"Could not find tab button '{spec.sidebar_tab_label}' in Fields sidebar: {e}"
+        except Exception:
+            self.session.emit_signal(
+                Cat.SIDEBAR,
+                f"Could not find tab button '{spec.sidebar_tab_label}'",
+                **ctx,
             )
             return None
 
-        logger.info(f"Activating '{spec.sidebar_tab_label}' tab in Fields sidebar...")
+        self.session.emit_diag(
+            Cat.SIDEBAR,
+            f"Activating '{spec.sidebar_tab_label}' tab",
+            **ctx,
+        )
 
         try:
-            # JS click is usually more reliable in offcanvas/sticky layouts
             driver.execute_script("arguments[0].click();", tab_btn)
-            # # debug logging to track tabs state
-            # tabs = fields_root.find_elements(By.CSS_SELECTOR, "button.nav-section[role='tab']")
-            # for t in tabs:
-            #     label = t.get_attribute("label")
-            #     cls = t.get_attribute("class")
-            #     aria = t.get_attribute("aria-selected")
-            #     logger.info(f"Tab '{label}' -> class='{cls}', aria-selected='{aria}'")
-
             return tab_btn
-        except Exception as e:
-            logger.error(f"Could not click '{spec.sidebar_tab_label}' tab button: {e}")
+        except Exception:
+            self.session.emit_signal(
+                Cat.SIDEBAR,
+                f"Could not click '{spec.sidebar_tab_label}' tab button",
+                **ctx,
+            )
             return None
 
     # --- add a new field to the canvas ---
@@ -500,7 +512,13 @@ class CAActivityBuilder:
         def _hard_resync_once_or_bail(reason: str) -> bool:
             nonlocal used_hard_resync
             if used_hard_resync:
-                logger.error("Hard resync already used for this add_field_from_spec call; refusing. reason=%s", reason)
+                ctx = self._ctx(kind="hard_resync", fi=fi_index, a="reuse_refused")
+                self.session.emit_signal(
+                    Cat.PHANTOM,
+                    "Hard resync already used for this add attempt",
+                    reason=reason,
+                    **ctx,
+                )
                 return False
 
             did = _hard_resync_or_bail(reason=reason)  # your existing helper
@@ -518,11 +536,14 @@ class CAActivityBuilder:
             abort_on_fail = getattr(config, "PHANTOM_TIMEOUT_ABORT", False)
 
             if self.hard_resync_count >= max_resync:
-                logger.error(
-                    "Hard resync budget exhausted (%d/%d). Reason=%s",
-                    self.hard_resync_count,
-                    max_resync,
-                    reason,
+                ctx = self._ctx(kind="hard_resync", fi=fi_index, a="budget_exhausted")
+                self.session.emit_signal(
+                    Cat.PHANTOM,
+                    "Hard resync budget exhausted",
+                    count=self.hard_resync_count,
+                    limit=max_resync,
+                    reason=reason,
+                    **ctx,
                 )
                 if abort_on_fail:
                     # Fail out of the activity build altogether (caller should catch)
@@ -530,21 +551,36 @@ class CAActivityBuilder:
                 return False  # skip this field
 
             if not hasattr(sections, "hard_resync_current_section"):
-                logger.error("No hard_resync_current_section available; cannot recover.")
+                ctx = self._ctx(kind="hard_resync", fi=fi_index, a="missing_hook")
+                self.session.emit_signal(
+                    Cat.PHANTOM,
+                    "Hard resync helper missing",
+                    reason=reason,
+                    **ctx,
+                )
                 if abort_on_fail:
                     raise RuntimeError(f"No hard resync available: {reason}")
                 return False
 
             self.hard_resync_count += 1
-            logger.warning(
-                "Hard resync triggered (%d/%d). Reason=%s",
-                self.hard_resync_count,
-                max_resync,
-                reason,
+            self.session.counters.inc("section.hard_resyncs")
+            ctx = self._ctx(kind="hard_resync", fi=fi_index, a="triggered")
+            self.session.emit_signal(
+                Cat.PHANTOM,
+                "Hard resync triggered",
+                count=self.hard_resync_count,
+                limit=max_resync,
+                reason=reason,
+                **ctx,
             )
             ok = sections.hard_resync_current_section()
             if not ok:
-                logger.error("Hard resync failed. Reason=%s", reason)
+                self.session.emit_signal(
+                    Cat.PHANTOM,
+                    "Hard resync attempt failed",
+                    reason=reason,
+                    **ctx,
+                )
                 if abort_on_fail:
                     raise RuntimeError(f"Hard resync failed: {reason}")
                 return False
@@ -560,24 +596,33 @@ class CAActivityBuilder:
             index=section_index,
         )
         if sec_handle is None:
-            logger.error("Could not prepare a question section; aborting field add.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not prepare question section",
+                section_title=section_title,
+                section_index=section_index,
+                **self._ctx(kind="section_prepare"),
+            )
             return None
 
         # Wait for the canvas to actually match the section we think is active
         if not sections.wait_for_canvas_for_current_section():
-            logger.error(
-                "Canvas not aligned with section '%s' (id=%s); refusing to add %s field.",
-                sec_handle.title,
-                sec_handle.section_id,
-                spec.display_name,
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Canvas not aligned with current section",
+                section_id=sec_handle.section_id,
+                section_title=sec_handle.title,
+                field_type=spec.display_name,
+                **self._ctx(kind="canvas_align"),
             )
             return None
 
         # Sanity check: we expect section layout (#section-fields) to be present
         if not driver.find_elements(By.CSS_SELECTOR, "#section-fields"):
-            logger.error(
-                "No #section-fields detected; Activity Builder is not in section mode. "
-                "Cannot add field."
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Section fields container missing",
+                **self._ctx(kind="section_mode"),
             )
             return None
         
@@ -715,11 +760,13 @@ class CAActivityBuilder:
                         key=key,
                         create_attempt=create_attempt,
                         drag_attempt=drag_attempt,
+                        fi_index=fi_index,
                         dump_pre_drop_state=(not pre_drop_dumped),
                     )
 
                     pre_drop_dumped = True
 
+                    drop_ctx = self._ctx(kind="drop", spec=spec, fi=fi_index, a=f"create={create_attempt}")
                     if not gesture.ok:
                         logger.warning("Drop gesture failed for %s: reason=%s dz_id=%s", spec.display_name, gesture.reason, gesture.dz_id)
                         continue
@@ -750,10 +797,28 @@ class CAActivityBuilder:
                             len(dom_after_release_ids),
                             spec.display_name,
                         )
+                        self.session.counters.inc("drop.dom_changed")
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "DOM count increased after drop release",
+                            section_id=self.sections.current_section_id or "",
+                            before=len(dom_before_ids),
+                            after=len(dom_after_release_ids),
+                            **drop_ctx,
+                        )
                     else:
                         logger.info(
                             "DOM count did not increase within 2.0s after drop release for %s.",
                             spec.display_name,
+                        )
+                        self.session.counters.inc("drop.dom_no_change")
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "DOM count unchanged after drop release",
+                            section_id=self.sections.current_section_id or "",
+                            before=len(dom_before_ids),
+                            after=len(dom_after_release_ids),
+                            **drop_ctx,
                         )
 
                     drag_succeeded = True
@@ -1503,12 +1568,15 @@ class CAActivityBuilder:
         key: str,
         create_attempt: int,
         drag_attempt: int,
+        fi_index: int | None = None,
         dump_pre_drop_state: bool = False,
     ) -> DropGestureResult:
         driver = self.driver
         logger = self.logger
 
         self.session.counters.inc("drop.drag_attempts")
+        ctx = self._ctx(kind="drop", spec=FIELD_TYPES.get(key), fi=fi_index, a=f"create={create_attempt}/drag={drag_attempt}")
+        self.session.emit_diag(Cat.DROP, "Starting drag/drop gesture", **ctx)
 
         note = f"type={key} create_attempt={create_attempt} drag_attempt={drag_attempt} loc={drop_location}"
 
@@ -1548,6 +1616,8 @@ class CAActivityBuilder:
                 ActionChains(driver).send_keys(Keys.ESCAPE).perform()
             except Exception:
                 pass
+            self.session.counters.inc("drop.dropzone_not_found")
+            self.session.emit_diag(Cat.DROP, "Dropzone not found", note="dropzone_not_found", **ctx)
             return DropGestureResult(False, "dropzone_not_found", dz_id)
 
         # Diagnostics: pre-drop state
@@ -1587,6 +1657,8 @@ class CAActivityBuilder:
                 ActionChains(driver).send_keys(Keys.ESCAPE).perform()
             except Exception:
                 pass
+            self.session.counters.inc("drop.dropzone_rect_unusable")
+            self.session.emit_diag(Cat.DROP, "Dropzone rect unusable", note="dropzone_rect_unusable", **ctx)
             return DropGestureResult(False, "dropzone_rect_unusable", dz_id)
 
         # Offsets: *center-relative* offsets.
@@ -1617,6 +1689,8 @@ class CAActivityBuilder:
         for (ox, oy) in offsets:
             try:
                 if not self._wait_for_drag_mode(timeout=0.2):
+                    self.session.counters.inc("drop.drag_mode_collapsed")
+                    self.session.emit_diag(Cat.DROP, "Drag mode collapsed", note="drag_mode_collapsed", **ctx)
                     return DropGestureResult(False, "drag_mode_collapsed", dz_id)
 
                 # Re-find dropzone by id each attempt (Turbo swaps nodes)
@@ -1625,6 +1699,8 @@ class CAActivityBuilder:
                 except Exception:
                     dropzone = None
                 if dropzone is None:
+                    self.session.counters.inc("drop.dropzone_lost")
+                    self.session.emit_diag(Cat.DROP, "Dropzone lost during offset retry", note="dropzone_lost", **ctx)
                     return DropGestureResult(False, "dropzone_lost", dz_id)
 
                 active_ok = driver.execute_script(
@@ -1650,6 +1726,14 @@ class CAActivityBuilder:
                     huge,
                 )
 
+                self.session.counters.inc("drop.successes")
+                self.session.emit_diag(
+                    Cat.DROP,
+                    "Drag/drop gesture released",
+                    note="released",
+                    offset=f"{ox},{oy}",
+                    **ctx,
+                )
                 return DropGestureResult(
                     True,
                     "released",
@@ -1677,7 +1761,14 @@ class CAActivityBuilder:
                             """,
                             px, py
                         )
-                        logger.debug("JS fallback mouseup dispatched (%s) at viewport(%d,%d).", note, px, py)
+                        self.session.counters.inc("drop.js_fallbacks")
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "Drop gesture JS fallback success",
+                            note="ok_js_fallback",
+                            offset=f"{ox},{oy}",
+                            **ctx,
+                        )
                         return DropGestureResult(True, "ok_js_fallback", dz_id, offset_used=(ox, oy), used_js_fallback=True)
                     except Exception:
                         pass
@@ -1690,6 +1781,8 @@ class CAActivityBuilder:
         except Exception:
             pass
 
+        self.session.counters.inc("drop.all_offsets_failed")
+        self.session.emit_diag(Cat.DROP, "All drop offsets exhausted", note="all_offsets_failed", **ctx)
         return DropGestureResult(False, "all_offsets_failed", dz_id)
      
     def _scroll_dropzone_to_visible(self, dropzone, *, max_attempts: int = 3, block: str = "end") -> bool:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from operator import attrgetter
-from typing import Dict, List, Iterable, Optional, cast
+from typing import Any, Dict, Iterable, List, Optional, cast
 
+from .instrumentation import Cat
 from .section_handles import SectionHandle
 from .field_handles import FieldHandle
+from .session import CASession
 
 
 @dataclass
@@ -25,11 +26,37 @@ class ActivityRegistry:
     - Can be reconstructed later from the DOM if needed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, session: CASession | None = None) -> None:
         # section_id -> SectionRecord
         self._sections: Dict[str, SectionRecord] = {}
         # field_id -> FieldHandle
         self._fields: Dict[str, FieldHandle] = {}
+        self._session = session
+
+    def _handle_ctx(self, handle: FieldHandle) -> dict[str, Any]:
+        ctx: dict[str, Any] = {
+            "sec": handle.section_id or "",
+            "fid": handle.field_id,
+            "type": handle.field_type_key,
+        }
+        if handle.fi_index is not None:
+            ctx["fi"] = handle.fi_index
+        return ctx
+
+    def _emit_signal(self, msg: str, **ctx: Any) -> None:
+        if self._session:
+            self._session.emit_signal(Cat.REG, msg, **ctx)
+
+    def _emit_diag(self, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx: Any) -> None:
+        if self._session:
+            self._session.emit_diag(Cat.REG, msg, key=key, every_s=every_s, **ctx)
+
+    def _inc_counter(self, key: str, n: int = 1) -> None:
+        if self._session:
+            self._session.counters.inc(key, n)
+
+    def stats(self) -> tuple[int, int]:
+        return len(self._sections), len(self._fields)
 
     # --- sections ---
 
@@ -66,15 +93,51 @@ class ActivityRegistry:
         if not handle.field_id:
             return
 
+        ctx = self._handle_ctx(handle)
+        duplicate_field = handle.field_id in self._fields
+        if duplicate_field:
+            self._inc_counter("registry.duplicate_field_ids")
+            self._emit_signal(
+                "Duplicate field handle re-registered",
+                note="duplicate_field_id",
+                **ctx,
+            )
+
         self._fields[handle.field_id] = handle
 
         if handle.section_id:
             rec = self._sections.get(handle.section_id)
             if rec is None:
-                # section might not have been registered yet – create a bare record
+                # section might not have been registered yet - create a bare record
                 rec = SectionRecord(handle=SectionHandle(section_id=handle.section_id))
                 self._sections[handle.section_id] = rec
-            rec.fields.append(handle)
+                self._inc_counter("registry.field_without_section")
+                self._emit_signal(
+                    "Field added before section record existed",
+                    reason="missing_section_record",
+                    **ctx,
+                )
+            existing_index = next(
+                (idx for idx, f in enumerate(rec.fields) if f.field_id == handle.field_id),
+                None,
+            )
+            if existing_index is not None:
+                self._inc_counter("registry.section_duplicate_handles")
+                self._emit_signal(
+                    "Section already referenced this field id",
+                    reason="duplicate_section_handle",
+                    **ctx,
+                )
+                rec.fields[existing_index] = handle
+            else:
+                rec.fields.append(handle)
+        else:
+            self._inc_counter("registry.field_missing_section")
+            self._emit_signal(
+                "Field handle without section information",
+                reason="missing_section_info",
+                **ctx,
+            )
 
     def get_field(self, field_id: str) -> Optional[FieldHandle]:
         return self._fields.get(field_id)
@@ -123,6 +186,13 @@ class ActivityRegistry:
         ]
 
         if not candidates:
+            ctx = {"sec": section_id, "fi": fi_index}
+            self._inc_counter("registry.anchor_misses")
+            self._emit_diag(
+                "No anchor found before requested fi index",
+                key="REG.anchor_missing",
+                **ctx,
+            )
             return None
 
         best = max(candidates, key=lambda fh: cast(int, fh.fi_index))
@@ -149,7 +219,7 @@ class ActivityRegistry:
         Return a simple dict representation of the current registry,
         suitable for JSON/YAML dumping.
         """
-        return {
+        snapshot = {
             "sections": {
                 section_id: {
                     "handle": {
@@ -183,3 +253,14 @@ class ActivityRegistry:
                 for field_id, fh in self._fields.items()
             },
         }
+
+        self._inc_counter("registry.snapshot_count")
+        self._emit_diag(
+            "Registry snapshot emitted",
+            key="REG.snapshot",
+            every_s=60.0,
+            sections=len(self._sections),
+            fields=len(self._fields),
+        )
+
+        return snapshot

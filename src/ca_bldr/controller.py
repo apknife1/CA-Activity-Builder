@@ -61,6 +61,14 @@ class ActivityBuildController:
         self.reader = ctx.reader  # you said you’ve added this to AppContext
         self.deleter = ctx.deleter
 
+    def _nav_ctx(self, act: ActivityInstruction, *, step: str | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        ctx = {"act": act.activity_code or "unknown"}
+        if step:
+            ctx["a"] = step
+        if extra:
+            ctx.update(extra)
+        return ctx
+
     def control_process(self) -> None:
         """
         landing point from src/main.py
@@ -117,7 +125,11 @@ class ActivityBuildController:
         for act in activities:
             with phase_timer(logger, f"Activity {act.activity_code} full build"):
 
-                self.session.emit_signal(Cat.NAV, "Activity start", act=act.activity_code)
+                self.session.emit_signal(
+                    Cat.NAV,
+                    "Activity start",
+                    **self._nav_ctx(act, step="start"),
+                )
                 status: ActivityStatus = ActivityStatus.ABORTED
                 reason: str | None = None
                 t0 = perf_counter()
@@ -127,7 +139,22 @@ class ActivityBuildController:
                     with phase_timer(logger, f"{act.activity_code}: locate existing template"):
                         match = session.find_activity_template_by_title_any_status(act.activity_title or "")
 
-                    self.session.emit_signal(Cat.NAV, f"Template locate result={('found' if match else 'not_found')}", act=act.activity_code)
+                    lookup_ctx = self._nav_ctx(act, step="template_lookup")
+                    self.session.counters.inc("nav.template_lookup_attempts")
+                    if match:
+                        status_label = (match.status or "found").strip().lower().replace(" ", "_")
+                        self.session.counters.inc("nav.template_lookup_found")
+                        self.session.counters.inc(f"nav.template_status_{status_label}")
+                        lookup_result = f"found({match.status})"
+                    else:
+                        self.session.counters.inc("nav.template_lookup_missing")
+                        lookup_result = "not_found"
+
+                    self.session.emit_signal(
+                        Cat.NAV,
+                        f"Template locate result={lookup_result}",
+                        **lookup_ctx,
+                    )
 
                     if match and match.status != "inactive":
                         status = ActivityStatus.SKIPPED_EXISTING 
@@ -187,8 +214,13 @@ class ActivityBuildController:
                             f"drag_attempts={delta.get('drop.drag_attempts',0)} "
                             f"phantoms={delta.get('phantom.timeouts',0)} "
                             f"hard_resync={delta.get('section.hard_resyncs',0)} "
-                            f"retries={delta.get('retry.pass_runs',0)}",
-                            act=act.activity_code,
+                            f"retries={delta.get('retry.pass_runs',0)} "
+                            f"template_lookups={delta.get('nav.template_lookup_attempts',0)} "
+                            f"template_found={delta.get('nav.template_lookup_found',0)} "
+                            f"template_active={delta.get('nav.template_status_active',0)} "
+                            f"template_inactive={delta.get('nav.template_status_inactive',0)} "
+                            f"template_missing={delta.get('nav.template_lookup_missing',0)}",
+                            **self._nav_ctx(act, step="end"),
                         )
                     except Exception:
                         # don't let summary emission break the run shutdown / control flow

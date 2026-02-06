@@ -37,8 +37,9 @@ from .field_configs import (
     MarkingType,
     TableCellConfig,
     SingleChoiceConfig,
-)
+    )
 from .. import config
+from .instrumentation import Cat
 
 FIELD_ID_SUFFIX_RE = re.compile(r"--(\d+)$")
 
@@ -86,6 +87,16 @@ class ActivityEditor:
         self.ui_state_recovery_count = 0
 
         self._skip_events: list[dict] = []
+
+    def _editor_ctx(self, *, field_id: str | None = None, section_id: str | None = None, kind: str | None = None, stage: str | None = None) -> dict[str, Any]:
+        ctx: dict[str, Any] = {
+            "sec": section_id or "",
+            "fid": field_id,
+            "kind": kind or "editor",
+        }
+        if stage:
+            ctx["a"] = stage
+        return ctx
 
     # -------- Field discovery --------
     
@@ -459,6 +470,15 @@ class ActivityEditor:
             If config is not an instance of BaseFieldConfig.
         """
 
+        ctx_config = self._editor_ctx(
+            field_id=handle.field_id,
+            section_id=handle.section_id,
+            kind="configure",
+            stage="start",
+        )
+        self.session.counters.inc("editor.configure_attempts")
+        self.session.emit_diag(Cat.CONFIGURE, "Configure field start", **ctx_config)
+
         def _cleanup_canvas() -> WebElement:
             self._reset_canvas_ui_state()
             fresh = self.get_field_by_id(handle.field_id)
@@ -563,6 +583,31 @@ class ActivityEditor:
             enable_model_answer = True
 
         self.logger.info(f"Switch values: enable_model_answer={enable_model_answer}, enable_assessor_comments={enable_assessor_comments}")
+
+        props_list = [
+            ("hide_in_report", config.hide_in_report),
+            ("learner_visibility", config.learner_visibility),
+            ("assessor_visibility", config.assessor_visibility),
+            ("required", required),
+            ("marking_type", marking_type),
+            ("enable_model_answer", enable_model_answer),
+            ("enable_assessor_comments", enable_assessor_comments),
+        ]
+        requested_props = [name for name, value in props_list if value is not None]
+        if requested_props:
+            ctx_props = self._editor_ctx(
+                field_id=handle.field_id,
+                section_id=handle.section_id,
+                kind="properties",
+                stage="start",
+            )
+            self.session.counters.inc("editor.properties_writes")
+            self.session.emit_diag(
+                Cat.PROPS,
+                "Applying field properties",
+                properties=",".join(requested_props),
+                **ctx_props,
+            )
 
         # Only call set_field_properties if we have *something* to set.
         if any(
@@ -1769,29 +1814,69 @@ class ActivityEditor:
                     field_id = None
 
             if not field_id:
-                self.logger.warning("UI_STATE: cannot determine expected field_id from field_el.")
+                ctx = self._editor_ctx(kind="ui_state", stage="missing_expected")
+                self.session.counters.inc("editor.ui_state_missing_expected")
+                self.session.emit_diag(
+                    Cat.UISTATE,
+                    "UI_STATE missing expected field_id",
+                    **ctx,
+                )
                 return False
 
             html = frame.get_attribute("innerHTML") or ""
             m = re.search(r"/fields/(\d+)\.turbo_stream", html)
             if not m:
                 # If the frame doesn't expose a field id, we cannot prove binding.
-                self.logger.warning("UI_STATE: cannot determine observed field_id from settings frame HTML.")
+                ctx = self._editor_ctx(kind="ui_state", stage="missing_observed_html", field_id=field_id)
+                self.session.counters.inc("editor.ui_state_missing_html")
+                self.session.emit_diag(
+                    Cat.UISTATE,
+                    "UI_STATE missing observed field_id in frame html",
+                    **ctx,
+                )
                 return False
 
             observed = self._observed_field_id_from_settings_frame(frame)
             if not observed:
-                self.logger.warning("UI_STATE: cannot determine observed field_id from settings frame controls/src.")
+                ctx = self._editor_ctx(kind="ui_state", stage="missing_observed_controls", field_id=field_id)
+                self.session.counters.inc("editor.ui_state_missing_control")
+                self.session.emit_diag(
+                    Cat.UISTATE,
+                    "UI_STATE missing observed field_id from controls",
+                    **ctx,
+                )
                 return False
 
             if observed != str(field_id):
-                self.logger.warning("UI_STATE: mismatch expected=%s observed=%s.", field_id, observed)
+                ctx = self._editor_ctx(kind="ui_state", stage="mismatch", field_id=field_id)
+                self.session.counters.inc("editor.ui_state_mismatch")
+                self.session.emit_diag(
+                    Cat.UISTATE,
+                    "UI_STATE binding mismatch",
+                    expected=field_id,
+                    observed=observed,
+                    **ctx,
+                )
                 return False
 
+            ctx = self._editor_ctx(kind="ui_state", stage="verified", field_id=field_id)
+            self.session.counters.inc("editor.ui_state_proved")
+            self.session.emit_diag(
+                Cat.UISTATE,
+                "UI_STATE binding proven",
+                **ctx,
+            )
             return True
 
         except Exception as e:
-            self.logger.warning("UI_STATE: binding proof failed: %r", e)
+            ctx = self._editor_ctx(kind="ui_state", stage="exception")
+            self.session.counters.inc("editor.ui_state_error")
+            self.session.emit_diag(
+                Cat.UISTATE,
+                "UI_STATE binding proof exception",
+                exc=str(e),
+                **ctx,
+            )
             return False
 
     # ---------- field properties: reporting, permissions etc. ----------
@@ -2080,7 +2165,14 @@ class ActivityEditor:
             except Exception:
                 pass
 
-            logger.warning("UI_STATE: binding not proven; skipping all property writes for field_id=%r title=%r", fid, title_txt)
+            ctx = self._editor_ctx(field_id=fid, section_id=None, kind="properties", stage="binding_failure")
+            self.session.counters.inc("editor.ui_state_property_skips")
+            self.session.emit_diag(
+                Cat.UISTATE,
+                "UI_STATE binding not proven; skipping property writes",
+                title=title_txt,
+                **ctx,
+            )
 
             # Record for controller reporting/retry
             self.record_skip({
@@ -2655,24 +2747,71 @@ class ActivityEditor:
             """
             Run a stage with retries. Always re-find the field element before each attempt.
             """
+            ctx_stage = self._editor_ctx(
+                field_id=field_id,
+                section_id=handle.section_id or "",
+                kind="table",
+                stage=stage_name,
+            )
             for attempt in range(1, attempts + 1):
                 try:
                     fresh = _fresh_field_el()
                     fn(fresh)
+                    self.session.counters.inc(f"editor.table_stage_{stage_name}_success")
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Table stage '{stage_name}' succeeded",
+                        attempt=attempt,
+                        **ctx_stage,
+                    )
                     return True
                 except StaleElementReferenceException as e:
-                    logger.debug("Table stage %s stale (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+                    self.session.counters.inc(f"editor.table_stage_{stage_name}_stale")
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Table stage '{stage_name}' stale element",
+                        attempt=attempt,
+                        exc=str(e),
+                        **ctx_stage,
+                    )
                 except NoSuchElementException as e:
-                    logger.debug("Table stage %s missing element (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+                    self.session.counters.inc(f"editor.table_stage_{stage_name}_missing")
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Table stage '{stage_name}' missing element",
+                        attempt=attempt,
+                        exc=str(e),
+                        **ctx_stage,
+                    )
                 except TableResizeError as e:
-                    logger.debug("Table stage %s resize failed and error raised (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+                    self.session.counters.inc(f"editor.table_stage_{stage_name}_resize_error")
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Table stage '{stage_name}' resize error",
+                        attempt=attempt,
+                        exc=str(e),
+                        **ctx_stage,
+                    )
                     raise
                 except Exception as e:
-                    logger.warning("Table stage %s failed (attempt %d/%d): %s", stage_name, attempt, attempts, e)
+                    self.session.counters.inc(f"editor.table_stage_{stage_name}_error")
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Table stage '{stage_name}' error",
+                        attempt=attempt,
+                        exc=str(e),
+                        **ctx_stage,
+                    )
 
                 if attempt < attempts:
                     time.sleep(sleep_s)
             logger.warning("Table stage %s: giving up after %d attempts.", stage_name, attempts)
+            self.session.counters.inc(f"editor.table_stage_{stage_name}_gave_up")
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"Table stage '{stage_name}' gave up after {attempts} attempts",
+                **ctx_stage,
+            )
             
             # Record a configure skip event for controller
             self._record_config_skip(
