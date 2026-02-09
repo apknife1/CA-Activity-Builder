@@ -6,6 +6,15 @@ It captures **all review points identified across the controller, session, build
 
 Nothing in this list implies that changes have been made. This is a **review and optimisation ledger**, intended to be worked through *after* instrumentation is in place.
 
+## Progress (2026-02-09)
+
+- Instrumentation migration completed for `controller.py`, `activity_builder.py`, and `activity_sections.py` (logger calls replaced with `emit_signal`/`emit_diag`).
+- Instrumentation migration completed for `activity_editor.py` (logger calls replaced with `emit_signal`/`emit_diag`; table, Froala, UI state, and properties are now instrumented).
+- `activity_sections._section_ctx` typing widened to avoid type-checker issues when passing `**ctx` to `emit_diag`.
+- `emit_signal` now supports a `level` parameter (default `info`) and warning/error levels are in use where appropriate.
+- `scripts/check_cat_enum.py` added and run to validate `Cat.*` references (OK).
+- `phase_timer` refactor to instrumentation remains pending (see Observability priorities).
+
 ---
 
 ## 1. Controller & Activity Lifecycle
@@ -173,6 +182,7 @@ Nothing in this list implies that changes have been made. This is a **review and
 - Make the per-activity summary the only `LIVE` signal that includes all key counters (`drop.drag_attempts`, `phantom.timeouts`, `retry.pass_runs`) to keep logs manageable.
 - Keep context formatting centralized in `instrumentation.format_ctx` so every signal stays searchable and the whole system can leverage the same keys.
 - Refactor `phase_timer` to emit instrumentation signals/diags instead of `logger.info` phase logs.
+- During module refactors, run `scripts/check_cat_enum.py` to confirm all `Cat.*` references exist in the enum.
 
 ---
 

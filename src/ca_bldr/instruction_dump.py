@@ -1,17 +1,33 @@
 import json
+import json
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 from .spec_reader import ActivityInstruction
+from .instrumentation import Cat
+from .session import CASession
 
-def dump_activity_instruction_json(act: ActivityInstruction, out_path: Path, logger) -> None:
+def dump_activity_instruction_json(
+    act: ActivityInstruction,
+    out_path: Path,
+    *,
+    logger=None,
+    session: CASession | None = None,
+) -> None:
+    def _emit(level: str, msg: str, **ctx: Any) -> None:
+        if session:
+            session.emit_signal(Cat.CONFIGURE, msg, level=level, **ctx)
+            return
+        if logger:
+            getattr(logger, level, logger.info)(msg)
+
     if is_dataclass(act):
-        logger.info("ActivityInstruction outputting asdict")
+        _emit("info", "ActivityInstruction outputting asdict")
         payload = asdict(act)
     else:
         # fallback: best effort
-        logger.info("ActivityInstruction payload building from attributes")
+        _emit("info", "ActivityInstruction payload building from attributes")
         payload = {
             "activity_code": getattr(act, "activity_code", None),
             "activity_title": getattr(act, "activity_title", None),
@@ -27,6 +43,6 @@ def dump_activity_instruction_json(act: ActivityInstruction, out_path: Path, log
             json.dumps(payload, indent=2, ensure_ascii=False, default=str),
             encoding="utf-8",
         )
-        logger.info("Wrote activity dump to: %s", out_path)
+        _emit("info", f"Wrote activity dump to: {out_path}")
     except Exception as e:
-        logger.error("Could not output to json. Message: %r", e)
+        _emit("warning", f"Could not output to json. Message: {e!r}")

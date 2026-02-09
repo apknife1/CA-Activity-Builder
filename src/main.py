@@ -44,7 +44,7 @@ def main():
     sections = ActivitySections(session, registry=registry, deleter=deleter)
     editor = ActivityEditor(session, registry=registry)
     builder = CAActivityBuilder(session, sections=sections, editor=editor, registry=registry)
-    reader = SpecReader(logger)
+    reader = SpecReader(logger, session=session)
 
     ctx = AppContext(
         logger=logger,

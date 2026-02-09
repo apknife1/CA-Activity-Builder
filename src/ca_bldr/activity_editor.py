@@ -81,7 +81,6 @@ class ActivityEditor:
         self.session = session
         self.driver = session.driver
         self.wait = session.wait
-        self.logger = session.logger
         self.registry = registry
 
         self.ui_state_recovery_count = 0
@@ -108,7 +107,7 @@ class ActivityEditor:
         Now hardened against stale field_el: if the element is stale, we try to
         re-locate the currently-selected field and extract the id from there.
         """
-        logger = self.logger
+        ctx = self._editor_ctx(kind="field_id")
 
         def _extract_from_root(root_el):
             # Try model-answer id first
@@ -145,9 +144,10 @@ class ActivityEditor:
             if field_id:
                 return field_id
         except StaleElementReferenceException:
-            logger.debug(
-                "Field element became stale while extracting field id; "
-                "attempting to re-locate selected field."
+            self.session.emit_diag(
+                Cat.CONFIGURE,
+                "Field element became stale while extracting field id; attempting to re-locate selected field.",
+                **ctx,
             )
 
         # Second attempt: re-locate the currently selected field in the canvas
@@ -162,9 +162,18 @@ class ActivityEditor:
             if field_id:
                 return field_id
         except (NoSuchElementException, StaleElementReferenceException) as e:
-            logger.error("Could not re-locate selected field after stale reference: %s", e)
+            self.session.emit_signal(
+                Cat.CONFIGURE,
+                f"Could not re-locate selected field after stale reference: {e}",
+                level="error",
+                **ctx,
+            )
 
-        logger.debug("Could not infer field id for field element.")
+        self.session.emit_diag(
+            Cat.CONFIGURE,
+            "Could not infer field id for field element.",
+            **ctx,
+        )
         return None
     
     def get_field_by_id(self, field_id: str):
@@ -192,7 +201,11 @@ class ActivityEditor:
         '#section-fields .designer__field.designer__field--text_area'
         """
         elems = self.driver.find_elements(By.CSS_SELECTOR, field_selector)
-        self.logger.info(f"Found {len(elems)} fields with selector '{field_selector}'.")
+        self.session.emit_diag(
+            Cat.CONFIGURE,
+            f"Found {len(elems)} fields with selector '{field_selector}'.",
+            **self._editor_ctx(kind="field_discovery"),
+        )
         return elems
 
     def get_last_field(self, field_selector: str):
@@ -204,7 +217,11 @@ class ActivityEditor:
         if not elems:
             raise TimeoutException(f"No fields found with selector '{field_selector}'.")
         last = elems[-1]
-        self.logger.info("Using last field for editing.")
+        self.session.emit_diag(
+            Cat.CONFIGURE,
+            "Using last field for editing.",
+            **self._editor_ctx(kind="field_discovery"),
+        )
         return last
     
 
@@ -235,13 +252,17 @@ class ActivityEditor:
         """
         fields = self.get_fields_for_type(field_key)
         if 0 <= index < len(fields):
-            self.logger.info(
-                f"Using index {index} of {len(fields)} for type '{field_key}'."
+            self.session.emit_diag(
+                Cat.CONFIGURE,
+                f"Using index {index} of {len(fields)} for type '{field_key}'.",
+                **self._editor_ctx(kind="field_discovery"),
             )
             return fields[index]
-        self.logger.warning(
-            f"Index {index} out of range for type '{field_key}' "
-            f"(found {len(fields)} fields)."
+        self.session.emit_signal(
+            Cat.CONFIGURE,
+            f"Index {index} out of range for type '{field_key}' (found {len(fields)} fields).",
+            level="warning",
+            **self._editor_ctx(kind="field_discovery"),
         )
         return None
 
@@ -270,22 +291,28 @@ class ActivityEditor:
                 actual = (title_el.text or "").strip()
                 if exact:
                     if actual == target:
-                        self.logger.info(
-                            f"Matched '{field_key}' field with exact title '{actual}'."
+                        self.session.emit_diag(
+                            Cat.CONFIGURE,
+                            f"Matched '{field_key}' field with exact title '{actual}'.",
+                            **self._editor_ctx(kind="field_discovery"),
                         )
                         return field
                 else:
                     if target_lower in actual.lower():
-                        self.logger.info(
-                            f"Matched '{field_key}' field with partial title '{actual}'."
+                        self.session.emit_diag(
+                            Cat.CONFIGURE,
+                            f"Matched '{field_key}' field with partial title '{actual}'.",
+                            **self._editor_ctx(kind="field_discovery"),
                         )
                         return field
             except Exception:
                 continue
 
-        self.logger.warning(
-            f"No '{field_key}' field found with title '{title_text}' "
-            f"(exact={exact})."
+        self.session.emit_signal(
+            Cat.CONFIGURE,
+            f"No '{field_key}' field found with title '{title_text}' (exact={exact}).",
+            level="warning",
+            **self._editor_ctx(kind="field_discovery"),
         )
         return None
     
@@ -307,7 +334,11 @@ class ActivityEditor:
         except NoSuchElementException:
             return None
         except Exception:
-            self.logger.debug("Could not read field title from element.", exc_info=True)
+            self.session.emit_diag(
+                Cat.CONFIGURE,
+                "Could not read field title from element.",
+                **self._editor_ctx(kind="field_title"),
+            )
             return None
 
     def try_get_field_id_strict(self, field_el) -> Optional[str]:
@@ -536,7 +567,15 @@ class ActivityEditor:
                     requested={"field_type_key": handle.field_type_key},
                 )
                 raise                
-            self.logger.debug("Interactive table: %r configured.", config.title)
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"Interactive table: {config.title!r} configured.",
+                **self._editor_ctx(
+                    field_id=handle.field_id,
+                    section_id=handle.section_id,
+                    kind="table_config",
+                ),
+            )
             field_el = _cleanup_canvas()
 
         if handle.field_type_key =="single_choice" and isinstance(config, SingleChoiceConfig):
@@ -582,7 +621,15 @@ class ActivityEditor:
         if model_answer_html is not None:
             enable_model_answer = True
 
-        self.logger.info(f"Switch values: enable_model_answer={enable_model_answer}, enable_assessor_comments={enable_assessor_comments}")
+        self.session.emit_diag(
+            Cat.PROPS,
+            f"Switch values: enable_model_answer={enable_model_answer}, enable_assessor_comments={enable_assessor_comments}",
+            **self._editor_ctx(
+                field_id=handle.field_id,
+                section_id=handle.section_id,
+                kind="properties",
+            ),
+        )
 
         props_list = [
             ("hide_in_report", config.hide_in_report),
@@ -639,13 +686,28 @@ class ActivityEditor:
             try:
                 self.set_field_model_answer(field_id, model_answer_html)
             except TimeoutException:
-                self.logger.warning(
-                    "Could not re-locate field after applying properties; "
-                    "skipping model answer configuration."
+                self.session.emit_signal(
+                    Cat.FROALA,
+                    "Could not re-locate field after applying properties; skipping model answer configuration.",
+                    level="warning",
+                    **self._editor_ctx(
+                        field_id=field_id,
+                        section_id=handle.section_id,
+                        kind="model_answer",
+                    ),
                 )
                 return
             except Exception as e:
-                self.logger.warning(f"Error retreiving last field: {e}")
+                self.session.emit_signal(
+                    Cat.FROALA,
+                    f"Error retreiving last field: {e}",
+                    level="warning",
+                    **self._editor_ctx(
+                        field_id=field_id,
+                        section_id=handle.section_id,
+                        kind="model_answer",
+                    ),
+                )
             return
         
         self._verify_body_after_properties_and_recover_once(
@@ -656,7 +718,6 @@ class ActivityEditor:
     # ---------- title ----------
 
     def set_field_title(self, field_el, title_text: str) -> None:
-        logger = self.logger
         desired = self._norm_text(title_text)
 
         if desired == "":
@@ -667,6 +728,7 @@ class ActivityEditor:
             fid = self.get_field_id_from_element(field_el)
         except Exception:
             fid = None
+        ctx = self._editor_ctx(field_id=fid, kind="title")
 
         def _refresh_field_el():
             nonlocal field_el
@@ -697,7 +759,11 @@ class ActivityEditor:
         # Fast path
         try:
             if _read_display_title() == desired:
-                logger.debug("Field title already correct (%r); skipping title set.", desired)
+                self.session.emit_diag(
+                    Cat.CONFIGURE,
+                    f"Field title already correct ({desired!r}); skipping title set.",
+                    **ctx,
+                )
                 return
         except Exception:
             pass
@@ -713,7 +779,11 @@ class ActivityEditor:
                     ".designer__field__editable-label--title h2.field__editable-label"
                 )
 
-                logger.info("Setting field title (attempt %d/3): %r", attempt, desired)
+                self.session.emit_diag(
+                    Cat.CONFIGURE,
+                    f"Setting field title (attempt {attempt}/3): {desired!r}",
+                    **ctx,
+                )
 
                 # Activate editor
                 if not self.session.click_element_safely(title_display):
@@ -741,12 +811,18 @@ class ActivityEditor:
                 observed = _read_input_value_if_present() or _read_display_title()
 
                 if observed == desired:
-                    logger.info("Field title verified: %r", desired)
+                    self.session.emit_diag(
+                        Cat.CONFIGURE,
+                        f"Field title verified: {desired!r}",
+                        **ctx,
+                    )
                     return
 
-                logger.warning(
-                    "Field title not applied after attempt %d/3 (wanted=%r got=%r).",
-                    attempt, desired, observed
+                self.session.emit_signal(
+                    Cat.CONFIGURE,
+                    f"Field title not applied after attempt {attempt}/3 (wanted={desired!r} got={observed!r}).",
+                    level="warning",
+                    **ctx,
                 )
 
                 # Cleanly exit any half-open editor before retry
@@ -759,7 +835,12 @@ class ActivityEditor:
 
             except Exception as e:
                 last_err = e
-                logger.warning("Field title set attempt %d/3 failed: %s", attempt, e)
+                self.session.emit_signal(
+                    Cat.CONFIGURE,
+                    f"Field title set attempt {attempt}/3 failed: {e}",
+                    level="warning",
+                    **ctx,
+                )
 
                 try:
                     ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
@@ -773,7 +854,12 @@ class ActivityEditor:
         if last_err is not None:
             msg += f": {type(last_err).__name__}: {last_err}"
 
-        logger.warning("Could not set field title: %s", msg)
+        self.session.emit_signal(
+            Cat.CONFIGURE,
+            f"Could not set field title: {msg}",
+            level="warning",
+            **ctx,
+        )
 
         self._record_config_skip(
             kind="configure",
@@ -813,7 +899,11 @@ class ActivityEditor:
 
             time.sleep(0.08)
 
-        self.logger.debug("Turbo idle wait timed out (last=%r).", last)
+        self.session.emit_diag(
+            Cat.FROALA,
+            f"Turbo idle wait timed out (last={last!r}).",
+            **self._editor_ctx(kind="turbo_idle"),
+        )
         return False
 
     def _read_froala_block_state(
@@ -913,7 +1003,7 @@ class ActivityEditor:
         - PROBE_MISSING: signature not seen on a fresh node
         - PROBE_UNKNOWN: couldn't read reliably (stale / no editor / turbo churn)
         """
-        logger = self.logger
+        ctx = self._editor_ctx(field_id=field_id, kind="body_probe", stage=phase)
 
         if desired_html is None:
             return PROBE_PRESENT  # nothing to check
@@ -969,9 +1059,10 @@ class ActivityEditor:
                 present = desired_sig in self._froala_sig(ed_html)
 
             if present:
-                logger.debug(
-                    "Body probe (%s): present (field_id=%r sig=%r attempt=%d source=%s).",
-                    phase, field_id, desired_sig, attempt, source
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"Body probe ({phase}): present (field_id={field_id!r} sig={desired_sig!r} attempt={attempt} source={source}).",
+                    **ctx,
                 )
                 return PROBE_PRESENT
 
@@ -982,24 +1073,31 @@ class ActivityEditor:
             ta_val = ta_primary if ta_primary is not None else ta_any
             ta_len = len(ta_val) if isinstance(ta_val, str) else None
 
-            logger.warning(
-                "Body probe (%s): MISSING (field_id=%r sig=%r attempt=%d) "
-                "source=%s ta_present=%s ta_len=%s ed_len=%d",
-                phase,
-                field_id,
-                desired_sig,
-                attempt,
-                source,        # <-- which source we evaluated
-                ta_present,    # <-- did we find ANY textarea
-                ta_len,        # <-- length of the textarea value we checked (if any)
-                ed_len,        # <-- editor html length
+            self.session.emit_signal(
+                Cat.FROALA,
+                (
+                    "Body probe ({phase}): MISSING (field_id={field_id!r} sig={sig!r} attempt={attempt}) "
+                    "source={source} ta_present={ta_present} ta_len={ta_len} ed_len={ed_len}"
+                ).format(
+                    phase=phase,
+                    field_id=field_id,
+                    sig=desired_sig,
+                    attempt=attempt,
+                    source=source,
+                    ta_present=ta_present,
+                    ta_len=ta_len,
+                    ed_len=ed_len,
+                ),
+                level="warning",
+                **ctx,
             )
             return PROBE_MISSING
 
         # never got a reliable read
-        logger.debug(
-            "Body probe (%s): UNKNOWN (field_id=%r sig=%r last_reason=%r).",
-            phase, field_id, desired_sig, last_reason
+        self.session.emit_diag(
+            Cat.FROALA,
+            f"Body probe ({phase}): UNKNOWN (field_id={field_id!r} sig={desired_sig!r} last_reason={last_reason!r}).",
+            **ctx,
         )
         return PROBE_UNKNOWN
     
@@ -1031,17 +1129,21 @@ class ActivityEditor:
 
         if result == PROBE_UNKNOWN:
             # Don't “fix” on uncertainty – that hides real causes and adds churn.        
-            self.logger.warning(
-                "Post-props body probe unknown (field_id=%r). Skipping recovery.",
-                fid,
+            self.session.emit_signal(
+                Cat.FROALA,
+                f"Post-props body probe unknown (field_id={fid!r}). Skipping recovery.",
+                level="warning",
+                **self._editor_ctx(field_id=fid, kind="body_probe", stage="post-props"),
             )
             return
         
         # only here if definite
-        self.logger.warning(
-            "Body LOST after properties (definite) field_id=%r. Re-applying body once.",
-            fid,
-        )        
+        self.session.emit_signal(
+            Cat.FROALA,
+            f"Body LOST after properties (definite) field_id={fid!r}. Re-applying body once.",
+            level="warning",
+            **self._editor_ctx(field_id=fid, kind="body_probe", stage="post-props"),
+        )
 
         # Re-apply and let _set_froala_block do its persisted+verified routine
         field_el = self.get_field_by_id(fid) if fid else None
@@ -1071,7 +1173,7 @@ class ActivityEditor:
 
         expected_by_field_id: {field_id: expected_html}
         """
-        logger = self.logger
+        ctx = self._editor_ctx(kind="body_audit", stage=label)
         self._wait_turbo_idle(timeout=5.0)
 
         missing = []
@@ -1116,17 +1218,27 @@ class ActivityEditor:
                 missing.append((field_id, exp_sig, act_sig))
 
         # Log summary
-        logger.info(
-            "Body audit (%s): ok=%d missing=%d unknown=%d total=%d",
-            label, ok, len(missing), len(unknown), len(expected_by_field_id)
+        self.session.emit_diag(
+            Cat.FROALA,
+            f"Body audit ({label}): ok={ok} missing={len(missing)} unknown={len(unknown)} total={len(expected_by_field_id)}",
+            **ctx,
         )
 
         # Log details (bounded)
         for field_id, exp_sig, act_sig in missing[:max_report]:
-            logger.warning("Body audit (%s): MISMATCH field_id=%s exp=%r act=%r", label, field_id, exp_sig, act_sig)
+            self.session.emit_signal(
+                Cat.FROALA,
+                f"Body audit ({label}): MISMATCH field_id={field_id} exp={exp_sig!r} act={act_sig!r}",
+                level="warning",
+                **ctx,
+            )
 
         for field_id, reason in unknown[:max_report]:
-            logger.debug("Body audit (%s): UNKNOWN field_id=%s reason=%r", label, field_id, reason)
+            self.session.emit_diag(
+                Cat.FROALA,
+                f"Body audit ({label}): UNKNOWN field_id={field_id} reason={reason!r}",
+                **ctx,
+            )
 
         return {"ok": ok, "missing": missing, "unknown": unknown}
 
@@ -1148,7 +1260,6 @@ class ActivityEditor:
         """
         driver = self.driver
         wait = self.wait
-        logger = self.logger
 
         if html is None:
             return
@@ -1164,6 +1275,7 @@ class ActivityEditor:
             fid = self.get_field_id_from_element(field_el)
         except Exception:
             fid = None
+        ctx = self._editor_ctx(field_id=fid, kind="froala", stage=log_label)
 
         def _refind_field():
             nonlocal field_el
@@ -1284,7 +1396,11 @@ class ActivityEditor:
                     res = driver.execute_script(script_set, field_el, desired, block_selector, textarea_selector) or {}
                     if not res.get("ok"):
                         last_reason = res.get("reason")
-                        logger.debug("%s: JS set failed (attempt %d): %s", log_label, attempt, last_reason)
+                        self.session.emit_diag(
+                            Cat.FROALA,
+                            f"{log_label}: JS set failed (attempt {attempt}): {last_reason}",
+                            **ctx,
+                        )
                         _refind_field()
                         time.sleep(0.18)
                         continue
@@ -1308,12 +1424,13 @@ class ActivityEditor:
                     )
                     last_state = state1
                     if not _contains_signature(state1):
-                        logger.debug(
-                            "%s: verify-1 failed (attempt %d). desired_sig=%r state=%r",
-                            log_label,
-                            attempt,
-                            desired_sig,
-                            {k: state1.get(k) for k in ("ok","reason")},
+                        self.session.emit_diag(
+                            Cat.FROALA,
+                            (
+                                f"{log_label}: verify-1 failed (attempt {attempt}). "
+                                f"desired_sig={desired_sig!r} state={{'ok': {state1.get('ok')!r}, 'reason': {state1.get('reason')!r}}}"
+                            ),
+                            **ctx,
                         )
                         _refind_field()
                         time.sleep(0.18)
@@ -1330,15 +1447,20 @@ class ActivityEditor:
                     )
                     last_state = state2
                     if _contains_signature(state2):
-                        logger.info("%s set successfully (persisted + verified).", log_label)
+                        self.session.emit_diag(
+                            Cat.FROALA,
+                            f"{log_label} set successfully (persisted + verified).",
+                            **ctx,
+                        )
                         return
 
-                    logger.debug(
-                        "%s: verify-2 failed after refind (attempt %d). desired_sig=%r state=%r",
-                        log_label,
-                        attempt,
-                        desired_sig,
-                        {k: state2.get(k) for k in ("ok","reason")},
+                    self.session.emit_diag(
+                        Cat.FROALA,
+                        (
+                            f"{log_label}: verify-2 failed after refind (attempt {attempt}). "
+                            f"desired_sig={desired_sig!r} state={{'ok': {state2.get('ok')!r}, 'reason': {state2.get('reason')!r}}}"
+                        ),
+                        **ctx,
                     )
 
                 except StaleElementReferenceException:
@@ -1350,22 +1472,26 @@ class ActivityEditor:
                 _refind_field()
 
             # If we get here: did not persist
-            logger.warning(
-                "%s: FAILED to persist after retries. desired_sig=%r last_reason=%r last_state_ok=%r",
-                log_label,
-                desired_sig,
-                last_reason,
-                (last_state or {}).get("ok"),
+            self.session.emit_signal(
+                Cat.FROALA,
+                (
+                    f"{log_label}: FAILED to persist after retries. "
+                    f"desired_sig={desired_sig!r} last_reason={last_reason!r} last_state_ok={(last_state or {}).get('ok')!r}"
+                ),
+                level="warning",
+                **ctx,
             )
 
         except TimeoutException as e:
-            logger.warning(
-                "%s: TIMEOUT waiting for Froala block/editor. block_selector=%r textarea_selector=%r (%s: %s)",
-                log_label,
-                block_selector,
-                textarea_selector,
-                type(e).__name__,
-                e,
+            self.session.emit_signal(
+                Cat.FROALA,
+                (
+                    f"{log_label}: TIMEOUT waiting for Froala block/editor. "
+                    f"block_selector={block_selector!r} textarea_selector={textarea_selector!r} "
+                    f"({type(e).__name__}: {e})"
+                ),
+                level="warning",
+                **ctx,
             )
             raise
 
@@ -1443,18 +1569,22 @@ class ActivityEditor:
         - field_el is the active single choice field container on canvas
         - title/description already handled elsewhere (optional)
         """
-        logger = self.logger
         driver = self.driver
         wait = self.wait
 
         options = options or []
         if not options:
-            logger.info("Single choice: no options provided; skipping answers config.")
+            self.session.emit_diag(
+                Cat.CONFIGURE,
+                "Single choice: no options provided; skipping answers config.",
+                **self._editor_ctx(kind="single_choice"),
+            )
             return
 
         field_id = self.get_field_id_from_element(field_el)
         if not field_id:
             raise RuntimeError("Could not determine field_id for single choice field.")
+        ctx = self._editor_ctx(field_id=field_id, kind="single_choice")
 
         sel = config.BUILDER_SELECTORS["single_choice"]
         answers_container_css = sel["answers_container"]
@@ -1536,7 +1666,11 @@ class ActivityEditor:
             try:
                 wait.until(lambda d: _row_active())
             except Exception:
-                logger.debug("Single choice: option row %d did not enter active edit mode promptly.", idx)
+                self.session.emit_diag(
+                    Cat.CONFIGURE,
+                    f"Single choice: option row {idx} did not enter active edit mode promptly.",
+                    **ctx,
+                )
 
             # --- Now locate the real option input (more specific) ---
             # Prefer field_answers input, which is the option-title input.
@@ -1568,7 +1702,11 @@ class ActivityEditor:
             try:
                 wait.until(lambda d: (inp.get_attribute("value") or "").strip() == label)
             except Exception:
-                logger.debug("Single choice: option %d value did not read back immediately.", idx)
+                self.session.emit_diag(
+                    Cat.CONFIGURE,
+                    f"Single choice: option {idx} value did not read back immediately.",
+                    **ctx,
+                )
 
             # 3) Set correct answer
             # CA complains if none selected, so default to first if not specified
@@ -1641,18 +1779,17 @@ class ActivityEditor:
 
                 wait.until(lambda d: _is_correct_selected())
 
-        logger.info(
-            "Single choice answers configured: options=%d correct_index=%d field_id=%s",
-            len(options),
-            correct_index,
-            field_id,
+        self.session.emit_diag(
+            Cat.CONFIGURE,
+            f"Single choice answers configured: options={len(options)} correct_index={correct_index} field_id={field_id}",
+            **ctx,
         )
 
     # ---------- field settings: open sidebar ----------
     def _open_field_settings_sidebar(self, field_el, timeout: int = 5, pivot_el=None, force_reopen: bool = False) -> None:
         driver = self.driver
         wait = self.session.get_wait(timeout)
-        logger = self.logger
+        ctx = self._editor_ctx(kind="field_settings")
 
         def _defocus():
             try:
@@ -1698,7 +1835,11 @@ class ActivityEditor:
         # Fast path
         try:
             if (not force_reopen) and self._is_field_settings_open_for_field(field_el):
-                logger.debug("Field settings sidebar already open for this field; skipping open.")
+                self.session.emit_diag(
+                    Cat.UISTATE,
+                    "Field settings sidebar already open for this field; skipping open.",
+                    **ctx,
+                )
                 return
         except Exception:
             pass
@@ -1706,7 +1847,11 @@ class ActivityEditor:
         for attempt in range(1, 3):
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field_el)
-                logger.info("Opening Field settings sidebar for selected field... (attempt %d/2)", attempt)
+                self.session.emit_diag(
+                    Cat.UISTATE,
+                    f"Opening Field settings sidebar for selected field... (attempt {attempt}/2)",
+                    **ctx,
+                )
 
                 _defocus()
                 if pivot_el is not None:
@@ -1736,11 +1881,20 @@ class ActivityEditor:
                 wait.until(_tab_visible)
                 wait.until(_frame_loaded)
 
-                logger.info("Field settings sidebar is open and settings frame is loaded.")
+                self.session.emit_diag(
+                    Cat.UISTATE,
+                    "Field settings sidebar is open and settings frame is loaded.",
+                    **ctx,
+                )
                 return
 
             except TimeoutException as e:
-                logger.warning("Timed out waiting for field settings sidebar (attempt %d/2): %s", attempt, e)
+                self.session.emit_signal(
+                    Cat.UISTATE,
+                    f"Timed out waiting for field settings sidebar (attempt {attempt}/2): {e}",
+                    level="warning",
+                    **ctx,
+                )
                 if attempt < 2:
                     _defocus_and_close_best_effort()
                     time.sleep(0.25)
@@ -1748,7 +1902,12 @@ class ActivityEditor:
                 raise
 
             except WebDriverException as e:
-                logger.warning("WebDriver error while opening field settings sidebar (attempt %d/2): %s", attempt, e)
+                self.session.emit_signal(
+                    Cat.UISTATE,
+                    f"WebDriver error while opening field settings sidebar (attempt {attempt}/2): {e}",
+                    level="warning",
+                    **ctx,
+                )
                 if attempt < 2:
                     _defocus_and_close_best_effort()
                     time.sleep(0.25)
@@ -1760,12 +1919,17 @@ class ActivityEditor:
         Return the turbo-frame element that contains the field settings
         for the currently selected field.
         """
-        logger = self.logger
+        ctx = self._editor_ctx(kind="field_settings_frame")
         wait = self.session.get_wait(timeout)
         try:
             return wait.until(lambda d: d.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame"))
         except Exception as e:
-            logger.warning(f"Could not locate field_settings_frame: {e}")
+            self.session.emit_signal(
+                Cat.UISTATE,
+                f"Could not locate field_settings_frame: {e}",
+                level="warning",
+                **ctx,
+            )
             raise
 
     def _is_field_settings_open_for_field(self, field_el) -> bool:
@@ -1781,14 +1945,22 @@ class ActivityEditor:
             if not tab.is_displayed():
                 return False
         except Exception as e:
-            self.logger.debug("Failed to find tab. Reason: %r", e)
+            self.session.emit_diag(
+                Cat.UISTATE,
+                f"Failed to find tab. Reason: {e!r}",
+                **self._editor_ctx(kind="ui_state", stage="tab"),
+            )
             return False
 
         # 2) frame present + loaded-ish (cheap: any inputs exist)
         try:
             frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
         except Exception as e:
-            self.logger.debug("Failed to find frame. Reason: %r", e)
+            self.session.emit_diag(
+                Cat.UISTATE,
+                f"Failed to find frame. Reason: {e!r}",
+                **self._editor_ctx(kind="ui_state", stage="frame"),
+            )
             return False
 
         try:
@@ -1798,7 +1970,11 @@ class ActivityEditor:
             if not loaded_controls:
                 return False
         except Exception as e:
-            self.logger.debug("Failed to load controls. Reason: %r", e)
+            self.session.emit_diag(
+                Cat.UISTATE,
+                f"Failed to load controls. Reason: {e!r}",
+                **self._editor_ctx(kind="ui_state", stage="controls"),
+            )
             return False
 
         # 3) STRICT: prove "is this the right field?"
@@ -1899,7 +2075,6 @@ class ActivityEditor:
         and gracefully skips options that aren't present on a given field type.
         """
         driver = self.driver
-        logger = self.logger
         props = config.BUILDER_SELECTORS["properties"]
 
         missed: dict[str, str] = {}  # knob -> reason
@@ -2005,9 +2180,18 @@ class ActivityEditor:
                     if frame is not None:
                         saw_loaded_frame = True
                         if self._is_field_settings_open_for_field(field_el):
-                            logger.debug("UI_STATE: frame loaded and matches this field.")
+                            self.session.emit_diag(
+                                Cat.UISTATE,
+                                "UI_STATE: frame loaded and matches this field.",
+                                **self._editor_ctx(field_id=fid, kind="ui_state", stage="frame_loaded"),
+                            )
                             return frame
-                        logger.warning("UI_STATE: loaded frame is misbound (attempt %d/%d).", attempt, retries)
+                        self.session.emit_signal(
+                            Cat.UISTATE,
+                            f"UI_STATE: loaded frame is misbound (attempt {attempt}/{retries}).",
+                            level="warning",
+                            **self._editor_ctx(field_id=fid, kind="ui_state", stage="misbound_loaded"),
+                        )
                         _log_misbind_probes("loaded_frame_misbound", attempt=attempt, retries=retries, heavy=False)
 
                     # try to open sidebar for this field
@@ -2026,9 +2210,18 @@ class ActivityEditor:
 
                         # mismatch -> recovery then retry
                         self.ui_state_recovery_count += 1
-                        logger.warning(
-                            "UI_STATE: recovery %d (attempt %d/%d) - sidebar misbound; will retry.",
-                            self.ui_state_recovery_count, attempt, retries
+                        self.session.emit_signal(
+                            Cat.UISTATE,
+                            (
+                                "UI_STATE: recovery {recovery} (attempt {attempt}/{retries}) "
+                                "- sidebar misbound; will retry."
+                            ).format(
+                                recovery=self.ui_state_recovery_count,
+                                attempt=attempt,
+                                retries=retries,
+                            ),
+                            level="warning",
+                            **self._editor_ctx(field_id=fid, kind="ui_state", stage="recovery"),
                         )
                         _defocus_and_close_best_effort()
                         continue
@@ -2039,7 +2232,12 @@ class ActivityEditor:
                     last_err = e
                     # This is a real load failure; we didn't get a usable frame
                     if attempt < retries:
-                        logger.warning("UI_STATE: timeout loading sidebar frame (attempt %d/%d).", attempt, retries)
+                        self.session.emit_signal(
+                            Cat.UISTATE,
+                            f"UI_STATE: timeout loading sidebar frame (attempt {attempt}/{retries}).",
+                            level="warning",
+                            **self._editor_ctx(field_id=fid, kind="ui_state", stage="timeout"),
+                        )
                         _defocus_and_close_best_effort()
                         continue
                     break
@@ -2047,7 +2245,12 @@ class ActivityEditor:
                 except Exception as e:
                     last_err = e
                     if attempt < retries:
-                        logger.warning("UI_STATE: error opening sidebar (attempt %d/%d): %s", attempt, retries, e)
+                        self.session.emit_signal(
+                            Cat.UISTATE,
+                            f"UI_STATE: error opening sidebar (attempt {attempt}/{retries}): {e}",
+                            level="warning",
+                            **self._editor_ctx(field_id=fid, kind="ui_state", stage="error"),
+                        )
                         _defocus_and_close_best_effort()
                         continue
                     break
@@ -2058,7 +2261,12 @@ class ActivityEditor:
                 raise FieldPropertiesSidebarTimeout(f"Could not open field settings sidebar/frame: {last_err}")
 
             # We saw a frame, but it never matched the expected field => UI_STATE mismatch => SKIP
-            logger.warning("UI_STATE: could not prove binding after %d attempt(s); skipping property writes.", retries)
+            self.session.emit_signal(
+                Cat.UISTATE,
+                f"UI_STATE: could not prove binding after {retries} attempt(s); skipping property writes.",
+                level="warning",
+                **self._editor_ctx(field_id=fid, kind="ui_state", stage="binding_failure"),
+            )
            
             # One final heavy snapshot (single-shot)
             _log_misbind_probes("final_misbound_skip", attempt=retries, retries=retries, heavy=True)
@@ -2077,12 +2285,20 @@ class ActivityEditor:
             radios = root.find_elements(By.CSS_SELECTOR, f"input[type='radio'][name='{name}']")
             radio = next((r for r in radios if r.get_attribute("value") == target_value), None)
             if radio is None:
-                self.logger.debug("No %s radio found for value %r (skipping).", label, target_value)
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"No {label} radio found for value {target_value!r} (skipping).",
+                    **self._editor_ctx(field_id=fid, kind="properties"),
+                )
                 return False
 
             # Click + verify (one retry)
             for attempt in (1, 2):
-                self.logger.info("Setting %s to %r (attempt %d/2)...", label, target_value, attempt)
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"Setting {label} to {target_value!r} (attempt {attempt}/2)...",
+                    **self._editor_ctx(field_id=fid, kind="properties"),
+                )
                 try:
                     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", radio)
                     driver.execute_script("arguments[0].click();", radio)
@@ -2098,14 +2314,23 @@ class ActivityEditor:
                 if current == target_value:
                     return True
 
-            self.logger.warning("Failed to set %s to %r (checked=%r)", label, target_value, _radio_checked_value(root, name))
+            self.session.emit_signal(
+                Cat.PROPS,
+                f"Failed to set {label} to {target_value!r} (checked={_radio_checked_value(root, name)!r})",
+                level="warning",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
             return False
         
         # --- capability gating based on field type ---
         field_type = _infer_field_type_key(field_el)
         fid = self.get_field_id_from_element(field_el)
         title = self.get_field_title(field_el)
-        logger.debug("set_field_properties: field_type=%s field_id=%s title=%r", field_type, fid, title)
+        self.session.emit_diag(
+            Cat.PROPS,
+            f"set_field_properties: field_type={field_type} field_id={fid} title={title!r}",
+            **self._editor_ctx(field_id=fid, kind="properties"),
+        )
 
         caps = FIELD_CAPS.get(field_type, FIELD_CAPS["unknown"])
 
@@ -2120,34 +2345,43 @@ class ActivityEditor:
 
         # Paragraph cannot do assessor update
         if assessor_visibility == "update" and not caps.get("assessor_visibility_update", True):
-            logger.debug(
-                "Skipping assessor_visibility=update (unsupported) field_type=%s field_id=%s title=%r",
-                field_type, fid, title
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Skipping assessor_visibility=update (unsupported) field_type={field_type} field_id={fid} title={title!r}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
             )
             assessor_visibility = None  # or force to "read"
 
         # Skip unsupported knobs entirely (capability gating)
         if required is not None and not caps.get("required", True):
-            logger.debug("Skipping required for (unsupported) field_type=%s field_id=%s title=%r",
-                field_type, fid, title
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Skipping required for (unsupported) field_type={field_type} field_id={fid} title={title!r}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
             )
             required = None
 
         if marking_type is not None and not caps.get("marking_type", True):
-            logger.debug("Skipping marking_type for (unsupported) field_type=%s field_id=%s title=%r",
-                field_type, fid, title
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Skipping marking_type for (unsupported) field_type={field_type} field_id={fid} title={title!r}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
             )
             marking_type = None
 
         if enable_model_answer is not None and not caps.get("model_answer", True):
-            logger.debug("Skipping model_answer toggle for (unsupported) field_type=%s field_id=%s title=%r",
-                field_type, fid, title
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Skipping model_answer toggle for (unsupported) field_type={field_type} field_id={fid} title={title!r}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
             )
             enable_model_answer = None
 
         if enable_assessor_comments is not None and not caps.get("assessor_comments", True):
-            logger.debug("Skipping assessor_comments toggle for (unsupported) field_type=%s field_id=%s title=%r",
-                field_type, fid, title
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Skipping assessor_comments toggle for (unsupported) field_type={field_type} field_id={fid} title={title!r}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
             )
             enable_assessor_comments = None
 
@@ -2198,7 +2432,11 @@ class ActivityEditor:
             if hide_in_report is not None:
                 self._set_checkbox(props["hide_in_report_checkbox"], hide_in_report, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
         except Exception as e:
-            logger.debug(f"hide_in_report not set/available: {e}")
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"hide_in_report not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
             missed["hide_in_report"] = f"exception: {type(e).__name__}: {e}"
 
         # --- learner visibility ---
@@ -2221,10 +2459,19 @@ class ActivityEditor:
                     if not ok:
                         missed["learner_visibility"] = f"verify failed (wanted={target_value})"
                 else:
-                    logger.warning("Unknown learner_visibility %r", learner_visibility)
+                    self.session.emit_signal(
+                        Cat.PROPS,
+                        f"Unknown learner_visibility {learner_visibility!r}",
+                        level="warning",
+                        **self._editor_ctx(field_id=fid, kind="properties"),
+                    )
                     missed["learner_visibility"] = f"unknown value {learner_visibility!r}"
         except Exception as e:
-            logger.debug("Learner visibility not set/available: %s", e)
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Learner visibility not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
             missed["learner_visibility"] = f"exception: {type(e).__name__}: {e}"
 
         # --- assessor visibility ---
@@ -2246,10 +2493,19 @@ class ActivityEditor:
                     if not ok:
                         missed["assessor_visibility"] = f"verify failed (wanted={target_value})"
                 else:
-                    logger.warning("Unknown assessor_visibility %r", assessor_visibility)
+                    self.session.emit_signal(
+                        Cat.PROPS,
+                        f"Unknown assessor_visibility {assessor_visibility!r}",
+                        level="warning",
+                        **self._editor_ctx(field_id=fid, kind="properties"),
+                    )
                     missed["assessor_visibility"] = f"unknown value {assessor_visibility!r}"
         except Exception as e:
-            logger.debug("Assessor visibility not set/available: %s", e)
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Assessor visibility not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
             missed["assessor_visibility"] = f"exception: {type(e).__name__}: {e}"
 
         # --- required_field ---
@@ -2257,7 +2513,11 @@ class ActivityEditor:
             if required is not None:
                 self._set_checkbox(props["required_checkbox"], required, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
         except Exception as e:
-            logger.debug(f"Required field checkbox not set/available: {e}")
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Required field checkbox not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
             missed["required_checkbox"] = f"exception: {type(e).__name__}: {e}"
 
         # --- marking_type (question only) ---
@@ -2274,19 +2534,31 @@ class ActivityEditor:
                     select.dispatchEvent(event);
                     return true;
                 """
-                logger.info(f"Setting marking_type to '{marking_type}'...")
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"Setting marking_type to '{marking_type}'...",
+                    **self._editor_ctx(field_id=fid, kind="properties"),
+                )
                 ok = driver.execute_script(script, frame, marking_type)
                 if not ok:
                     missed["marking_type"] = "select[name='marking_type'] not found or change not applied"
         except Exception as e:
-            logger.debug(f"marking_type not set/available: {e}")
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"marking_type not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
 
         # --- model_answer switch ---
         try:
             if enable_model_answer is not None:
                 self._set_checkbox(props["model_answer_toggle"], enable_model_answer, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
         except Exception as e:
-            logger.debug(f"Model answer switch not set/available: {e}")
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Model answer switch not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
             missed["enable_model_answer"] = f"exception: {type(e).__name__}: {e}"
 
         # --- assessor_comments switch ---
@@ -2294,7 +2566,11 @@ class ActivityEditor:
             if enable_assessor_comments is not None:
                 self._set_checkbox(props["assessor_comments_toggle"], enable_assessor_comments, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
         except Exception as e:
-            logger.debug(f"Assessor comments switch not set/available: {e}")
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Assessor comments switch not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
             missed["enable_assessor_comments"] = f"exception: {type(e).__name__}: {e}"
 
         if missed:
@@ -2329,10 +2605,10 @@ class ActivityEditor:
         This helper is robust against Turbo re-renders by re-resolving the field
         element and retrying a few times if we hit stale element references.
         """
-        logger = self.logger
         driver = self.driver
         if not model_answer_html:
             return
+        ctx = self._editor_ctx(field_id=field_id, kind="model_answer")
 
         block_selector = (
             ".designer__field__editable-label--description"
@@ -2349,10 +2625,10 @@ class ActivityEditor:
                 self._activate_model_answer_editor(field_id)
                 
                 # 2) Wait for a fresh field_el with an initialised Froala editor
-                logger.debug(
-                    "Model answer: waiting for Froala editor for field id %s (attempt %d)...",
-                    field_id,
-                    attempt,
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"Model answer: waiting for Froala editor for field id {field_id} (attempt {attempt})...",
+                    **ctx,
                 )
                 field_el = self._wait_for_model_answer_editor(field_id, block_selector, "Model answer")
 
@@ -2392,37 +2668,42 @@ class ActivityEditor:
                     return true;
                 """
                 driver.execute_script(script, field_id, model_answer_html)
-                logger.info("Model answer text synchronised for field id %s.", field_id)
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"Model answer text synchronised for field id {field_id}.",
+                    **ctx,
+                )
                 return  # success
             except StaleElementReferenceException:
-                logger.debug(
-                    "Model answer: stale element on attempt %d for %r; retrying...",
-                    attempt,
-                    field_id,
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"Model answer: stale element on attempt {attempt} for {field_id!r}; retrying...",
+                    **ctx,
                 )
                 continue
             except TimeoutException as e:
-                logger.warning(
-                    "Model answer: timeout waiting for editor on attempt %d for %r: %s",
-                    attempt,
-                    field_id,
-                    e,
+                self.session.emit_signal(
+                    Cat.FROALA,
+                    f"Model answer: timeout waiting for editor on attempt {attempt} for {field_id!r}: {e}",
+                    level="warning",
+                    **ctx,
                 )
                 # no point retrying immediately if editor never appeared
                 break
             except Exception as e:
-                logger.warning(
-                    "Model answer: unexpected error on attempt %d for %r: %s",
-                    attempt,
-                    field_id,
-                    e,
+                self.session.emit_signal(
+                    Cat.FROALA,
+                    f"Model answer: unexpected error on attempt {attempt} for {field_id!r}: {e}",
+                    level="warning",
+                    **ctx,
                 )
                 break
 
-        logger.warning(
-            "Model answer: giving up after %d attempt(s) for field id %r.",
-            max_attempts,
-            field_id,
+        self.session.emit_signal(
+            Cat.FROALA,
+            f"Model answer: giving up after {max_attempts} attempt(s) for field id {field_id!r}.",
+            level="warning",
+            **ctx,
         )
 
     def _wait_for_model_answer_editor(self, field_id: str, block_selector: str, log_label: str) -> WebElement:
@@ -2430,32 +2711,34 @@ class ActivityEditor:
         Wait until the model answer Froala editor exists for the given field id,
         returning the *fresh* field element.
         """
-        logger = self.logger
         wait = self.wait
+        ctx = self._editor_ctx(field_id=field_id, kind="model_answer", stage=log_label)
 
         def block_and_editor_present(_):
             try:
                 field = self.get_field_by_id(field_id)
             except NoSuchElementException:
-                logger.debug("%s: field for id %s not found yet.", log_label, field_id)
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"{log_label}: field for id {field_id} not found yet.",
+                    **ctx,
+                )
                 return False
 
             try:
                 block = field.find_element(By.CSS_SELECTOR, block_selector)
             except NoSuchElementException:
-                logger.debug(
-                    "%s: field %s found but block %r not present yet.",
-                    log_label,
-                    field_id,
-                    block_selector,
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"{log_label}: field {field_id} found but block {block_selector!r} not present yet.",
+                    **ctx,
                 )
                 return False
             except StaleElementReferenceException:
-                logger.debug(
-                    "%s: field element for id %s became stale while looking for block %r.",
-                    log_label,
-                    field_id,
-                    block_selector,
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"{log_label}: field element for id {field_id} became stale while looking for block {block_selector!r}.",
+                    **ctx,
                 )
                 return False
 
@@ -2464,20 +2747,24 @@ class ActivityEditor:
                     By.CSS_SELECTOR,
                     ".fr-element.fr-view[contenteditable='true']",
                 )
-                logger.debug("%s: Froala editor present for field id %s.", log_label, field_id)
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"{log_label}: Froala editor present for field id {field_id}.",
+                    **ctx,
+                )
                 return True
             except NoSuchElementException:
-                logger.debug(
-                    "%s: block present for field id %s but Froala editor not yet initialised.",
-                    log_label,
-                    field_id,
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"{log_label}: block present for field id {field_id} but Froala editor not yet initialised.",
+                    **ctx,
                 )
                 return False
             except StaleElementReferenceException:
-                logger.debug(
-                    "%s: block became stale for field id %s.",
-                    log_label,
-                    field_id,
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"{log_label}: block became stale for field id {field_id}.",
+                    **ctx,
                 )
                 return False
 
@@ -2494,9 +2781,9 @@ class ActivityEditor:
         - Retries once on StaleElementReferenceException.
         - Optionally proves activation by waiting for an 'active' class on the wrapper.
         """
-        logger = self.logger
         driver = self.driver
         session = self.session
+        ctx = self._editor_ctx(field_id=field_id, kind="model_answer", stage=log_label)
 
         # Prefer a selector that doesn't depend on a stale field root.
         label_css = f".field__editable-label.designer__field__model-answer-description--{field_id}"
@@ -2517,11 +2804,18 @@ class ActivityEditor:
             try:
                 _click_label_once()
             except Exception as e2:
-                logger.debug("%s: could not pre-activate editor for field id %s (stale retry failed): %s",
-                            log_label, field_id, e2)
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    f"{log_label}: could not pre-activate editor for field id {field_id} (stale retry failed): {e2}",
+                    **ctx,
+                )
                 return
         except Exception as e:
-            logger.debug("%s: could not pre-activate editor for field id %s: %s", log_label, field_id, e)
+            self.session.emit_diag(
+                Cat.FROALA,
+                f"{log_label}: could not pre-activate editor for field id {field_id}: {e}",
+                **ctx,
+            )
             return
 
         # Best-effort “prove”: wait briefly for active state to appear
@@ -2534,10 +2828,10 @@ class ActivityEditor:
         except Exception:
             pass
 
-        logger.debug(
-            "%s: pre-activated editor by clicking model answer label for field id %s.",
-            log_label,
-            field_id,
+        self.session.emit_diag(
+            Cat.FROALA,
+            f"{log_label}: pre-activated editor by clicking model answer label for field id {field_id}.",
+            **ctx,
         )
 
     def _set_checkbox(
@@ -2558,7 +2852,7 @@ class ActivityEditor:
         - Retries on stale elements because the settings turbo-frame often re-renders.
         """
         driver = self.driver
-        logger = self.logger
+        ctx = self._editor_ctx(field_id=expected_field_id, kind="properties", stage="checkbox")
 
         max_attempts = 3
 
@@ -2583,7 +2877,11 @@ class ActivityEditor:
                     cb = frame.find_element(By.CSS_SELECTOR, selector)
                     return cb
                 except (StaleElementReferenceException, NoSuchElementException):
-                    logger.debug("Checkbox %r not ready / stale when locating; retrying...", selector)
+                    self.session.emit_diag(
+                        Cat.PROPS,
+                        f"Checkbox {selector!r} not ready / stale when locating; retrying...",
+                        **ctx,
+                    )
                     time.sleep(0.2)
             return None
 
@@ -2612,7 +2910,11 @@ class ActivityEditor:
         for attempt in range(1, max_attempts + 1):
             checkbox = _locate_checkbox()
             if checkbox is None:
-                logger.debug("Checkbox %r not found in settings sidebar (attempt %d);", selector, attempt)
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"Checkbox {selector!r} not found in settings sidebar (attempt {attempt});",
+                    **ctx,
+                )
                 
                 _maybe_probe(
                 f"checkbox_missing selector={selector} attempt={attempt}/{max_attempts}",
@@ -2620,26 +2922,36 @@ class ActivityEditor:
                 )
 
                 if attempt == max_attempts:
-                    logger.debug("Giving up on checkbox %r after %d attempts.", selector, max_attempts)
+                    self.session.emit_diag(
+                        Cat.PROPS,
+                        f"Giving up on checkbox {selector!r} after {max_attempts} attempts.",
+                        **ctx,
+                    )
                 continue
 
             # Read current state
             current = _is_checked(checkbox)
-            logger.debug(
-                "Checkbox %r state before attempt %d: %r (desired=%s)",
-                selector,
-                attempt,
-                current,
-                desired,
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Checkbox {selector!r} state before attempt {attempt}: {current!r} (desired={desired})",
+                **ctx,
             )
 
             if current is not None and current == desired:
-                logger.debug("Checkbox %r already in desired state (%s).", selector, desired)
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"Checkbox {selector!r} already in desired state ({desired}).",
+                    **ctx,
+                )
                 return
 
             # Click via JS
             try:
-                logger.debug("Clicking checkbox %r to set to %s (attempt %d).", selector, desired, attempt)
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"Clicking checkbox {selector!r} to set to {desired} (attempt {attempt}).",
+                    **ctx,
+                )
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
                 driver.execute_script("arguments[0].click();", checkbox)
 
@@ -2657,11 +2969,10 @@ class ActivityEditor:
                     pass
 
             except StaleElementReferenceException as e:
-                logger.debug(
-                    "Checkbox %r went stale during click on attempt %d: %s; will retry.",
-                    selector,
-                    attempt,
-                    e,
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"Checkbox {selector!r} went stale during click on attempt {attempt}: {e}; will retry.",
+                    **ctx,
                 )
                 
                 _maybe_probe(
@@ -2671,9 +2982,10 @@ class ActivityEditor:
 
                 # retry with a fresh element in next loop iteration
                 if attempt == max_attempts:
-                    logger.debug(
-                        "Giving up on checkbox %r after stale click on final attempt.",
-                        selector,
+                    self.session.emit_diag(
+                        Cat.PROPS,
+                        f"Giving up on checkbox {selector!r} after stale click on final attempt.",
+                        **ctx,
                     )
                 continue
 
@@ -2686,7 +2998,11 @@ class ActivityEditor:
                     continue
                 final = _is_checked(cb2)
                 if final is not None and final == desired:
-                    logger.debug("Checkbox %r now in desired state (%s).", selector, desired)
+                    self.session.emit_diag(
+                        Cat.PROPS,
+                        f"Checkbox {selector!r} now in desired state ({desired}).",
+                        **ctx,
+                    )
                     return
                 time.sleep(0.1)
 
@@ -2701,18 +3017,16 @@ class ActivityEditor:
                     heavy=False
                 )
 
-            logger.debug(
-                "Checkbox %r did not reach desired state (%s) within confirmation window on attempt %d.",
-                selector,
-                desired,
-                attempt,
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"Checkbox {selector!r} did not reach desired state ({desired}) within confirmation window on attempt {attempt}.",
+                **ctx,
             )
 
-        logger.debug(
-            "Checkbox %r may not have reached desired state (%s) after %d attempts; continuing.",
-            selector,
-            desired,
-            max_attempts,
+        self.session.emit_diag(
+            Cat.PROPS,
+            f"Checkbox {selector!r} may not have reached desired state ({desired}) after {max_attempts} attempts; continuing.",
+            **ctx,
         )
 
 # --- TABLES ---
@@ -2726,7 +3040,7 @@ class ActivityEditor:
         - Between stages, re-find the field element by id to avoid stale anchors.
         - Retry each stage a few times on stale/DOM churn.
         """
-        logger = self.logger
+        ctx = self._editor_ctx(kind="table_config")
 
         # Resolve a stable id for the field so we can re-find the root element
         field_id = None
@@ -2736,7 +3050,12 @@ class ActivityEditor:
             field_id = None
 
         if not field_id:
-            logger.warning("Table config: could not resolve field_id from field_el; proceeding without re-find safeguards.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                "Table config: could not resolve field_id from field_el; proceeding without re-find safeguards.",
+                level="warning",
+                **ctx,
+            )
 
         section_id = ""
         if field_id:
@@ -2810,24 +3129,29 @@ class ActivityEditor:
 
                 if attempt < attempts:
                     time.sleep(sleep_s)
-            logger.warning("Table stage %s: giving up after %d attempts.", stage_name, attempts)
-            self.session.counters.inc(f"editor.table_stage_{stage_name}_gave_up")
-            self.session.emit_diag(
-                Cat.TABLE,
-                f"Table stage '{stage_name}' gave up after {attempts} attempts",
-                **ctx_stage,
-            )
-            
-            # Record a configure skip event for controller
-            self._record_config_skip(
-                kind="configure",
-                reason=f"table stage '{stage_name}' failed after {attempts} attempts",
-                retryable=True,
-                field_id=field_id,
-                field_title=(getattr(config, "title", None) or None),  # careful: config is TableConfig here
-                requested={"stage": stage_name},
-            )
-            
+                self.session.emit_signal(
+                    Cat.TABLE,
+                    f"Table stage {stage_name} giving up after {attempts} attempts.",
+                    level="warning",
+                    **ctx_stage,
+                )
+                self.session.counters.inc(f"editor.table_stage_{stage_name}_gave_up")
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"Table stage '{stage_name}' gave up after {attempts} attempts",
+                    **ctx_stage,
+                )
+                
+                # Record a configure skip event for controller
+                self._record_config_skip(
+                    kind="configure",
+                    reason=f"table stage '{stage_name}' failed after {attempts} attempts",
+                    retryable=True,
+                    field_id=field_id,
+                    field_title=(getattr(config, "title", None) or None),  # careful: config is TableConfig here
+                    requested={"stage": stage_name},
+                )
+                
             return False
 
         # ---- 1) Dimensions ----
@@ -2876,12 +3200,17 @@ class ActivityEditor:
             def _apply_overrides(fresh_field):
                 table_root = self._get_dynamic_table_root(fresh_field)
                 for (r, c), cell_cfg in (config.cell_overrides or {}).items():
-                    self.logger.info(
-                        "Applying cell_override at (r=%s,c=%s) text=%r",
-                        r, c, cell_cfg.text
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Applying cell_override at (r={r},c={c}) text={cell_cfg.text!r}",
+                        **self._editor_ctx(kind="table_override"),
                     )
                     ok = self._apply_table_cell_override(table_root, r, c, cell_cfg)
-                    self.logger.info("cell_override result at (r=%s,c=%s): ok=%s", r, c, ok)
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"cell_override result at (r={r},c={c}): ok={ok}",
+                        **self._editor_ctx(kind="table_override"),
+                    )
 
             _run_stage("cell_overrides", _apply_overrides, attempts=3)
 
@@ -2928,9 +3257,9 @@ class ActivityEditor:
         - Only grows; does not shrink.
         - Uses polling after each add to confirm DOM state change.
         """
-        logger = self.logger
         driver = self.driver
         table_selectors = config.BUILDER_SELECTORS["table"]
+        ctx = self._editor_ctx(kind="table_resize")
 
         def get_shape():
             """
@@ -2950,7 +3279,11 @@ class ActivityEditor:
             """
             Return (add_column_wrapper, add_row_wrapper) freshly located.
             """
-            logger.info("Locating and assigning wrappers")
+            self.session.emit_diag(
+                Cat.TABLE,
+                "Locating and assigning wrappers",
+                **ctx,
+            )
             add_col_wrapper = table_root.find_element(By.CSS_SELECTOR, table_selectors["add_column_button"])
             add_row_wrapper = table_root.find_element(By.CSS_SELECTOR, table_selectors["add_row_button"])
             return add_col_wrapper, add_row_wrapper
@@ -2959,7 +3292,11 @@ class ActivityEditor:
             """
             Use a real pointer-style click on the wrapper.
             """
-            logger.info("Attempting to click wrapper")
+            self.session.emit_diag(
+                Cat.TABLE,
+                "Attempting to click wrapper",
+                **ctx,
+            )
             try:
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
@@ -3070,9 +3407,10 @@ class ActivityEditor:
 
         # --- Initial shape --------------------------------------------------
         table_root, header_cells, body_rows, current_cols, current_rows = get_shape()
-        logger.info(
-            "Dynamic table current shape: rows=%d, cols=%d (requested rows=%d, cols=%d).",
-            current_rows, current_cols, rows, cols
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Dynamic table current shape: rows={current_rows}, cols={current_cols} (requested rows={rows}, cols={cols}).",
+            **ctx,
         )
 
         last_seen_cols = current_cols
@@ -3081,16 +3419,29 @@ class ActivityEditor:
         # --- Grow columns ---------------------------------------------------
         while current_cols < cols:
             try:
-                logger.info("Fetching table shape")
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    "Fetching table shape",
+                    **ctx,
+                )
                 table_root, header_cells, body_rows, current_cols, current_rows = get_shape()
                 last_seen_cols = current_cols
                 add_col_btn, _ = get_add_wrappers(table_root)
             except NoSuchElementException:
-                logger.warning("Aborting column growth: add_column_wrapper not found.")
+                self.session.emit_signal(
+                    Cat.TABLE,
+                    "Aborting column growth: add_column_wrapper not found.",
+                    level="warning",
+                    **ctx,
+                )
                 break
 
             target_cols = current_cols + 1
-            logger.info("Adding column %d (current=%d).", target_cols, current_cols)
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"Adding column {target_cols} (current={current_cols}).",
+                **ctx,
+            )
             # click_wrapper(add_col_wrapper)
             click_add_action(
                 table_root=table_root,
@@ -3114,10 +3465,10 @@ class ActivityEditor:
                 last_seen_cols = new_cols
                 # ✅ log first poll + every 10th poll
                 if poll_i == 1 or poll_i % 10 == 0:
-                    logger.debug(
-                        "[table] Polling columns: current=%d, target=%d",
-                        new_cols,
-                        target_cols,
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"[table] Polling columns: current={new_cols}, target={target_cols}",
+                        **ctx,
                     )
 
                 if new_cols >= target_cols:
@@ -3126,10 +3477,11 @@ class ActivityEditor:
 
                 time.sleep(0.2)
             else:
-                logger.warning(
-                    "Timed out waiting for table columns to grow to %d. Last observed cols=%d.",
-                    target_cols,
-                    last_seen_cols,
+                self.session.emit_signal(
+                    Cat.TABLE,
+                    f"Timed out waiting for table columns to grow to {target_cols}. Last observed cols={last_seen_cols}.",
+                    level="warning",
+                    **ctx,
                 )
                 break
 
@@ -3140,11 +3492,20 @@ class ActivityEditor:
                 last_seen_rows = current_rows
                 _, add_row_btn = get_add_wrappers(table_root)
             except NoSuchElementException:
-                logger.warning("Aborting row growth: add_row_button not found.")
+                self.session.emit_signal(
+                    Cat.TABLE,
+                    "Aborting row growth: add_row_button not found.",
+                    level="warning",
+                    **ctx,
+                )
                 break
 
             target_rows = current_rows + 1
-            logger.info("Adding row %d (current=%d).", target_rows, current_rows)
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"Adding row {target_rows} (current={current_rows}).",
+                **ctx,
+            )
 
             # click_wrapper(add_row_wrapper)
             click_add_action(
@@ -3169,10 +3530,10 @@ class ActivityEditor:
                 last_seen_rows = new_rows
                 # ✅ log first poll + every 10th poll
                 if poll_i == 1 or poll_i % 10 == 0:
-                    logger.debug(
-                        "[table] Polling rows: current=%d, target=%d",
-                        new_rows,
-                        target_rows,
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"[table] Polling rows: current={new_rows}, target={target_rows}",
+                        **ctx,
                     )
 
                 if new_rows >= target_rows:
@@ -3181,10 +3542,11 @@ class ActivityEditor:
 
                 time.sleep(0.2)
             else:
-                logger.warning(
-                    "Timed out waiting for table rows to grow to %d. Last observed rows=%d.",
-                    target_rows,
-                    last_seen_rows,
+                self.session.emit_signal(
+                    Cat.TABLE,
+                    f"Timed out waiting for table rows to grow to {target_rows}. Last observed rows={last_seen_rows}.",
+                    level="warning",
+                    **ctx,
                 )
                 break
 
@@ -3196,7 +3558,11 @@ class ActivityEditor:
             # If final measure fails, fall back to last known counters.
             pass
 
-        logger.info("Dynamic table resized to rows=%d, cols=%d.", current_rows, current_cols)
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Dynamic table resized to rows={current_rows}, cols={current_cols}.",
+            **ctx,
+        )
         return current_rows, current_cols
     
     def _get_table_header_cell(self, table_root, *, body_row_index: int, cell_index: int):
@@ -3228,22 +3594,35 @@ class ActivityEditor:
         - Some CA tables include an extra leading <td> in the header row that is not editable.
         We detect this and apply a DOM offset to keep header mapping stable.
         """
-        logger = self.logger
         driver = self.driver
         selectors = config.BUILDER_SELECTORS["table"]
         max_attempts = 3
+        ctx = self._editor_ctx(kind="table_headers")
 
         header_row_index = 0  # first body row acts as header row
-        logger.info("Setting %d column header(s) on first body row.", len(column_headers))
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Setting {len(column_headers)} column header(s) on first body row.",
+            **ctx,
+        )
 
         # 0) Mark row 0 as heading (best effort, but do it once)
         try:
             self._set_row_type(field_el, row_index=0, type_name="heading")
             self.session.get_wait(timeout=3).until(lambda d: self._row_looks_like_heading(field_el, 0))
         except TimeoutException:
-            logger.debug("Header row did not confirm heading; proceeding anyway.")
+            self.session.emit_diag(
+                Cat.TABLE,
+                "Header row did not confirm heading; proceeding anyway.",
+                **ctx,
+            )
         except Exception as e:
-            logger.warning("Failed to set column heading row to heading: %s", e)
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Failed to set column heading row to heading: {e}",
+                level="warning",
+                **ctx,
+            )
 
         def _get_header_row_tds():
             table_root = self._get_dynamic_table_root(field_el)
@@ -3257,12 +3636,22 @@ class ActivityEditor:
         try:
             self.session.get_wait(timeout=8).until(lambda d: bool(_get_header_row_tds()))
         except TimeoutException:
-            logger.warning("Header row not present after wait; proceeding with best-effort writes.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                "Header row not present after wait; proceeding with best-effort writes.",
+                level="warning",
+                **ctx,
+            )
 
         # 2) Derive DOM offset once: sometimes there is an extra leading TD in the DOM.
         tds = _get_header_row_tds() or []
         if not tds:
-            logger.warning("No header row cells found; cannot set column headers.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                "No header row cells found; cannot set column headers.",
+                level="warning",
+                **ctx,
+            )
             return
 
         # If DOM has one extra cell, assume it's a non-editable leading cell.
@@ -3272,11 +3661,10 @@ class ActivityEditor:
             dom_offset = 1
 
         # If DOM has fewer cells than headers, log and proceed; writes will skip missing cells.
-        logger.info(
-            "Header row cells (td)=%d, headers=%d, dom_offset=%d",
-            len(tds),
-            len(column_headers),
-            dom_offset,
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Header row cells (td)={len(tds)}, headers={len(column_headers)}, dom_offset={dom_offset}",
+            **ctx,
         )
 
         # 3) For each header cell: stabilise UI + re-find td + write (bounded time)
@@ -3297,11 +3685,10 @@ class ActivityEditor:
                     # Re-find the target td every attempt (Turbo-safe)
                     tds = _get_header_row_tds()
                     if not tds or target_td_index >= len(tds):
-                        logger.debug(
-                            "Skipping header %r: no td at index %d (attempt %d).",
-                            header_text,
-                            target_td_index,
-                            attempt,
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            f"Skipping header {header_text!r}: no td at index {target_td_index} (attempt {attempt}).",
+                            **ctx,
                         )
                         break
 
@@ -3326,13 +3713,13 @@ class ActivityEditor:
 
                     ok = self._set_table_cell_text(cell, header_text, retries=3)
                     if ok:
-                        logger.debug(
-                            "Set column header %r at offset=%d (td_index=%d dom_offset=%d) on attempt %d.",
-                            header_text,
-                            offset,
-                            target_td_index,
-                            dom_offset,
-                            attempt,
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            (
+                                f"Set column header {header_text!r} at offset={offset} "
+                                f"(td_index={target_td_index} dom_offset={dom_offset}) on attempt {attempt}."
+                            ),
+                            **ctx,
                         )
                         success = True
                         break
@@ -3341,29 +3728,26 @@ class ActivityEditor:
                     time.sleep(0.15)
 
                 except StaleElementReferenceException:
-                    logger.debug(
-                        "Header write stale for %r at td_index=%d (attempt %d).",
-                        header_text,
-                        target_td_index,
-                        attempt,
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Header write stale for {header_text!r} at td_index={target_td_index} (attempt {attempt}).",
+                        **ctx,
                     )
                     time.sleep(0.15)
                 except Exception as e:
-                    logger.debug(
-                        "Header write error for %r at td_index=%d (attempt %d): %s",
-                        header_text,
-                        target_td_index,
-                        attempt,
-                        e,
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Header write error for {header_text!r} at td_index={target_td_index} (attempt {attempt}): {e}",
+                        **ctx,
                     )
                     time.sleep(0.15)
 
             if not success:
-                logger.warning(
-                    "Could not set column header %r (td_index=%d dom_offset=%d).",
-                    header_text,
-                    target_td_index,
-                    dom_offset,
+                self.session.emit_signal(
+                    Cat.TABLE,
+                    f"Could not set column header {header_text!r} (td_index={target_td_index} dom_offset={dom_offset}).",
+                    level="warning",
+                    **ctx,
                 )
                 self._record_config_skip(
                     kind="configure",
@@ -3391,15 +3775,24 @@ class ActivityEditor:
         - cell index 1 is the first data column (row label column)
         """
         selectors = config.BUILDER_SELECTORS["table"]
-        logger = self.logger
+        ctx = self._editor_ctx(kind="table_row_labels")
 
         # Best effort: make row-label column "heading" type
         try:
             self._set_column_type(field_el, col_index=0, type_name="heading")
         except Exception as e:
-            logger.warning("Failed to set row-label column to heading: %s", e)
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Failed to set row-label column to heading: {e}",
+                level="warning",
+                **ctx,
+            )
 
-        logger.info("Setting %d row labels via dynamic table cells.", len(row_labels))
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Setting {len(row_labels)} row labels via dynamic table cells.",
+            **ctx,
+        )
 
         for offset, label in enumerate(row_labels):
             label_text = label or ""
@@ -3413,15 +3806,19 @@ class ActivityEditor:
                     table_root = self._get_dynamic_table_root(field_el)
                     body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
                     if not body_rows:
-                        logger.warning("No body rows in table; cannot set row labels.")
+                        self.session.emit_signal(
+                            Cat.TABLE,
+                            "No body rows in table; cannot set row labels.",
+                            level="warning",
+                            **ctx,
+                        )
                         return
 
                     if target_row_index >= len(body_rows):
-                        logger.debug(
-                            "Skipping row label %r: no body row at index %d (rows=%d).",
-                            label_text,
-                            target_row_index,
-                            len(body_rows),
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            f"Skipping row label {label_text!r}: no body row at index {target_row_index} (rows={len(body_rows)}).",
+                            **ctx,
                         )
                         return  # nothing further to do
 
@@ -3430,20 +3827,21 @@ class ActivityEditor:
 
                     # Need at least control + first data column
                     if len(cells) < 2:
-                        logger.debug(
-                            "Body row %d has fewer than 2 cells; skipping label %r.",
-                            target_row_index,
-                            label_text,
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            f"Body row {target_row_index} has fewer than 2 cells; skipping label {label_text!r}.",
+                            **ctx,
                         )
                         break
 
                     data_cell = cells[1]  # first data column
                     ok = self._set_table_cell_text(data_cell, label, retries=3)
                     if not ok:
-                        logger.warning(
-                            "Could not set row label %r at cell_index=%d (no editable control).",
-                            label,
-                            target_row_index,
+                        self.session.emit_signal(
+                            Cat.TABLE,
+                            f"Could not set row label {label!r} at cell_index={target_row_index} (no editable control).",
+                            level="warning",
+                            **ctx,
                         )
                         if attempt < max_attempts:
                             time.sleep(0.15)
@@ -3465,43 +3863,45 @@ class ActivityEditor:
                         )
                         break
 
-                    logger.debug(
-                        "Set row label %r at body_row=%d on attempt %d/%d.",
-                        label_text,
-                        target_row_index,
-                        attempt,
-                        max_attempts,
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"Set row label {label_text!r} at body_row={target_row_index} on attempt {attempt}/{max_attempts}.",
+                        **ctx,
                     )
                     break  # success for this label
 
                 except StaleElementReferenceException as e:
-                    logger.debug(
-                        "Stale element while setting row label %r (body_row=%d) attempt %d/%d: %s",
-                        label_text,
-                        target_row_index,
-                        attempt,
-                        max_attempts,
-                        e,
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        (
+                            f"Stale element while setting row label {label_text!r} (body_row={target_row_index}) "
+                            f"attempt {attempt}/{max_attempts}: {e}"
+                        ),
+                        **ctx,
                     )
                     if attempt < max_attempts:
                         time.sleep(0.15)
                         continue
-                    logger.warning(
-                        "Giving up setting row label %r (body_row=%d) after %d attempts due to repeated staleness.",
-                        label_text,
-                        target_row_index,
-                        max_attempts,
+                    self.session.emit_signal(
+                        Cat.TABLE,
+                        (
+                            f"Giving up setting row label {label_text!r} (body_row={target_row_index}) "
+                            f"after {max_attempts} attempts due to repeated staleness."
+                        ),
+                        level="warning",
+                        **ctx,
                     )
                     break
 
                 except Exception as e:
-                    logger.warning(
-                        "Error setting row label %r (body_row=%d) attempt %d/%d: %s",
-                        label_text,
-                        target_row_index,
-                        attempt,
-                        max_attempts,
-                        e,
+                    self.session.emit_signal(
+                        Cat.TABLE,
+                        (
+                            f"Error setting row label {label_text!r} (body_row={target_row_index}) "
+                            f"attempt {attempt}/{max_attempts}: {e}"
+                        ),
+                        level="warning",
+                        **ctx,
                     )
                     if attempt < max_attempts:
                         time.sleep(0.15)
@@ -3522,8 +3922,8 @@ class ActivityEditor:
             We treat it as retryable and continue, expecting the caller to re-find the cell
             (your header writer already re-finds td per attempt).
         """
-        logger = self.session.logger
         driver = self.session.driver
+        ctx = self._editor_ctx(kind="table_cell")
 
         def _dismiss_overlays_best_effort():
             try:
@@ -3548,7 +3948,11 @@ class ActivityEditor:
                 )
                 return True
             except Exception as e:
-                logger.debug("[table] JS value-set failed: %s", e)
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"[table] JS value-set failed: {e}",
+                    **ctx,
+                )
                 return False
 
         def _js_set_textcontent(el) -> bool:
@@ -3568,7 +3972,11 @@ class ActivityEditor:
                 )
                 return True
             except Exception as e:
-                logger.debug("[table] JS textContent-set failed: %s", e)
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"[table] JS textContent-set failed: {e}",
+                    **ctx,
+                )
                 return False
 
         for attempt in range(1, retries + 1):
@@ -3585,7 +3993,11 @@ class ActivityEditor:
                         break
 
                 if control is not None and _js_set_value(control):
-                    logger.debug("[table] cell_title set via %s (attempt %d/%d).", control.tag_name, attempt, retries)
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"[table] cell_title set via {control.tag_name} (attempt {attempt}/{retries}).",
+                        **ctx,
+                    )
                     return True
 
                 # 2) Fallback: contenteditable within cell
@@ -3597,7 +4009,11 @@ class ActivityEditor:
                         pass
 
                     if _js_set_textcontent(eds[0]):
-                        logger.debug("[table] cell set via contenteditable (attempt %d/%d).", attempt, retries)
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            f"[table] cell set via contenteditable (attempt {attempt}/{retries}).",
+                            **ctx,
+                        )
                         return True
 
                 # 3) Fallback: label-like elements (for tricky headers, checkbox cols, etc.)
@@ -3617,7 +4033,11 @@ class ActivityEditor:
                         pass
 
                     if _js_set_textcontent(target):
-                        logger.debug("[table] cell set via '%s' (attempt %d/%d).", sel, attempt, retries)
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            f"[table] cell set via '{sel}' (attempt {attempt}/{retries}).",
+                            **ctx,
+                        )
                         return True
 
                 # 4) Checkbox column header fallback (column-level label)
@@ -3631,7 +4051,11 @@ class ActivityEditor:
                         target = labels[-1]
                         driver.execute_script("arguments[0].click();", target)
                         if _js_set_textcontent(target):
-                            logger.debug("[table] cell set via column-level editable-label.")
+                            self.session.emit_diag(
+                                Cat.TABLE,
+                                "[table] cell set via column-level editable-label.",
+                                **ctx,
+                            )
                             return True
                 except StaleElementReferenceException:
                     continue
@@ -3639,23 +4063,40 @@ class ActivityEditor:
                     pass
 
             except StaleElementReferenceException:
-                logger.debug("[table] Cell went stale during attempt %d/%d; will retry.", attempt, retries)
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"[table] Cell went stale during attempt {attempt}/{retries}; will retry.",
+                    **ctx,
+                )
                 # Give Turbo a beat to settle; caller should be re-finding cells between attempts anyway.
                 if attempt < retries:
                     time.sleep(0.10)
                 continue
             except Exception as e:
                 # Any other transient issue: retry, but keep it quiet.
-                logger.debug("[table] Unexpected error during attempt %d/%d: %s", attempt, retries, e)
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"[table] Unexpected error during attempt {attempt}/{retries}: {e}",
+                    **ctx,
+                )
                 if attempt < retries:
                     time.sleep(0.10)
                 continue
 
             if attempt < retries:
-                logger.debug("[table] No editable control matched; retrying (%d/%d).", attempt, retries)
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"[table] No editable control matched; retrying ({attempt}/{retries}).",
+                    **ctx,
+                )
                 time.sleep(0.10)
 
-        logger.warning("[table] Could not set cell text %r after %d attempt(s).", text, retries)
+        self.session.emit_signal(
+            Cat.TABLE,
+            f"[table] Could not set cell text {text!r} after {retries} attempt(s).",
+            level="warning",
+            **ctx,
+        )
         return False
     
     def _set_table_cell_type(self, cell, cell_type: str) -> None:
@@ -3667,13 +4108,17 @@ class ActivityEditor:
         - Does NOT block the rest of the table config if it fails.
         - Uses JS clicks to avoid 'element not interactable' as much as possible.
         """
-        logger = self.logger
         driver = self.driver
         table_sel = config.BUILDER_SELECTORS["table"]
+        ctx = self._editor_ctx(kind="table_cell_type")
 
         # We currently only implement 'heading'
         if cell_type != "heading":
-            logger.debug(f"_set_table_cell_type: unsupported type '{cell_type}', skipping.")
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"_set_table_cell_type: unsupported type '{cell_type}', skipping.",
+                **ctx,
+            )
             return
 
         heading_class = table_sel.get(
@@ -3694,14 +4139,22 @@ class ActivityEditor:
 
         wrapper = get_wrapper()
         if not wrapper:
-            logger.debug("No editable-label wrapper in cell; cannot set cell type.")
+            self.session.emit_diag(
+                Cat.TABLE,
+                "No editable-label wrapper in cell; cannot set cell type.",
+                **ctx,
+            )
             return
 
         # Already heading? Nothing to do.
         try:
             current_classes = wrapper.get_attribute("class") or ""
             if heading_class in current_classes:
-                logger.debug("Cell already has heading class; skipping type change.")
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    "Cell already has heading class; skipping type change.",
+                    **ctx,
+                )
                 return
         except StaleElementReferenceException:
             pass
@@ -3711,7 +4164,11 @@ class ActivityEditor:
             dropdown = cell.find_element(By.CSS_SELECTOR, ".dropdown")
             toggle = dropdown.find_element(By.CSS_SELECTOR, "button.dropdown-toggle")
         except NoSuchElementException:
-            logger.debug("No dropdown toggle found in cell; cannot set cell type.")
+            self.session.emit_diag(
+                Cat.TABLE,
+                "No dropdown toggle found in cell; cannot set cell type.",
+                **ctx,
+            )
             return
 
         # 2) Open the dropdown (real click to trigger Stimulus)
@@ -3727,7 +4184,12 @@ class ActivityEditor:
             actions = ActionChains(driver)
             actions.move_to_element(toggle).pause(0.1).click().perform()
         except Exception as e:
-            logger.warning(f"Error clicking cell type dropdown toggle: {e}")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Error clicking cell type dropdown toggle: {e}",
+                level="warning",
+                **ctx,
+            )
             return
 
         # 3) Locate the dropdown menu for THIS cell, then its Heading option
@@ -3738,14 +4200,24 @@ class ActivityEditor:
                 "button[data-url*='type=heading']",
             )
         except NoSuchElementException:
-            logger.warning("Heading option not found in this cell's dropdown menu.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                "Heading option not found in this cell's dropdown menu.",
+                level="warning",
+                **ctx,
+            )
             return
 
         # 4) Click Heading via JS (bypassing size/visibility quirks)
         try:
             driver.execute_script("arguments[0].click();", heading_btn)
         except Exception as e:
-            logger.warning(f"JS click on 'Heading' menu item failed: {e}")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"JS click on 'Heading' menu item failed: {e}",
+                level="warning",
+                **ctx,
+            )
             return
         
         # 5) Optionally: light-touch check to see if the class appears, but don’t wait long
@@ -3754,7 +4226,11 @@ class ActivityEditor:
             if wrapper:
                 classes = wrapper.get_attribute("class") or ""
                 if heading_class in classes:
-                    logger.debug("Cell heading type applied (wrapper has heading class).")
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        "Cell heading type applied (wrapper has heading class).",
+                        **ctx,
+                    )
         except StaleElementReferenceException:
             # Turbo may have re-rendered; it's fine, we already clicked
             pass
@@ -3782,8 +4258,7 @@ class ActivityEditor:
         """
         if not column_types:
             return
-
-        logger = self.session.logger
+        ctx = self._editor_ctx(kind="table_column_types")
 
         for idx, col_type in enumerate(column_types):
             if not col_type:
@@ -3797,12 +4272,17 @@ class ActivityEditor:
                 try:
                     self._set_column_type(field_el, col_index=idx, type_name=col_type)
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to set column {idx} type to '{col_type}': {e}"
+                    self.session.emit_signal(
+                        Cat.TABLE,
+                        f"Failed to set column {idx} type to '{col_type}': {e}",
+                        level="warning",
+                        **ctx,
                     )
             else:
-                logger.debug(
-                    f"Column {idx} type '{col_type}' not implemented; skipping."
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"Column {idx} type '{col_type}' not implemented; skipping.",
+                    **ctx,
                 )
 
     def _set_column_type(self, field_el, col_index: int, type_name: str) -> None:
@@ -3815,17 +4295,25 @@ class ActivityEditor:
 
         type_name: "heading", "text", "text_field", "date_field", "checkbox"
         """
-
-        logger = self.logger
         selectors = config.BUILDER_SELECTORS["table"]
+        ctx = self._editor_ctx(kind="table_column_type")
 
-        logger.info(f"Applying column type '{type_name}' to data column {col_index} via bulk update.")
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Applying column type '{type_name}' to data column {col_index} via bulk update.",
+            **ctx,
+        )
 
         # 1. Locate table + header row (fresh each time)
         try:
             table_root = self._get_dynamic_table_root(field_el)
         except Exception as e:
-            logger.warning(f"Cannot locate table root for column update: {e}")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Cannot locate table root for column update: {e}",
+                level="warning",
+                **ctx,
+            )
             return
 
         # Use the actual header cells in <thead>, safer for column actions
@@ -3833,13 +4321,23 @@ class ActivityEditor:
             By.CSS_SELECTOR, selectors["header_cells"]
         )
         if not header_cells:
-            logger.warning("No header cells found; cannot set column type.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                "No header cells found; cannot set column type.",
+                level="warning",
+                **ctx,
+            )
             return
 
         # Skip control column at index 0
         th_index = col_index + 1  # column 0 = first data column
         if th_index >= len(header_cells):
-            logger.warning(f"No header cell for data column {col_index}.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"No header cell for data column {col_index}.",
+                level="warning",
+                **ctx,
+            )
             return
 
         header_cell = header_cells[th_index]
@@ -3855,7 +4353,12 @@ class ActivityEditor:
                 column_actions_sel
             )
         except NoSuchElementException as e:
-            logger.warning(f"No column actions container found for data column {col_index}.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"No column actions container found for data column {col_index}.",
+                level="warning",
+                **ctx,
+            )
             return
 
         # 3. Inside the column actions, find the bulk_update button for the requested type
@@ -3867,19 +4370,29 @@ class ActivityEditor:
                 By.CSS_SELECTOR, f"button[data-url*='type={type_name}']"
             )
         except NoSuchElementException:
-            logger.warning(
-                f"No bulk-update button for type '{type_name}' found in column {col_index} actions."
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"No bulk-update button for type '{type_name}' found in column {col_index} actions.",
+                level="warning",
+                **ctx,
             )
             return
         except StaleElementReferenceException:
-            logger.warning(
-                f"Column actions became stale while looking for type '{type_name}' in col {col_index}."
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Column actions became stale while looking for type '{type_name}' in col {col_index}.",
+                level="warning",
+                **ctx,
             )
             return
 
         # 5. Dispatch synthetic click on the turbo button
         self._dispatch_turbo_click(type_btn)
-        logger.info(f"Column {col_index}: requested type '{type_name}' via bulk-update button.")
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Column {col_index}: requested type '{type_name}' via bulk-update button.",
+            **ctx,
+        )
 
     def _set_row_type(self, field_el, row_index: int, type_name: str) -> None:
         """
@@ -3888,19 +4401,33 @@ class ActivityEditor:
         type_name: 'heading', 'text', 'text_field', 'date_field', 'checkbox'
         """
         selectors = config.BUILDER_SELECTORS["table"]
-        logger = self.logger
+        ctx = self._editor_ctx(kind="table_row_type")
     
-        logger.info(f"Applying row type '{type_name}' to row {row_index} via bulk update.")
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Applying row type '{type_name}' to row {row_index} via bulk update.",
+            **ctx,
+        )
 
         try:
             table_root = self._get_dynamic_table_root(field_el)
             body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
         except Exception as e:
-            logger.warning(f"Failed to locate table/rows for row type '{type_name}': {e}")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Failed to locate table/rows for row type '{type_name}': {e}",
+                level="warning",
+                **ctx,
+            )
             return
         
         if not body_rows or row_index >= len(body_rows):
-            logger.warning(f"No body row at index {row_index}; cannot set row type.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"No body row at index {row_index}; cannot set row type.",
+                level="warning",
+                **ctx,
+            )
             return
 
         # row = body_rows[row_index]
@@ -3918,7 +4445,12 @@ class ActivityEditor:
             # row_index=0 is fine (and you can ignore the index).
             actions_container = row_actions_groups[min(row_index, len(row_actions_groups) - 1)]
         except NoSuchElementException:
-            logger.warning(f"No row actions container found for row {row_index}.")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"No row actions container found for row {row_index}.",
+                level="warning",
+                **ctx,
+            )
             return
         
         try:
@@ -3930,26 +4462,47 @@ class ActivityEditor:
                 By.CSS_SELECTOR, f"button[data-url*='type={type_name}']"
             )
         except NoSuchElementException as e:
-            logger.warning(f"Cannot set row type for row {row_index}: {e}")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Cannot set row type for row {row_index}: {e}",
+                level="warning",
+                **ctx,
+            )
             return
         except StaleElementReferenceException:
-            logger.warning(
-                f"Row actions became stale while looking for type '{type_name}' in row {row_index}."
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Row actions became stale while looking for type '{type_name}' in row {row_index}.",
+                level="warning",
+                **ctx,
             )
             return
         except Exception as e:
-            logger.warning(f"Error setting row type '{type_name}' for row {row_index}: {e}")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Error setting row type '{type_name}' for row {row_index}: {e}",
+                level="warning",
+                **ctx,
+            )
             return
 
         # Dispatch synthetic click (no native click() → no size/location complaints)
         self._dispatch_turbo_click(type_btn)
-        logger.info(f"Row {row_index}: requested type '{type_name}' via bulk-update button.")        
+        self.session.emit_diag(
+            Cat.TABLE,
+            f"Row {row_index}: requested type '{type_name}' via bulk-update button.",
+            **ctx,
+        )        
         # Post-click settle: wait for the row to actually become heading (best-effort)
         if type_name == "heading":
             try:
                 self.session.get_wait(timeout=3).until(lambda d: self._row_looks_like_heading(field_el, row_index))
             except TimeoutException:
-                logger.debug("Row %d did not confirm as heading within settle window.", row_index)
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    f"Row {row_index} did not confirm as heading within settle window.",
+                    **ctx,
+                )
 
     def _apply_table_cell_override(
         self,
@@ -4058,8 +4611,8 @@ class ActivityEditor:
         This avoids Chrome's 'element not interactable' restrictions on
         hidden elements, while still triggering CA's Stimulus controllers.
         """
-        logger = self.logger
         driver = self.driver
+        ctx = self._editor_ctx(kind="table_click")
 
         if button_el is None:
             return
@@ -4078,9 +4631,18 @@ class ActivityEditor:
                 """,
                 button_el,
             )
-            logger.debug("Dispatched synthetic click on turbo button.")
+            self.session.emit_diag(
+                Cat.TABLE,
+                "Dispatched synthetic click on turbo button.",
+                **ctx,
+            )
         except Exception as e:
-            logger.warning(f"Failed to dispatch turbo click: {e}")
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Failed to dispatch turbo click: {e}",
+                level="warning",
+                **ctx,
+            )
 
     def _row_looks_like_heading(self, field_el, row_index: int) -> bool:
         selectors = config.BUILDER_SELECTORS["table"]

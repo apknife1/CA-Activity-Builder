@@ -1,2 +1,3 @@
-2026-02-06 12:03:37,928 [INFO] ca_bldr: Logging into Cloud Assess...
-2026-02-06 12:03:39,437 [INFO] ca_bldr: Logged in successfully.
+2026-02-09 18:11:00,160 [INFO] ca_bldr: [Cat.STARTUP] Session initialized :: kind=startup log_mode=live wait_time=5
+2026-02-09 18:11:01,408 [INFO] ca_bldr: [Cat.NAV] Logging into Cloud Assess... :: kind=login
+2026-02-09 18:11:02,361 [INFO] ca_bldr: [Cat.NAV] Logged in successfully. :: kind=login

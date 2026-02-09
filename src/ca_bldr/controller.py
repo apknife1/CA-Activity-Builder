@@ -95,7 +95,6 @@ class ActivityBuildController:
         
         from here all other processes are run
         """
-        logger = self.logger
         session = self.session
         reader = self.reader
 
@@ -113,7 +112,7 @@ class ActivityBuildController:
         )
 
         # 2. Get path to activity template yaml
-        with phase_timer(logger, "Spec selection + parse"):
+        with phase_timer(session, "Spec selection + parse"):
             spec_paths = self._get_spec_paths()
             self.session.emit_signal(
                 Cat.STARTUP,
@@ -144,6 +143,7 @@ class ActivityBuildController:
                     Cat.STARTUP,
                     "No activities found in spec",
                     path=str(spec_path),
+                    level="warning",
                     **self._ctx(step="spec_read_empty"),
                 )
                 continue
@@ -153,6 +153,7 @@ class ActivityBuildController:
             self.session.emit_signal(
                 Cat.STARTUP,
                 "No activities found in selected spec(s)",
+                level="error",
                 **self._ctx(step="spec_read_none"),
             )
             return
@@ -172,7 +173,7 @@ class ActivityBuildController:
 
         # 4. Iterate through Activities
         for act in activities:
-            with phase_timer(logger, f"Activity {act.activity_code} full build"):
+            with phase_timer(session, f"Activity {act.activity_code} full build"):
 
                 self.session.emit_signal(
                     Cat.NAV,
@@ -185,7 +186,7 @@ class ActivityBuildController:
                 start_counters = self.session.counters.snapshot()
 
                 try:
-                    with phase_timer(logger, f"{act.activity_code}: locate existing template"):
+                    with phase_timer(session, f"{act.activity_code}: locate existing template"):
                         lookup_hops = 0
                         match = session.find_activity_template_by_title(act.activity_title or "", status="active")
                         lookup_hops += 1
@@ -227,7 +228,7 @@ class ActivityBuildController:
                     else:
                         # No match found → create new
                         # 5.1 Create the new activity template via offcanvas
-                        with phase_timer(logger, f"{act.activity_code}: create template"):
+                        with phase_timer(session, f"{act.activity_code}: create template"):
                             created = self._create_activity_from_instruction(act)
                             if not created:
                                 status = ActivityStatus.FAILED
@@ -235,7 +236,7 @@ class ActivityBuildController:
                                 return
                         
                         # 5.2 open the builder page
-                        with phase_timer(logger, f"{act.activity_code}: open Activity Builder"):
+                        with phase_timer(session, f"{act.activity_code}: open Activity Builder"):
                             if not self._open_activity_builder_for_new_activity(act=act):
                                 status = ActivityStatus.FAILED
                                 reason = "open_activity_builder"
@@ -283,12 +284,20 @@ class ActivityBuildController:
                         # don't let summary emission break the run shutdown / control flow
                         pass
 
-        input(
-            "\nCheck the Activity Builder page:\n"
-            "- Does the activity have all of the designated sections?\n"
-            "- Does it have all of the appropriate fields in each section?\n"
-            "When you've checked, press Enter here to close the browser..."
-        )
+        try:
+            input(
+                "\nCheck the Activity Builder page:\n"
+                "- Does the activity have all of the designated sections?\n"
+                "- Does it have all of the appropriate fields in each section?\n"
+                "When you've checked, press Enter here to close the browser..."
+            )
+        except EOFError:
+            self.session.emit_signal(
+                Cat.NAV,
+                "End-of-run prompt unavailable (EOF); continuing shutdown",
+                level="warning",
+                **self._ctx(step="end_prompt_eof"),
+            )
 
     def _get_spec_path(self) -> str:
         """
@@ -314,7 +323,16 @@ class ActivityBuildController:
 
         print("\nEnter a number, or paste a path. Press Enter for 1.")
         while True:
-            choice = input("> ").strip()
+            try:
+                choice = input("> ").strip()
+            except EOFError:
+                self.session.emit_signal(
+                    Cat.STARTUP,
+                    "Spec selection input unavailable (EOF); aborting selection",
+                    level="error",
+                    **self._ctx(step="spec_select_eof"),
+                )
+                raise
 
             if choice == "":
                 return str(files[0].as_posix())
@@ -401,6 +419,7 @@ class ActivityBuildController:
                 Cat.NAV,
                 "Create Activity button not found on templates page",
                 stage="create_button",
+                level="error",
                 **ctx,
             )
             return False
@@ -418,6 +437,7 @@ class ActivityBuildController:
                 Cat.NAV,
                 "Create Activity offcanvas form did not appear",
                 stage="offcanvas",
+                level="error",
                 **ctx,
             )
             return False
@@ -431,6 +451,7 @@ class ActivityBuildController:
                 "Activity title input not found",
                 stage="title_input",
                 exception=str(e),
+                level="error",
                 **ctx,
             )
             return False
@@ -452,6 +473,7 @@ class ActivityBuildController:
                 "Could not enforce 'Design from scratch' option",
                 stage="scratch_option",
                 exception=str(e),
+                level="warning",
                 **ctx,
             )
 
@@ -469,6 +491,7 @@ class ActivityBuildController:
                 "Activity code input not found",
                 stage="code_input",
                 exception=str(e),
+                level="error",
                 **ctx,
             )
             return False
@@ -488,6 +511,7 @@ class ActivityBuildController:
                 "Create button not found in offcanvas",
                 stage="create_submit",
                 exception=str(e),
+                level="error",
                 **ctx,
             )
             return False
@@ -555,6 +579,7 @@ class ActivityBuildController:
                 Cat.NAV,
                 "Hidden category select not found",
                 exception=str(e),
+                level="warning",
                 **ctx,
             )
             return
@@ -567,6 +592,7 @@ class ActivityBuildController:
                 Cat.NAV,
                 "Could not enumerate category options",
                 exception=str(e),
+                level="warning",
                 **ctx,
             )
             return
@@ -603,6 +629,7 @@ class ActivityBuildController:
             self.session.emit_signal(
                 Cat.NAV,
                 "No category option found for label",
+                level="warning",
                 **ctx,
             )
             return
@@ -631,6 +658,7 @@ class ActivityBuildController:
                 "Error applying category via JS",
                 target_value=target_value,
                 exception=str(e),
+                level="warning",
                 **ctx,
             )
 
@@ -679,6 +707,7 @@ class ActivityBuildController:
                 Cat.NAV,
                 "Timed out waiting for activity template revision page",
                 url=driver.current_url,
+                level="error",
                 **ctx,
             )
             return False
@@ -694,6 +723,7 @@ class ActivityBuildController:
             self.session.emit_signal(
                 Cat.NAV,
                 "Clickable 'Edit content' button not found on template revision page",
+                level="error",
                 **ctx,
             )
             return False
@@ -725,6 +755,7 @@ class ActivityBuildController:
                 Cat.NAV,
                 "Timed out waiting for Activity Builder page",
                 url=driver.current_url,
+                level="error",
                 **ctx,
             )
             return False
@@ -737,12 +768,13 @@ class ActivityBuildController:
         ) -> bool:
         builder = self.builder
         editor = self.editor
-        logger = self.logger
+        session = self.session
 
         if not act:
             self.session.emit_signal(
                 Cat.NAV,
                 "No activity passed from controller",
+                level="error",
                 **self._ctx(step="build_init"),
             )
             return False
@@ -828,6 +860,7 @@ class ActivityBuildController:
                 target_add=faults.plan.add_fail_fi_index,
                 target_properties=faults.plan.properties_fail_fi_index,
                 target_configure=faults.plan.configure_fail_fi_index,
+                level="warning",
                 **self._ctx(act=act, step="fault_inject_plan"),
             )
 
@@ -918,7 +951,7 @@ class ActivityBuildController:
             fid = handle.field_id if handle else None
             return self._ctx(act=act, step=step, sec=sec, fid=fid, fi=fi_index, extra=ctx_extra)
 
-        with phase_timer(logger, f"{act.activity_code}: build from instruction"):
+        with phase_timer(session, f"{act.activity_code}: build from instruction"):
         # For now we expect exactly one written_assessment per WA spec, but looping keeps it flexible
             self.session.emit_signal(
                 Cat.NAV,
@@ -931,7 +964,7 @@ class ActivityBuildController:
             act_dir = run_dir / "activities"
             act_stem = f"{act.activity_code}_{act.activity_type}"
             instruction_path = act_dir / f"{act_stem}_instruction.json"
-            dump_activity_instruction_json(act, instruction_path, logger)
+            dump_activity_instruction_json(act, instruction_path, session=session)
 
             # debug stop point if necessary
             # result = input("Do you want to continue the process here or end? Y/N")
@@ -986,6 +1019,7 @@ class ActivityBuildController:
                                 Cat.UISTATE,
                                 "AUDIT FAILED before new section",
                                 exception=str(e),
+                                level="warning",
                                 **self._ctx(act=act, step="audit_section_pre_fail", sec=last_section_id, fi=fi_index),
                             )
 
@@ -1005,12 +1039,13 @@ class ActivityBuildController:
                 )
 
                 # ---- 1. Create field ----
-                with phase_timer(logger, f"{act.activity_code}: add field {field_key}"):
+                with phase_timer(session, f"{act.activity_code}: add field {field_key}"):
                     if faults.should_fail_add(fi_index):
                         self.session.emit_signal(
                             Cat.DROP,
                             "FAULT_INJECT: forcing add failure",
                             field_key=field_key,
+                            level="warning",
                             **_ctx_for(step="fault_inject_add", fi_index=fi_index, sec_title=sec_title, sec_index=sec_index),
                         )
                         handle = None
@@ -1032,6 +1067,7 @@ class ActivityBuildController:
                                 Cat.DROP,
                                 "Field failed to add; retrying once",
                                 field_key=field_key,
+                                level="warning",
                                 **_ctx_for(step="add_retry_once", fi_index=fi_index, sec_title=sec_title, sec_index=sec_index),
                             )
                             handle = builder.add_field_from_spec(
@@ -1049,6 +1085,7 @@ class ActivityBuildController:
                             "Failed to add field; skipping configuration",
                             field_key=field_key,
                             field_title=title,
+                            level="error",
                             **_ctx_for(step="add_failed", fi_index=fi_index, sec_title=sec_title, sec_index=sec_index),
                         )
 
@@ -1077,6 +1114,7 @@ class ActivityBuildController:
                                 Cat.DROP,
                                 "Critical field failed to add; aborting build",
                                 field_key=field_key,
+                                level="error",
                                 **_ctx_for(step="add_failed_critical", fi_index=fi_index, sec_title=sec_title, sec_index=sec_index),
                             )
                             aborted = True
@@ -1086,6 +1124,7 @@ class ActivityBuildController:
                                 Cat.DROP,
                                 "Critical field failed to add due to FAULT_INJECT; continuing",
                                 field_key=field_key,
+                                level="warning",
                                 **_ctx_for(step="add_failed_critical_injected", fi_index=fi_index, sec_title=sec_title, sec_index=sec_index),
                             )
 
@@ -1095,6 +1134,7 @@ class ActivityBuildController:
                                 "Consecutive field-add failures; aborting build early",
                                 consecutive_failures=consecutive_failures,
                                 field_key=field_key,
+                                level="error",
                                 **_ctx_for(step="add_failed_threshold", fi_index=fi_index, sec_title=sec_title, sec_index=sec_index),
                             )
                             aborted = True
@@ -1110,7 +1150,7 @@ class ActivityBuildController:
                     consecutive_failures = 0
 
                     # ---- 2. Configure field ----
-                with phase_timer(logger, f"{act.activity_code}: configure field {field_key}"):
+                with phase_timer(session, f"{act.activity_code}: configure field {field_key}"):
                     # Build config from spec + defaults and configure the new field
                     cfg = build_field_config(fi)
 
@@ -1136,6 +1176,7 @@ class ActivityBuildController:
                                 Cat.PROPS,
                                 "FAULT_INJECT: forcing properties failure via skip event",
                                 requested=req,
+                                level="warning",
                                 **_ctx_for(step="fault_inject_properties", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
                             editor.record_skip({
@@ -1158,6 +1199,7 @@ class ActivityBuildController:
                             "Table strict resize failed; attempting recovery",
                             field_title=raw.get("title"),
                             exception=str(e),
+                            level="warning",
                             **_ctx_for(step="table_resize_recover", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                         )
 
@@ -1173,6 +1215,7 @@ class ActivityBuildController:
                                 Cat.TABLE,
                                 "Recovery configure after refresh failed",
                                 exception=str(e2),
+                                level="warning",
                                 **_ctx_for(step="table_recover_refresh_fail", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
 
@@ -1190,6 +1233,7 @@ class ActivityBuildController:
                                 Cat.TABLE,
                                 "Table recovery failed; skipping field",
                                 exception=str(e3),
+                                level="error",
                                 **_ctx_for(step="table_recover_failed", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
                             # fall through to existing failure append/skip logic
@@ -1199,6 +1243,7 @@ class ActivityBuildController:
                             Cat.PROPS,
                             "Properties sidebar timeout; attempting refresh recovery",
                             exception=str(e),
+                            level="warning",
                             **_ctx_for(step="properties_timeout", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                         )
                         try:
@@ -1215,6 +1260,7 @@ class ActivityBuildController:
                                 field_key=field_key,
                                 field_title=title,
                                 exception=str(e2),
+                                level="error",
                                 **_ctx_for(step="properties_recover_failed", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
                             reason = f"properties sidebar recovery failed: {e2}"
@@ -1242,6 +1288,7 @@ class ActivityBuildController:
                                     Cat.PROPS,
                                     "Critical field failed to configure properties; aborting build",
                                     field_key=field_key,
+                                    level="error",
                                     **_ctx_for(step="properties_failed_critical", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                                 )
                                 aborted = True
@@ -1251,6 +1298,7 @@ class ActivityBuildController:
                                     Cat.PROPS,
                                     "Critical field failed to configure properties due to FAULT_INJECT; continuing",
                                     field_key=field_key,
+                                    level="warning",
                                     **_ctx_for(step="properties_failed_critical_injected", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                                 )
                             if consecutive_failures >= FAILURE_THRESHOLD:
@@ -1259,6 +1307,7 @@ class ActivityBuildController:
                                     "Consecutive properties failures; aborting build early",
                                     consecutive_failures=consecutive_failures,
                                     field_key=field_key,
+                                    level="error",
                                     **_ctx_for(step="properties_failed_threshold", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                                 )
                                 aborted = True
@@ -1274,6 +1323,7 @@ class ActivityBuildController:
                             field_key=field_key,
                             field_title=title,
                             exception=str(e),
+                            level="error",
                             **_ctx_for(step="configure_error", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                         )
                         reason = f"configure_field_from_config error: {e}"
@@ -1303,6 +1353,7 @@ class ActivityBuildController:
                                 Cat.CONFIGURE,
                                 "Critical field failed to configure; aborting build",
                                 field_key=field_key,
+                                level="error",
                                 **_ctx_for(step="configure_failed_critical", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
                             aborted = True
@@ -1312,6 +1363,7 @@ class ActivityBuildController:
                                 Cat.CONFIGURE,
                                 "Critical field failed to configure due to FAULT_INJECT; continuing",
                                 field_key=field_key,
+                                level="warning",
                                 **_ctx_for(step="configure_failed_critical_injected", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
 
@@ -1321,6 +1373,7 @@ class ActivityBuildController:
                                 "Consecutive configure failures; aborting build early",
                                 consecutive_failures=consecutive_failures,
                                 field_key=field_key,
+                                level="error",
                                 **_ctx_for(step="configure_failed_threshold", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
                             aborted = True
@@ -1348,6 +1401,7 @@ class ActivityBuildController:
                     Cat.CONFIGURE,
                     "Build completed with skipped items",
                     skipped_count=len(failures),
+                    level="warning",
                     **self._ctx(act=act, step="build_skipped_summary"),
                 )
                 for f in failures:
@@ -1395,6 +1449,7 @@ class ActivityBuildController:
                         Cat.RETRY,
                         "After retries, failures remain",
                         remaining=len(failures),
+                        level="warning",
                         **self._ctx(act=act, step="retry_remaining"),
                     )
                     for f in failures:
@@ -1454,6 +1509,7 @@ class ActivityBuildController:
                         Cat.UISTATE,
                         "AUDIT FAILED FINAL",
                         exception=str(e),
+                        level="warning",
                         **self._ctx(act=act, step="audit_final_fail", sec=last_section_id),
                     )
 
@@ -1533,6 +1589,7 @@ class ActivityBuildController:
                 self.session.emit_signal(
                     Cat.RETRY,
                     "Retry prompt unavailable (non-interactive); skipping retries",
+                    level="warning",
                     **self._ctx(act=act, step="retry_prompt_unavailable"),
                 )
                 return failures
@@ -1776,6 +1833,7 @@ class ActivityBuildController:
                         "Retry pass refresh failed",
                         pass_num=p,
                         exception=str(e),
+                        level="warning",
                         **self._ctx(act=act, step="retry_refresh_fail"),
                     )
                     
@@ -1813,6 +1871,7 @@ class ActivityBuildController:
                             "Retry pass hit failure threshold; stopping early.",
                             pass_num=p,
                             threshold=retry_failure_threshold,
+                            level="warning",
                             **self._ctx(act=act, step="retry_pass_threshold"),
                         )
                         break
@@ -1832,6 +1891,7 @@ class ActivityBuildController:
                     Cat.RETRY,
                     "Retry pass resolved no items; stopping early",
                     pass_num=p,
+                    level="warning",
                     **self._ctx(act=act, step="retry_pass_no_resolve"),
                 )
                 break
@@ -1853,6 +1913,7 @@ class ActivityBuildController:
                 Cat.RETRY,
                 "Could not rewrite failures report after retries",
                 exception=str(e),
+                level="warning",
                 **self._ctx(act=act, step="retry_report_write_fail"),
             )
 
@@ -1905,6 +1966,7 @@ class ActivityBuildController:
                 Cat.STARTUP,
                 "Spec picker UI unavailable; falling back to CLI selection",
                 exception=str(e),
+                level="warning",
                 **self._ctx(step="spec_picker_fallback"),
             )
 

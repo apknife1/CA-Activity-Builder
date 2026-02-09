@@ -8,6 +8,8 @@ import html
 
 import yaml  # ensure PyYAML is in requirements.txt
 
+from .instrumentation import Cat
+from .session import CASession
 
 @dataclass
 class FieldInstruction:
@@ -199,8 +201,45 @@ class SpecReader:
     into a "what to build" structure.
     """
 
-    def __init__(self, logger):
+    def __init__(self, logger=None, *, session: CASession | None = None):
         self.logger = logger
+        self.session = session
+
+    def _ctx(self, *, kind: str | None = None, source_path: Path | None = None, **extra: Any) -> dict[str, Any]:
+        ctx: dict[str, Any] = {}
+        if kind:
+            ctx["kind"] = kind
+        if source_path is not None:
+            ctx["path"] = str(source_path)
+        if extra:
+            ctx.update(extra)
+        return ctx
+
+    def _emit_signal(self, msg: str, *, level: str | int = "info", **ctx: Any) -> None:
+        if self.session:
+            self.session.emit_signal(Cat.CONFIGURE, msg, level=level, **ctx)
+            return
+        if not self.logger:
+            return
+        if isinstance(level, int):
+            self.logger.log(level, msg)
+            return
+        lvl = (level or "info").lower()
+        if lvl in ("warn", "warning"):
+            self.logger.warning(msg)
+        elif lvl in ("error", "err", "critical", "fatal"):
+            self.logger.error(msg)
+        elif lvl in ("debug", "trace"):
+            self.logger.debug(msg)
+        else:
+            self.logger.info(msg)
+
+    def _emit_diag(self, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx: Any) -> None:
+        if self.session:
+            self.session.emit_diag(Cat.CONFIGURE, msg, key=key, every_s=every_s, **ctx)
+            return
+        if self.logger:
+            self.logger.debug(msg)
 
     # ---------- public API ----------
 
@@ -225,16 +264,16 @@ class SpecReader:
 
         for ext in ("*.yml", "*.yaml", "*.json"):
             for file in dir_path.glob(ext):
-                if self.logger:
-                    self.logger.info("Reading spec file: %s", file)
+                self._emit_diag(
+                    f"Reading spec file: {file}",
+                    **self._ctx(kind="read_file", source_path=file),
+                )
                 activities.extend(self._read_file(file))
 
-        if self.logger:
-            self.logger.info(
-                "Loaded %d activity instruction(s) from directory %s",
-                len(activities),
-                dir_path,
-            )
+        self._emit_signal(
+            f"Loaded {len(activities)} activity instruction(s) from directory {dir_path}",
+            **self._ctx(kind="read_directory", source_path=dir_path),
+        )
 
         return activities
 
@@ -264,12 +303,10 @@ class SpecReader:
                 self._activity_generic(data, source_path=file_path)
             )
 
-        if self.logger:
-            self.logger.info(
-                "Read %d activity instruction(s) from %s",
-                len(activities),
-                file_path,
-            )
+        self._emit_signal(
+            f"Read {len(activities)} activity instruction(s) from {file_path}",
+            **self._ctx(kind="read_file", source_path=file_path),
+        )
         return activities
 
     def _load_raw(self, file_path: Path) -> Any:
@@ -509,12 +546,17 @@ class SpecReader:
             elif key == "assessment_result":
                 self._append_ar_fields(act, data)
             else:
-                self.logger.warning(
-                    "Unsupported activity_type=%r; no section/question fields appended.",
-                    activity_type,
+                self._emit_signal(
+                    f"Unsupported activity_type={activity_type!r}; no section/question fields appended.",
+                    level="warning",
+                    **self._ctx(kind="append_fields", source_path=source_path, activity_type=activity_type),
                 )
         except Exception as e:
-            self.logger.error("Failed to append specific fields for activity: %r, with message %r", activity_title, e)
+            self._emit_signal(
+                f"Failed to append specific fields for activity: {activity_title!r}, message={e!r}",
+                level="error",
+                **self._ctx(kind="append_fields", source_path=source_path, activity_title=activity_title),
+            )
         # return amended ActivityInstruction
         return act
     
@@ -673,16 +715,17 @@ class SpecReader:
         - Notes on evidence
         Returns: {"what_html": ..., "points_html": ..., "notes_html": ...}
         """
-        self.logger.debug("Building Industry Evidence specific intro")
+        self._emit_diag(
+            "Building Industry Evidence specific intro",
+            **self._ctx(kind="ie_intro"),
+        )
         what = intro.get("what_this_is") if isinstance(intro, dict) else None
         points = intro.get("must_cover_points") if isinstance(intro, dict) else None
         notes = intro.get("notes") if isinstance(intro, dict) else None
 
-        self.logger.info(
-            "IE intro blocks: what=%s points=%d notes=%s",
-            bool(what),
-            len(points) if isinstance(points, list) else 0,
-            bool(notes),
+        self._emit_diag(
+            f"IE intro blocks: what={bool(what)} points={(len(points) if isinstance(points, list) else 0)} notes={bool(notes)}",
+            **self._ctx(kind="ie_intro"),
         )
 
         what_html = self._text_to_html_paragraphs(what or "")
@@ -1102,9 +1145,13 @@ class SpecReader:
 
             # --- Placeholder: verifier_required (skip + log) ---
             if proj.get("verifier_required") is True:
-                self.logger.warning(
-                    "Industry Evidence: verifier_required=True for section %r but no checkbox field type exists yet; skipping.",
-                    section_title,
+                self._emit_signal(
+                    (
+                        "Industry Evidence: verifier_required=True for section "
+                        f"{section_title!r} but no checkbox field type exists yet; skipping."
+                    ),
+                    level="warning",
+                    **self._ctx(kind="ie_verifier", section_title=section_title),
                 )
 
             # --- Self-check table ---

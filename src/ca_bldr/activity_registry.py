@@ -43,9 +43,9 @@ class ActivityRegistry:
             ctx["fi"] = handle.fi_index
         return ctx
 
-    def _emit_signal(self, msg: str, **ctx: Any) -> None:
+    def _emit_signal(self, msg: str, *, level: str | int = "info", **ctx: Any) -> None:
         if self._session:
-            self._session.emit_signal(Cat.REG, msg, **ctx)
+            self._session.emit_signal(Cat.REG, msg, level=level, **ctx)
 
     def _emit_diag(self, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx: Any) -> None:
         if self._session:
@@ -100,6 +100,7 @@ class ActivityRegistry:
             self._emit_signal(
                 "Duplicate field handle re-registered",
                 note="duplicate_field_id",
+                level="warning",
                 **ctx,
             )
 
@@ -115,6 +116,7 @@ class ActivityRegistry:
                 self._emit_signal(
                     "Field added before section record existed",
                     reason="missing_section_record",
+                    level="warning",
                     **ctx,
                 )
             existing_index = next(
@@ -126,6 +128,7 @@ class ActivityRegistry:
                 self._emit_signal(
                     "Section already referenced this field id",
                     reason="duplicate_section_handle",
+                    level="warning",
                     **ctx,
                 )
                 rec.fields[existing_index] = handle
@@ -136,6 +139,7 @@ class ActivityRegistry:
             self._emit_signal(
                 "Field handle without section information",
                 reason="missing_section_info",
+                level="warning",
                 **ctx,
             )
 

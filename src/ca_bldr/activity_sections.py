@@ -2,7 +2,7 @@
 
 import re
 import time
-from typing import Optional, Iterable
+from typing import Optional, Iterable, Any
 
 from dataclasses import replace
 
@@ -56,8 +56,8 @@ class ActivitySections:
 
         self._sections_list_cache = None
 
-    def _section_ctx(self, *, action: str, attempt: str | None = None) -> dict[str, str]:
-        ctx: dict[str, str] = {
+    def _section_ctx(self, *, action: str, attempt: str | None = None) -> dict[str, Any]:
+        ctx: dict[str, Any] = {
             "sec": self.current_section_id or "",
             "kind": action,
         }
@@ -88,7 +88,14 @@ class ActivitySections:
 
     def _sections_cache_invalidate(self, reason: str = "") -> None:
         if self._sections_list_cache is not None:
-            self.logger.debug("Invalidating sections list cache. Reason=%s", reason)
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Invalidating sections list cache",
+                reason=reason,
+                key="SECTION.cache.invalidate",
+                every_s=1.0,
+                **self._section_ctx(action="cache_invalidate"),
+            )
         self._sections_list_cache = None
 
     def _ensure_sidebar_visible(self, timeout: int = 10) -> bool:
@@ -100,7 +107,7 @@ class ActivitySections:
         """
         driver = self.driver
         wait = self.session.get_wait(timeout)
-        logger = self.logger
+        ctx = self._section_ctx(action="ensure_sidebar")
 
         self.session.counters.inc("section.sidebar_ensure_calls")
 
@@ -111,7 +118,12 @@ class ActivitySections:
         frame_sel = cfg.get("frame")
 
         if not tab_sel:
-            logger.error("No tab selector configured for sidebar kind 'sections'.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No tab selector configured for sidebar kind 'sections'",
+                level="error",
+                **ctx,
+            )
             return False
 
         def _items_present() -> bool:
@@ -145,10 +157,17 @@ class ActivitySections:
                             return True
                     except Exception:
                         pass
-
-                    logger.info("Sections sidebar appears visible but not populated; will try to reopen/nudge.")
+                    self.session.emit_diag(
+                        Cat.SECTION,
+                        "Sections sidebar visible but not populated; will try to reopen/nudge",
+                        **self._section_ctx(action="ensure_sidebar", attempt="fastpath_no_items"),
+                    )
             except Exception:
-                logger.info("Sections sidebar tab not currently visible; will try to open it.")
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Sections sidebar tab not currently visible; will try to open it",
+                    **self._section_ctx(action="ensure_sidebar", attempt="open"),
+                )
 
             # 2. Click the 'Sections' toggle button
             sections_btn = None
@@ -159,12 +178,19 @@ class ActivitySections:
                     "toggle_button_onclick",
                     "button[onclick*='toggleSidebar'][onclick*='sections']",
                 )
-                logger.info("Looking for 'Sections' button by onclick attribute...")
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Looking for 'Sections' button by onclick selector",
+                    method="onclick_selector",
+                    **self._section_ctx(action="ensure_sidebar", attempt="find_button"),
+                )
                 sections_btn = driver.find_element(By.CSS_SELECTOR, onclick_sel)
             except Exception:
-                logger.info(
-                    "No button with toggleSidebar(..., 'sections') found via CSS; "
-                    "falling back to text-based button search."
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "No sections toggle via onclick selector; falling back to text search",
+                    method="text_scan",
+                    **self._section_ctx(action="ensure_sidebar", attempt="find_button"),
                 )
                 # b) Fallback: any button whose visible text includes 'Sections'
                 candidates = driver.find_elements(By.TAG_NAME, "button")
@@ -175,11 +201,21 @@ class ActivitySections:
                         text = ""
                     if text and "sections" in text.lower():
                         sections_btn = b
-                        logger.info(f"Found 'Sections' button by text: '{text}'")
+                        self.session.emit_diag(
+                            Cat.SECTION,
+                            "Found 'Sections' button by text",
+                            text=text,
+                            **self._section_ctx(action="ensure_sidebar", attempt="find_button"),
+                        )
                         break
 
             if sections_btn is None:
-                logger.error("Could not find any 'Sections' toggle button.")
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Could not find any 'Sections' toggle button",
+                    level="error",
+                    **ctx,
+                )
                 return False
 
             clicked = False
@@ -197,7 +233,11 @@ class ActivitySections:
                     return False
 
             wait.until(tab_visible)
-            logger.info("Sections sidebar tab is now visible.")
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Sections sidebar tab is now visible",
+                **self._section_ctx(action="ensure_sidebar", attempt="tab_visible"),
+            )
 
             # 4. If a frame is configured, wait for it
             if frame_sel:
@@ -209,18 +249,41 @@ class ActivitySections:
                         return False
 
                 wait.until(frame_ready)
-                logger.info("Sections sidebar frame '%s' is loaded.", frame_sel)
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Sections sidebar frame is loaded",
+                    frame_sel=frame_sel,
+                    **self._section_ctx(action="ensure_sidebar", attempt="frame_ready"),
+                )
 
             return True
 
         except TimeoutException as e:
-            logger.error("Timed out ensuring Sections sidebar visibility: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Timed out ensuring Sections sidebar visibility",
+                exception=str(e),
+                level="error",
+                **ctx,
+            )
             return False
         except WebDriverException as e:
-            logger.error("WebDriver error ensuring Sections sidebar visibility: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "WebDriver error ensuring Sections sidebar visibility",
+                exception=str(e),
+                level="error",
+                **ctx,
+            )
             return False
         except Exception as e:
-            logger.error("Unexpected error ensuring Sections sidebar visibility: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Unexpected error ensuring Sections sidebar visibility",
+                exception=str(e),
+                level="error",
+                **ctx,
+            )
             return False
 
     def _get_sections_frame(self):
@@ -238,7 +301,13 @@ class ActivitySections:
             frame = driver.find_element(By.CSS_SELECTOR, sel)
             return frame
         except Exception as e:
-            self.logger.warning("Could not locate designer_sections frame: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not locate designer_sections frame",
+                exception=str(e),
+                level="warning",
+                **self._section_ctx(action="get_frame"),
+            )
             raise
 
     # ------------------------------------------------------------------
@@ -258,8 +327,6 @@ class ActivitySections:
         - Use a very short cache window to avoid repeated DOM scans.
         - If a stale error occurs, invalidate cache and retry once.
         """
-        logger = self.logger
-
         cached = self._sections_cache_get()
         if cached is not None:
             return cached
@@ -271,25 +338,46 @@ class ActivitySections:
                     pass
                 else:
                     if not self._ensure_sidebar_visible():
-                        logger.warning("Sections sidebar not visible; returning empty list.")
+                        self.session.emit_signal(
+                            Cat.SECTION,
+                            "Sections sidebar not visible; returning empty list",
+                            level="warning",
+                            **self._section_ctx(action="list"),
+                        )
                         return []
             except Exception:
                 # fallback to original behaviour
                 if not self._ensure_sidebar_visible():
-                    logger.warning("Sections sidebar not visible; returning empty list.")
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        "Sections sidebar not visible; returning empty list",
+                        level="warning",
+                        **self._section_ctx(action="list"),
+                    )
                     return []
 
             frame = self._get_sections_frame()
             items_sel = config.BUILDER_SELECTORS["sections"]["items"]
 
             sections = frame.find_elements(By.CSS_SELECTOR, items_sel)
-            logger.info("Found %d editable section(s) in the Sections sidebar.", len(sections))
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Found editable sections in sidebar",
+                count=len(sections),
+                **self._section_ctx(action="list"),
+            )
             return sections
 
         try:
             sections = _fetch()
         except (StaleElementReferenceException, WebDriverException) as e:
-            logger.warning("Stale/WebDriver while listing sections; retrying once: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Stale/WebDriver while listing sections; retrying once",
+                exception=str(e),
+                level="warning",
+                **self._section_ctx(action="list_retry"),
+            )
             # invalidate cache and retry once
             self._sections_cache_invalidate(reason="stale_fetch")
             try:
@@ -297,7 +385,13 @@ class ActivitySections:
             except Exception:
                 return []
         except Exception as e:
-            logger.warning("Unexpected error while listing sections: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Unexpected error while listing sections",
+                exception=str(e),
+                level="warning",
+                **self._section_ctx(action="list"),
+            )
             return []
 
         # store cache
@@ -378,7 +472,7 @@ class ActivitySections:
         """
         driver = self.driver
         wait = self.wait
-        logger = self.logger
+        ctx = self._section_ctx(action="select")
 
         # section_el is the <li id="designer__sidebar__item--<id>">
         li_id = section_el.get_attribute("id") or ""
@@ -393,7 +487,13 @@ class ActivitySections:
                 ".designer__sidebar__item__link",
             )
         except Exception as e:
-            logger.warning(f"Could not find section link to click: {e}")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not find section link to click",
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
             return None
 
         try:
@@ -407,7 +507,11 @@ class ActivitySections:
             if not clicked:
                 driver.execute_script("arguments[0].click();", link)
 
-            logger.info("Section selected via sidebar; waiting for canvas to load...")
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Section selected via sidebar; waiting for canvas to load",
+                **ctx,
+            )
 
             if section_id:
                 def canvas_for_section_loaded(_):
@@ -419,17 +523,38 @@ class ActivitySections:
                         return False
 
                 wait.until(canvas_for_section_loaded)
-                logger.info("Canvas updated for section %s.", section_id)
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Canvas updated for section",
+                    section_id=section_id,
+                    **ctx,
+                )
             else:
-                logger.info("No section_id parsed; skipping create_field_path check.")
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "No section_id parsed; skipping create_field_path check",
+                    **ctx,
+                )
 
             return section_id
 
         except (TimeoutException, WebDriverException) as e:
-            logger.warning(f"WebDriver error while selecting section: {e}")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "WebDriver error while selecting section",
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
             return None
         except Exception as e:
-            logger.warning(f"Unexpected error while selecting section: {e}")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Unexpected error while selecting section",
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
             return None
 
     def _select_from_current_handle(self) -> bool:
@@ -443,12 +568,15 @@ class ActivitySections:
         - If we can prove canvas alignment for current section, we skip sidebar work.
         - Otherwise we retry sidebar selection and fall back to id/title.
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="select_current")
 
         handle = self.current_section_handle
         if handle is None or not handle.section_id:
-            logger.warning(
-                "_select_from_current_handle called but current_section_handle is not set or has no section_id."
+            self.session.emit_signal(
+                Cat.SECTION,
+                "_select_from_current_handle called but current_section_handle is not set or has no section_id",
+                level="warning",
+                **ctx,
             )
             return False
 
@@ -464,10 +592,12 @@ class ActivitySections:
                     every_s=1.0,
                     **self._section_ctx(action="select", attempt="fastpath"),
                 )
-                logger.debug(
-                    "_select_from_current_handle fast-path: canvas already aligned for section id=%s title=%r.",
-                    handle.section_id,
-                    handle.title,
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Fast-path: canvas already aligned for current section",
+                    section_id=handle.section_id,
+                    section_title=handle.title,
+                    **ctx,
                 )
                 return True
         except Exception:
@@ -479,67 +609,111 @@ class ActivitySections:
             try:
                 ch = self.select_by_handle(handle)
                 if ch:
-                    logger.info(
-                        "Section id=%s, title=%r selected via _select_from_current_handle (attempt %d).",
-                        handle.section_id,
-                        handle.title,
-                        attempt,
+                    self.session.emit_diag(
+                        Cat.SECTION,
+                        "Selected current section via handle",
+                        section_id=handle.section_id,
+                        section_title=handle.title,
+                        attempt=attempt,
+                        **ctx,
                     )
                     return True
 
-                logger.warning(
-                    "select_by_handle returned empty for id=%s on attempt %d.",
-                    handle.section_id,
-                    attempt,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "select_by_handle returned empty",
+                    section_id=handle.section_id,
+                    attempt=attempt,
+                    level="warning",
+                    **ctx,
                 )
 
             except StaleElementReferenceException as e:
-                logger.warning(
-                    "Stale element while selecting current section id=%s on attempt %d: %s",
-                    handle.section_id,
-                    attempt,
-                    e,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Stale element while selecting current section",
+                    section_id=handle.section_id,
+                    attempt=attempt,
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
                 )
             except WebDriverException as e:
-                logger.warning(
-                    "WebDriver error while selecting current section id=%s on attempt %d: %s",
-                    handle.section_id,
-                    attempt,
-                    e,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "WebDriver error while selecting current section",
+                    section_id=handle.section_id,
+                    attempt=attempt,
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
                 )
             except Exception as e:
-                logger.warning(
-                    "Unexpected error while selecting current section id=%s on attempt %d: %s",
-                    handle.section_id,
-                    attempt,
-                    e,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Unexpected error while selecting current section",
+                    section_id=handle.section_id,
+                    attempt=attempt,
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
                 )
 
         # Fallback: try selecting by id or title from scratch
-        logger.info(
-            "Falling back to select_by_id / select_by_title for current section id=%s, title=%r.",
-            handle.section_id,
-            handle.title,
+        self.session.emit_signal(
+            Cat.SECTION,
+            "Falling back to select_by_id / select_by_title for current section",
+            section_id=handle.section_id,
+            section_title=handle.title,
+            level="warning",
+            **ctx,
         )
 
         try:
             if handle.section_id and self.select_by_id(handle.section_id):
-                logger.info("Fallback select_by_id succeeded for id=%s.", handle.section_id)
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Fallback select_by_id succeeded",
+                    section_id=handle.section_id,
+                    **ctx,
+                )
                 return True
         except Exception as e:
-            logger.warning("Fallback select_by_id raised for id=%s: %s", handle.section_id, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Fallback select_by_id raised",
+                section_id=handle.section_id,
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
 
         try:
             if handle.title and self.select_by_title(handle.title, exact=True):
-                logger.info("Fallback select_by_title succeeded for title=%r.", handle.title)
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Fallback select_by_title succeeded",
+                    section_title=handle.title,
+                    **ctx,
+                )
                 return True
         except Exception as e:
-            logger.warning("Fallback select_by_title raised for title=%r: %s", handle.title, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Fallback select_by_title raised",
+                section_title=handle.title,
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
 
-        logger.error(
-            "Failed to select current section id=%s, title=%r after retries and fallbacks.",
-            handle.section_id,
-            handle.title,
+        self.session.emit_signal(
+            Cat.SECTION,
+            "Failed to select current section after retries and fallbacks",
+            section_id=handle.section_id,
+            section_title=handle.title,
+            level="error",
+            **ctx,
         )
         return False
 
@@ -549,7 +723,7 @@ class ActivitySections:
 
         Returns True on success, False otherwise.
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="select_by_handle")
 
         li = self._find_section_li_for_handle(handle)
         if li is None:
@@ -576,11 +750,13 @@ class ActivitySections:
         self.current_section_handle = resolved_handle
         self.registry.add_or_update_section(resolved_handle)
 
-        logger.info(
-            "Selected section with id=%s, title=%r, index=%r",
-            resolved_handle.section_id,
-            resolved_handle.title,
-            resolved_handle.index,
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Selected section with handle",
+            section_id=resolved_handle.section_id,
+            section_title=resolved_handle.title,
+            section_index=resolved_handle.index,
+            **ctx,
         )
         if resolved_handle.section_id == handle.section_id:
             return handle
@@ -591,10 +767,15 @@ class ActivitySections:
         Given a SectionHandle, find the corresponding <li> in the sidebar.
         Prefer section_id when available, otherwise fall back to index/title.
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="find_li")
 
         if not self._ensure_sidebar_visible():
-            logger.warning("Sidebar is not visible; cannot find section li.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Sidebar is not visible; cannot find section li",
+                level="warning",
+                **ctx,
+            )
             return None
 
         frame = self._get_sections_frame()
@@ -606,9 +787,11 @@ class ActivitySections:
                 lambda d: len(frame.find_elements(By.CSS_SELECTOR, items_sel)) > 0
             )
         except TimeoutException:
-            logger.debug(
-                "Sections frame present but items not populated yet (items_sel=%r).",
-                items_sel,
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Sections frame present but items not populated yet",
+                items_sel=items_sel,
+                **ctx,
             )
 
         # 1) Fast path: use section_id from handle
@@ -620,9 +803,11 @@ class ActivitySections:
                 )
                 return li
             except NoSuchElementException:
-                logger.debug(
-                    "No li found for section id %s; falling back to index/title.",
-                    handle.section_id,
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "No li found for section id; falling back to index/title",
+                    section_id=handle.section_id,
+                    **ctx,
                 )
 
         # 2) Fallback: use index
@@ -631,10 +816,12 @@ class ActivitySections:
             if 0 <= handle.index < len(sections):
                 return sections[handle.index]
             else:
-                logger.debug(
-                    "Handle index %s out of range for sections (0..%d).",
-                    handle.index,
-                    len(sections) - 1,
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Handle index out of range for sections",
+                    section_index=handle.index,
+                    max_index=len(sections) - 1,
+                    **ctx,
                 )
 
         # 3) Fallback: match by title
@@ -656,11 +843,14 @@ class ActivitySections:
                 except Exception:
                     continue
 
-        logger.warning(
-            "Could not locate li for SectionHandle(id=%s, title=%r, index=%r)",
-            handle.section_id,
-            handle.title,
-            handle.index,
+        self.session.emit_signal(
+            Cat.SECTION,
+            "Could not locate li for SectionHandle",
+            section_id=handle.section_id,
+            section_title=handle.title,
+            section_index=handle.index,
+            level="warning",
+            **ctx,
         )
         return None
 
@@ -672,17 +862,27 @@ class ActivitySections:
         If more than one section shares the same title, no section is selected
         (the caller should then disambiguate via index or id).
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="select_by_title")
 
         target = (title_text or "").strip()
         if not target:
-            logger.warning("Empty section title provided for search.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Empty section title provided for search",
+                level="warning",
+                **ctx,
+            )
             return None
 
         target_lower = target.lower()
         sections = self.list()
         if not sections:
-            logger.warning("No sections available to select by title.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No sections available to select by title",
+                level="warning",
+                **ctx,
+            )
             return None
 
         # Collect all matching <li> elements
@@ -701,18 +901,25 @@ class ActivitySections:
                     matches.append((idx, sec))
 
         if not matches:
-            logger.warning(
-                "No section found with title %r (exact=%s).", title_text, exact
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No section found with title",
+                title=title_text,
+                exact=exact,
+                level="warning",
+                **ctx,
             )
             return None
 
         if len(matches) > 1:
-            logger.warning(
-                "Multiple sections (%d) found with title %r (exact=%s). "
-                "Please disambiguate by index or id.",
-                len(matches),
-                title_text,
-                exact,
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Multiple sections found with title; please disambiguate",
+                count=len(matches),
+                title=title_text,
+                exact=exact,
+                level="warning",
+                **ctx,
             )
             # We *could* pick the first, but for automation it's safer to refuse.
             return None
@@ -733,14 +940,25 @@ class ActivitySections:
 
         Returns SectionHandle on success, None on failure.
         """
+        ctx = self._section_ctx(action="select_by_index")
         sections = self.list()
         if not sections:
-            self.logger.warning("No sections available to select by index.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No sections available to select by index",
+                level="warning",
+                **ctx,
+            )
             return None
 
         if index < 0 or index >= len(sections):
-            self.logger.warning(
-                "Section index %d out of range (0..%d).", index, len(sections) - 1
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Section index out of range",
+                index=index,
+                max_index=len(sections) - 1,
+                level="warning",
+                **ctx,
             )
             return None
 
@@ -750,7 +968,12 @@ class ActivitySections:
 
         ch =  self.select_by_handle(handle)
         if ch:
-            self.logger.info("Selected section index %d.", index)
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Selected section by index",
+                index=index,
+                **ctx,
+            )
             # current_section_handle is already updated
             return self.current_section_handle
         return None
@@ -761,10 +984,15 @@ class ActivitySections:
 
         Returns a SectionHandle on success, or None on failure.
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="select_by_id")
         section_id = (section_id or "").strip()
         if not section_id:
-            logger.warning("Empty section_id provided to select_by_id.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Empty section_id provided to select_by_id",
+                level="warning",
+                **ctx,
+            )
             return None
 
         handle = SectionHandle(section_id=section_id)
@@ -772,17 +1000,31 @@ class ActivitySections:
         try:
             ch = self.select_by_handle(handle)
             if not ch:
-                logger.warning("select_by_handle succeeded but current_section_handle is None (unexpected).")
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "select_by_handle succeeded but current_section_handle is None (unexpected)",
+                    level="warning",
+                    **ctx,
+                )
                 return None            
-            logger.info(
-                "Selected section by id=%s (title=%r, index=%r).",
-                ch.section_id,
-                ch.title,
-                ch.index,
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Selected section by id",
+                section_id=ch.section_id,
+                section_title=ch.title,
+                section_index=ch.index,
+                **ctx,
             )
             return self.current_section_handle
         except Exception as e:
-            logger.error("Failed to select section with id=%s. Message: %s", section_id, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Failed to select section by id",
+                section_id=section_id,
+                exception=str(e),
+                level="error",
+                **ctx,
+            )
 
     def select_last(self):
         """
@@ -792,7 +1034,12 @@ class ActivitySections:
         """
         sections = self.list()
         if not sections:
-            self.logger.warning("No sections available to select.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No sections available to select last",
+                level="warning",
+                **self._section_ctx(action="select_last"),
+            )
             return None
 
         li = sections[-1]
@@ -816,9 +1063,9 @@ class ActivitySections:
         Returns True if we end up with the intended section selected,
         False otherwise.
         """
-        logger = self.logger
         driver = self.driver
         wait = self.session.get_wait(timeout)
+        ctx = self._section_ctx(action="hard_resync")
 
         self.session.counters.inc("section.hard_resyncs")
 
@@ -826,15 +1073,23 @@ class ActivitySections:
 
         handle = self.current_section_handle
         if not handle:
-            logger.warning("hard_resync_current_section called but no current_section_handle is set.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "hard_resync_current_section called but no current_section_handle is set",
+                level="warning",
+                **ctx,
+            )
             return False
 
         is_info_handle = (handle.section_id == "information") or ((handle.title or "").strip().lower() == "information")
 
-        logger.warning(
-            "Hard resync: refreshing Activity Builder and re-selecting section id=%s title=%r",
-            handle.section_id,
-            handle.title,
+        self.session.emit_signal(
+            Cat.SECTION,
+            "Hard resync: refreshing Activity Builder and re-selecting section",
+            section_id=handle.section_id,
+            section_title=handle.title,
+            level="warning",
+            **ctx,
         )
 
         def _is_information_url() -> bool:
@@ -854,26 +1109,48 @@ class ActivitySections:
 
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, frame_sel)))
         except TimeoutException:
-            logger.error(
-                "Hard resync: sections sidebar frame %r did not become present after refresh.",
-                frame_sel,
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Hard resync: sections sidebar frame did not become present after refresh",
+                frame_sel=frame_sel,
+                level="error",
+                **ctx,
             )
             return False
 
         # 3) Make sure the sections sidebar is visible
         if not self._ensure_sidebar_visible(timeout):
-            logger.error("Hard resync: could not ensure sections sidebar is visible after refresh.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Hard resync: could not ensure sections sidebar is visible after refresh",
+                level="error",
+                **ctx,
+            )
             return False
 
         # 3b) In Information-only mode, the sections list may legitimately be empty.
         if _is_information_url() or is_info_handle:
-            logger.info("Hard resync: detected Information-only section via URL; skipping sections list population wait.")
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Hard resync: detected Information-only section; skipping sections list population wait",
+                **ctx,
+            )
             # Best-effort: make sure sidebar is visible (already done above), then wait for canvas settle.
             try:
                 self.wait_for_canvas_for_current_section(timeout=10)
             except Exception as e:
-                logger.warning("Hard resync (information): error while waiting for canvas alignment: %s", e)
-            logger.info("Hard resync completed in Information-only mode.")
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Hard resync (information): error while waiting for canvas alignment",
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
+                )
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Hard resync completed in Information-only mode",
+                **ctx,
+            )
             return True
 
         # Otherwise, normal behaviour:
@@ -894,24 +1171,43 @@ class ActivitySections:
             local_wait = self.session.get_wait(int(min(3, remaining)))  # short waits per iteration
             try:
                 items = local_wait.until(lambda d: _items_or_false())
-                logger.info("Hard resync: sections list populated (items=%d).", len(items))
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Hard resync: sections list populated",
+                    items=len(items),
+                    **ctx,
+                )
                 break
             except TimeoutException:
                 nudges += 1
                 if time.time() >= deadline or nudges > 2:
-                    logger.error(
-                        "Hard resync: sections frame present but no section items appeared (selector=%r).",
-                        items_sel,
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        "Hard resync: sections frame present but no section items appeared",
+                        items_sel=items_sel,
+                        level="error",
+                        **ctx,
                     )
                     try:
                         frame = self._get_sections_frame()
                         snippet = (frame.get_attribute("innerHTML") or "")[:500]
-                        logger.debug("Hard resync: sections frame innerHTML (first 500 chars): %r", snippet)
+                        self.session.emit_diag(
+                            Cat.SECTION,
+                            "Hard resync: sections frame innerHTML (first 500 chars)",
+                            snippet=snippet,
+                            **ctx,
+                        )
                     except Exception:
                         pass
                     return False
 
-                logger.warning("Hard resync: sections list still empty; nudging sidebar (nudge %d/2).", nudges)
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Hard resync: sections list still empty; nudging sidebar",
+                    nudge=nudges,
+                    level="warning",
+                    **ctx,
+                )
 
                 # nudge: click Sections toggle again (idempotent) and re-wait
                 self._ensure_sidebar_visible(timeout=5)
@@ -928,10 +1224,13 @@ class ActivitySections:
             self._ensure_sidebar_visible(timeout)
             ch = self.select_by_handle(handle)
             if not ch:
-                logger.error(
-                    "Hard resync: could not re-select section id=%s title=%r after refresh.",
-                    handle.section_id,
-                    handle.title,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Hard resync: could not re-select section after refresh",
+                    section_id=handle.section_id,
+                    section_title=handle.title,
+                    level="error",
+                    **ctx,
                 )
                 return False
 
@@ -939,12 +1238,20 @@ class ActivitySections:
         try:
             self.wait_for_canvas_for_current_section(timeout=10)
         except Exception as e:
-            logger.warning("Hard resync: error while waiting for canvas alignment: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Hard resync: error while waiting for canvas alignment",
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
 
-        logger.info(
-            "Hard resync completed; current section is id=%s title=%r.",
-            ch.section_id,
-            ch.title,
+        self.session.emit_signal(
+            Cat.SECTION,
+            "Hard resync completed",
+            section_id=ch.section_id,
+            section_title=ch.title,
+            **ctx,
         )
         return True
 
@@ -958,12 +1265,17 @@ class ActivitySections:
         """
         driver = self.driver
         wait = self.session.get_wait(timeout)
-        logger = self.logger
+        ctx = self._section_ctx(action="create")
 
         self._sections_cache_invalidate(reason="create_section")
 
         if not self._ensure_sidebar_visible(timeout=timeout):
-            logger.error("Cannot create section because Sections sidebar is not visible.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Cannot create section because Sections sidebar is not visible",
+                level="error",
+                **ctx,
+            )
             return None
 
         frame = self._get_sections_frame()
@@ -972,7 +1284,12 @@ class ActivitySections:
         items_sel = config.BUILDER_SELECTORS["sections"]["items"]
         before_sections = frame.find_elements(By.CSS_SELECTOR, items_sel)
         before_count = len(before_sections)
-        logger.info("Sections before creation: %d", before_count)
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Sections before creation",
+            count=before_count,
+            **ctx,
+        )
 
         # Locate 'Create Section' button inside sections tab
         try:
@@ -986,7 +1303,13 @@ class ActivitySections:
             if not clicked:
                 driver.execute_script("arguments[0].click();", create_btn)
         except Exception as e:
-            logger.error("Could not find/click 'Create Section' button: %s", e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not find/click 'Create Section' button",
+                exception=str(e),
+                level="error",
+                **ctx,
+            )
             return None
 
         # Wait for a new section item to appear
@@ -1000,7 +1323,12 @@ class ActivitySections:
         try:
             wait.until(new_section_appeared)
         except TimeoutException:
-            logger.warning("Timed out waiting for new section to appear.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Timed out waiting for new section to appear",
+                level="warning",
+                **ctx,
+            )
             # Still attempt to grab current last section
             current = frame.find_elements(By.CSS_SELECTOR, items_sel)
             if not current:
@@ -1014,7 +1342,12 @@ class ActivitySections:
 
         # New section exists; pick the last one
         current = frame.find_elements(By.CSS_SELECTOR, items_sel)
-        logger.info("Sections after creation: %d", len(current))
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Sections after creation",
+            count=len(current),
+            **ctx,
+        )
         if not current:
             return None
 
@@ -1023,11 +1356,13 @@ class ActivitySections:
         handle = self._build_section_handle_from_li(new_li, index=index)
 
         self.current_section_handle = handle
-        logger.info(
-            "Created new section with id=%s, title=%r, index=%r",
-            handle.section_id,
-            handle.title,
-            handle.index,
+        self.session.emit_signal(
+            Cat.SECTION,
+            "Created new section",
+            section_id=handle.section_id,
+            section_title=handle.title,
+            section_index=handle.index,
+            **ctx,
         )
         return handle
 
@@ -1040,7 +1375,7 @@ class ActivitySections:
         """
         Build a SectionHandle from a <li id="designer__sidebar__item--<section_id>"> node.
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="build_handle")
 
         title = None
 
@@ -1079,11 +1414,13 @@ class ActivitySections:
             index=index,
         )
 
-        logger.debug(
-            "Built SectionHandle from li: id=%s, title=%r, index=%r",
-            handle.section_id,
-            handle.title,
-            handle.index,
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Built SectionHandle from li",
+            section_id=handle.section_id,
+            section_title=handle.title,
+            section_index=handle.index,
+            **ctx,
         )
         return handle
 
@@ -1102,13 +1439,15 @@ class ActivitySections:
           active section is correct AND the canvas is aligned.
         - Otherwise we fall back to the existing robust behaviour.
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="ensure_ready")
 
-        logger.info(
-            "ensure_section_ready called with section_title=%r, index=%r and section_id=%r.",
-            section_title,
-            index,
-            section_id,
+        self.session.emit_diag(
+            Cat.SECTION,
+            "ensure_section_ready called",
+            section_title=section_title,
+            section_index=index,
+            section_id=section_id,
+            **ctx,
         )
 
         # -----------------------------
@@ -1135,7 +1474,13 @@ class ActivitySections:
                     # Confirm alignment (bounded, no sleeps)
                     self.wait_for_canvas_for_current_section(timeout=10)
             except Exception as e:
-                logger.warning("Failed to navigate to Information section URL: %s", e)
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Failed to navigate to Information section URL",
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
+                )
 
             return handle
         
@@ -1201,11 +1546,13 @@ class ActivitySections:
                 return None
 
             # If we’re here: the requested/current section is already active and safe.
-            logger.info(
-                "Fast-path: current section already selected and canvas aligned (id=%s title=%r index=%r).",
-                current.section_id,
-                current.title,
-                current.index,
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Fast-path: current section already selected and canvas aligned",
+                section_id=current.section_id,
+                section_title=current.title,
+                section_index=current.index,
+                **ctx,
             )
             # Ensure registry is up-to-date
             try:
@@ -1217,22 +1564,40 @@ class ActivitySections:
         def _create_new() -> Optional[SectionHandle]:
             new_section = self.create()
             if not new_section:
-                logger.error("Failed to create a new section; cannot prepare question section.")
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Failed to create a new section; cannot prepare question section",
+                    level="error",
+                    **ctx,
+                )
                 return None
 
-            logger.info(
-                "Created new section with id=%s, title=%r, index=%r",
-                new_section.section_id,
-                new_section.title,
-                new_section.index,
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Created new section (ensure_section_ready)",
+                section_id=new_section.section_id,
+                section_title=new_section.title,
+                section_index=new_section.index,
+                **ctx,
             )
 
             if section_title and section_title.strip():
-                logger.info("Renaming new section to %r from spec...", section_title)
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Renaming new section from spec",
+                    new_title=section_title,
+                    **ctx,
+                )
                 try:
                     self.rename_section(new_section, new_title=section_title)
                 except Exception as e:
-                    logger.warning("Failed to rename new section: %s", e)
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        "Failed to rename new section",
+                        exception=str(e),
+                        level="warning",
+                        **ctx,
+                    )
 
             # After creation/rename, rely on current_section_handle (your existing pattern)
             created_handle = getattr(self, "current_section_handle", None) or new_section
@@ -1254,26 +1619,39 @@ class ActivitySections:
             try:
                 ok = self._select_from_current_handle()
             except Exception as e:
-                logger.warning("Selection failed (%s): %s", why, e)
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Selection failed",
+                    reason=why,
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
+                )
                 ok = False
 
             if not ok:
-                logger.error(
-                    "Could not select section (%s): title=%r id=%s",
-                    why,
-                    getattr(handle, "title", None),
-                    getattr(handle, "section_id", None),
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Could not select section",
+                    reason=why,
+                    section_title=getattr(handle, "title", None),
+                    section_id=getattr(handle, "section_id", None),
+                    level="error",
+                    **ctx,
                 )
                 return None
 
             # 2) Fast alignment check (avoid paying 10s repeatedly)
             if _canvas_aligned(timeout=3):
                 return handle
-            logger.warning(
-                "Canvas not aligned after selecting section (%s); forcing sidebar reselect: title=%r id=%s",
-                why,
-                getattr(handle, "title", None),
-                getattr(handle, "section_id", None),
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Canvas not aligned after selecting section; forcing sidebar reselect",
+                reason=why,
+                section_title=getattr(handle, "title", None),
+                section_id=getattr(handle, "section_id", None),
+                level="warning",
+                **ctx,
             )
 
             # 3) Force a sidebar reselect (your proven recovery path)
@@ -1281,17 +1659,27 @@ class ActivitySections:
                 if getattr(handle, "section_id", None):
                     self.select_by_id(handle.section_id)
             except Exception as e:
-                logger.warning("Sidebar reselect failed (%s): %s", why, e)
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Sidebar reselect failed",
+                    reason=why,
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
+                )
 
             # 4) Confirm again with a slightly longer, still bounded wait
             if _canvas_aligned(timeout=5):
                 return handle
 
-            logger.warning(
-                "Canvas still not aligned after sidebar reselect (%s): title=%r id=%s",
-                why,
-                getattr(handle, "title", None),
-                getattr(handle, "section_id", None),
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Canvas still not aligned after sidebar reselect",
+                reason=why,
+                section_title=getattr(handle, "title", None),
+                section_id=getattr(handle, "section_id", None),
+                level="warning",
+                **ctx,
             )
 
             return handle  # best-effort; caller/builder has its own guard too
@@ -1310,8 +1698,11 @@ class ActivitySections:
 
         # If none exist: create + select
         if not sections:
-            logger.info(
-                "No editable sections found (other than 'Information'). Creating a new section..."
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No editable sections found; creating a new section",
+                level="warning",
+                **ctx,
             )
             created = _create_new()
             if not created:
@@ -1322,7 +1713,12 @@ class ActivitySections:
             if selected is None:
                 return None
 
-            logger.info("Created editable section titled: %r", selected.title)
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Created editable section",
+                section_title=selected.title,
+                **ctx,
+            )
             self.current_section_handle = selected
             return selected
 
@@ -1334,44 +1730,73 @@ class ActivitySections:
             if section_title is not None:
                 selected = self.select_by_title(section_title, exact=True)
                 if selected is not None:
-                    logger.info("Section selected by title: %r.", section_title)
+                    self.session.emit_diag(
+                        Cat.SECTION,
+                        "Section selected by title",
+                        section_title=section_title,
+                        **ctx,
+                    )
                     # Confirm selection/canvas (cheap)
                     confirmed = _select_and_confirm(selected, why="select-by-title")
                     self.current_section_handle = confirmed or selected
                     return self.current_section_handle
-                logger.warning(
-                    "Requested section title %r not found; will try index / id or create.",
-                    section_title,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Requested section title not found; will try index/id or create",
+                    section_title=section_title,
+                    level="warning",
+                    **ctx,
                 )
 
             # 2) select by index
             if index is not None:
                 selected = self.select_by_index(index)
                 if selected is not None:
-                    logger.info("Section selected by index: %s.", index)
+                    self.session.emit_diag(
+                        Cat.SECTION,
+                        "Section selected by index",
+                        section_index=index,
+                        **ctx,
+                    )
                     confirmed = _select_and_confirm(selected, why="select-by-index")
                     self.current_section_handle = confirmed or selected
                     return self.current_section_handle
-                logger.warning(
-                    "Requested section index %s not valid; will try id or create.",
-                    index,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Requested section index not valid; will try id or create",
+                    section_index=index,
+                    level="warning",
+                    **ctx,
                 )
 
             # 3) select by id
             if section_id is not None:
                 selected = self.select_by_id(section_id)
                 if selected is not None:
-                    logger.info("Section selected by id: %s.", section_id)
+                    self.session.emit_diag(
+                        Cat.SECTION,
+                        "Section selected by id",
+                        section_id=section_id,
+                        **ctx,
+                    )
                     confirmed = _select_and_confirm(selected, why="select-by-id")
                     self.current_section_handle = confirmed or selected
                     return self.current_section_handle
-                logger.warning(
-                    "Requested section id %s not valid; a new section will be created.",
-                    section_id,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Requested section id not valid; a new section will be created",
+                    section_id=section_id,
+                    level="warning",
+                    **ctx,
                 )
 
             # 4) create new
-            logger.info("Requested section not found by title/index/id; creating a new section...")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Requested section not found; creating a new section",
+                level="warning",
+                **ctx,
+            )
             created = _create_new()
             if not created:
                 return None
@@ -1380,7 +1805,12 @@ class ActivitySections:
             if selected is None:
                 return None
 
-            logger.info("Created editable section titled: %r", selected.title)
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Created editable section",
+                section_title=selected.title,
+                **ctx,
+            )
             self.current_section_handle = selected
             return selected
 
@@ -1389,7 +1819,12 @@ class ActivitySections:
         # -----------------------------
         selected = self.select_last()
         if selected is None:
-            logger.warning("No last section could be selected; creating a new section instead.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No last section could be selected; creating a new section instead",
+                level="warning",
+                **ctx,
+            )
             created = _create_new()
             if not created:
                 return None
@@ -1398,7 +1833,12 @@ class ActivitySections:
             if selected2 is None:
                 return None
 
-            logger.info("Created editable section titled: %r", selected2.title)
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Created editable section",
+                section_title=selected2.title,
+                **ctx,
+            )
             self.current_section_handle = selected2
             return selected2
 
@@ -1406,7 +1846,11 @@ class ActivitySections:
         confirmed = _select_and_confirm(selected, why="select-last")
         self.current_section_handle = confirmed or selected
 
-        logger.info("Question-ready section is selected and ready for adding fields.")
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Question-ready section is selected and ready for adding fields",
+            **ctx,
+        )
         return self.current_section_handle
 
     def rename_section(self, handle: SectionHandle, new_title: str, timeout: int = 10) -> bool:
@@ -1416,17 +1860,28 @@ class ActivitySections:
         `handle` should be a SectionHandle with a valid section_id.
         Returns True on success, False on failure.
         """
-        logger = self.logger
         driver = self.driver
+        ctx = self._section_ctx(action="rename")
 
         self._sections_cache_invalidate(reason="rename_section")
 
         if not handle.section_id:
-            logger.warning("Cannot rename section without section_id (handle=%r).", handle)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Cannot rename section without section_id",
+                handle=handle,
+                level="warning",
+                **ctx,
+            )
             return False
 
         if not self._ensure_sidebar_visible(timeout=timeout):
-            logger.error("Cannot rename section because Sections sidebar is not visible.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Cannot rename section because Sections sidebar is not visible",
+                level="error",
+                **ctx,
+            )
             return False
 
         frame = self._get_sections_frame()
@@ -1436,7 +1891,14 @@ class ActivitySections:
         try:
             li = frame.find_element(By.ID, li_id)
         except Exception as e:
-            logger.error("Could not locate section list item with id=%r: %s", li_id, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not locate section list item",
+                section_id=li_id,
+                exception=str(e),
+                level="error",
+                **ctx,
+            )
             return False
 
         # 2) Click the edit (pencil) button to toggle the input visible (best effort)
@@ -1447,10 +1909,13 @@ class ActivitySections:
             )
             driver.execute_script("arguments[0].click();", edit_btn)
         except Exception as e:
-            logger.warning(
-                "Could not click section edit button for id=%s (proceeding anyway): %s",
-                handle.section_id,
-                e,
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not click section edit button (proceeding anyway)",
+                section_id=handle.section_id,
+                exception=str(e),
+                level="warning",
+                **ctx,
             )
 
         # 3) Find the input inside this <li> (presence is enough)
@@ -1465,10 +1930,13 @@ class ActivitySections:
                 time.sleep(0.2)
 
         if input_el is None:
-            logger.error(
-                "Timed out locating section title input for id=%s using selector %r",
-                handle.section_id,
-                input_selector,
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Timed out locating section title input",
+                section_id=handle.section_id,
+                input_selector=input_selector,
+                level="error",
+                **ctx,
             )
             return False
 
@@ -1495,7 +1963,15 @@ class ActivitySections:
             """
             driver.execute_script(js, input_el, new_title)
         except Exception as e:
-            logger.error("Failed to set new section title %r for id=%s via JS: %s", new_title, handle.section_id, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Failed to set new section title via JS",
+                new_title=new_title,
+                section_id=handle.section_id,
+                exception=str(e),
+                level="error",
+                **ctx,
+            )
             return False
 
         # 5) Try to wait for the reflector <h4> text to update (best effort)
@@ -1508,18 +1984,24 @@ class ActivitySections:
                     break
                 time.sleep(0.2)
             else:
-                logger.warning(
-                    "Reflector text for id=%s did not update to %r within timeout (current=%r).",
-                    handle.section_id,
-                    new_title,
-                    reflector.text.strip(),
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Reflector text did not update within timeout",
+                    section_id=handle.section_id,
+                    new_title=new_title,
+                    current_text=reflector.text.strip(),
+                    level="warning",
+                    **ctx,
                 )
         except Exception as e:
-            logger.warning(
-                "Could not read reflector text for id=%s after rename (wanted %r): %s",
-                handle.section_id,
-                new_title,
-                e,
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not read reflector text after rename",
+                section_id=handle.section_id,
+                new_title=new_title,
+                exception=str(e),
+                level="warning",
+                **ctx,
             )
 
         # 6) Update handle + registry
@@ -1527,7 +2009,13 @@ class ActivitySections:
         self.current_section_handle = new_handle
         self.registry.add_or_update_section(new_handle)
 
-        logger.info("Renamed section id=%s to %r.", new_handle.section_id, new_title)
+        self.session.emit_signal(
+            Cat.SECTION,
+            "Renamed section",
+            section_id=new_handle.section_id,
+            new_title=new_title,
+            **ctx,
+        )
         return True
 
     def wait_for_canvas_for_current_section(self, timeout: int = 10) -> bool:
@@ -1537,16 +2025,18 @@ class ActivitySections:
 
         Best-effort: logs a warning on timeout but does not raise.
         """
-        logger = self.logger
         driver = self.driver
+        ctx = self._section_ctx(action="canvas_align")
 
         self.session.counters.inc("section.canvas_align_checks")
 
         handle = self.current_section_handle
         if not handle or not handle.section_id:
-            logger.warning(
-                "wait_for_canvas_for_current_section called but no current_section_handle "
-                "or section_id is set."
+            self.session.emit_signal(
+                Cat.SECTION,
+                "wait_for_canvas_for_current_section called but no current_section_handle or section_id is set",
+                level="warning",
+                **ctx,
             )
             return False
 
@@ -1579,20 +2069,30 @@ class ActivitySections:
 
             try:
                 wait.until(_canvas_is_information)
-                logger.info("Canvas now aligned with Information section (wait_for_canvas_for_current_section).")
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Canvas now aligned with Information section",
+                    **ctx,
+                )
                 return True
             except TimeoutException:
-                logger.warning(
-                    "Timed out waiting for canvas to align with Information (expected URL containing %r).",
-                    info_fragment,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Timed out waiting for canvas to align with Information",
+                    info_fragment=info_fragment,
+                    level="warning",
+                    **ctx,
                 )
                 return False
 
         # --- NORMAL SECTION CASE ---
         if not section_id:
-            logger.warning(
-                "Current section handle has no section_id (title=%r); cannot verify canvas alignment.",
-                handle.title,
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Current section handle has no section_id; cannot verify canvas alignment",
+                section_title=handle.title,
+                level="warning",
+                **ctx,
             )
             return False
 
@@ -1624,13 +2124,21 @@ class ActivitySections:
 
         try:
             wait.until(_canvas_matches_section)
-            logger.info(
-                "Canvas now aligned with section id=%s (wait_for_canvas_for_current_section).",
-                section_id,
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Canvas now aligned with section",
+                section_id=section_id,
+                **ctx,
             )
             return True
         except TimeoutException:
-            logger.warning("Timed out waiting for canvas to align with section id=%s.", section_id)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Timed out waiting for canvas to align with section",
+                section_id=section_id,
+                level="warning",
+                **ctx,
+            )
             return False
         
     # ------------------------------------------------------------------
@@ -1648,7 +2156,7 @@ class ActivitySections:
         """
         driver = self.driver
         wait = self.wait
-        logger = self.logger
+        ctx = self._section_ctx(action="delete_section")
 
         sec_id = section_el.get_attribute("id") or "<no-id>"
 
@@ -1668,7 +2176,12 @@ class ActivitySections:
                 "a[data-turbo-method='delete']",
             )
 
-            logger.info("Clicking delete control for section %s via JS...", sec_id)
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Clicking delete control for section via JS",
+                section_id=sec_id,
+                **ctx,
+            )
             driver.execute_script("arguments[0].click();", delete_link)
 
             if hasattr(self.session, "handle_modal_dialogs"):
@@ -1678,10 +2191,13 @@ class ActivitySections:
                         timeout=confirm_timeout,
                     )
                 except Exception as e:
-                    logger.warning(
-                        "Error while handling delete-section modal for %s: %s",
-                        sec_id,
-                        e,
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        "Error while handling delete-section modal",
+                        section_id=sec_id,
+                        exception=str(e),
+                        level="warning",
+                        **ctx,
                     )
 
             def section_gone(_):
@@ -1693,20 +2209,42 @@ class ActivitySections:
 
             try:
                 wait.until(section_gone)
-                logger.info("Section %s deleted (no longer present in DOM).", sec_id)
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Section deleted (no longer present in DOM)",
+                    section_id=sec_id,
+                    **ctx,
+                )
                 return True
             except TimeoutException:
-                logger.warning(
-                    "Timeout waiting for section %s to disappear after delete.",
-                    sec_id,
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Timeout waiting for section to disappear after delete",
+                    section_id=sec_id,
+                    level="warning",
+                    **ctx,
                 )
                 return False
 
         except WebDriverException as e:
-            logger.warning("Could not delete section %s: %s", sec_id, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Could not delete section",
+                section_id=sec_id,
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
             return False
         except Exception as e:
-            logger.warning("Unexpected error deleting section %s: %s", sec_id, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Unexpected error deleting section",
+                section_id=sec_id,
+                exception=str(e),
+                level="warning",
+                **ctx,
+            )
             return False
 
     def delete(
@@ -1718,7 +2256,7 @@ class ActivitySections:
         """
         Delete a single section by title *or* by index.
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="delete")
 
         if title is not None and index is not None:
             raise ValueError("Provide either 'title' or 'index', not both.")
@@ -1728,12 +2266,24 @@ class ActivitySections:
         if title is not None:
             sec_el = self.select_by_title(title)
             if sec_el is None:
-                logger.warning("No section found with title %r to delete.", title)
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "No section found with title to delete",
+                    title=title,
+                    level="warning",
+                    **ctx,
+                )
                 return False
         else:
             sec_el = self.select_by_index(index or 0)
             if sec_el is None:
-                logger.warning("No section found at index %r to delete.", index)
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "No section found at index to delete",
+                    index=index,
+                    level="warning",
+                    **ctx,
+                )
                 return False
 
         return self._delete_section_element(sec_el, confirm_timeout=confirm_timeout)
@@ -1757,7 +2307,7 @@ class ActivitySections:
               - >0 => section was kept and that many fields were cleared
               - -1 => operation failed for that section
         """
-        logger = self.logger
+        ctx = self._section_ctx(action="delete_all")
         results: dict[str, int] = {}
 
         if skip_titles is None:
@@ -1766,36 +2316,60 @@ class ActivitySections:
             skip_titles = set(skip_titles)
 
         if not self._ensure_sidebar_visible():
-            logger.error("Sections sidebar not visible; cannot delete sections.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Sections sidebar not visible; cannot delete sections",
+                level="error",
+                **ctx,
+            )
             return results
 
         sections = self.list()
         if not sections:
-            logger.info("No sections to delete.")
+            self.session.emit_diag(
+                Cat.SECTION,
+                "No sections to delete",
+                **ctx,
+            )
             return results
 
         # Iterate from bottom to top so indices don't shift undesirably when deleting
         for sec_el in reversed(sections):
             title = self.get_title(sec_el) or "<unnamed>"
-            logger.info("Processing section %r.", title)
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Processing section",
+                section_title=title,
+                **ctx,
+            )
 
             if title in skip_titles:
-                logger.info("Skipping deletion of protected section %r.", title)
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Skipping deletion of protected section",
+                    section_title=title,
+                    **ctx,
+                )
                 deleted_count = 0
                 if clear_skipped_sections:
                     try:
                         if self._select(sec_el):
                             deleted_count = self.deleter.delete_all_fields()
-                            logger.info(
-                                "Cleared %d field(s) from protected section %r.",
-                                deleted_count,
-                                title,
+                            self.session.emit_diag(
+                                Cat.SECTION,
+                                "Cleared fields from protected section",
+                                section_title=title,
+                                deleted_count=deleted_count,
+                                **ctx,
                             )
                     except Exception as e:
-                        logger.warning(
-                            "Failed to clear fields from protected section %r: %s",
-                            title,
-                            e,
+                        self.session.emit_signal(
+                            Cat.SECTION,
+                            "Failed to clear fields from protected section",
+                            section_title=title,
+                            exception=str(e),
+                            level="warning",
+                            **ctx,
                         )
                         deleted_count = -1
 
@@ -1805,7 +2379,13 @@ class ActivitySections:
             if self._delete_section_element(sec_el):
                 results[title] = 0
             else:
-                logger.warning("Failed to delete section %r.", title)
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Failed to delete section",
+                    section_title=title,
+                    level="warning",
+                    **ctx,
+                )
                 results[title] = -1
 
         return results

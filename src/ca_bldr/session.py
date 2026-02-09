@@ -54,6 +54,32 @@ class CASession:
         )
         self.counters = Counters()
         self._rate = RateLimiter()
+        self.emit_signal(
+            Cat.STARTUP,
+            "Session initialized",
+            kind="startup",
+            log_mode=mode.value,
+            wait_time=config.WAIT_TIME,
+        )
+
+    def _ctx(
+        self,
+        *,
+        kind: str | None = None,
+        attempt: int | None = None,
+        label: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        ctx: dict[str, Any] = {}
+        if kind:
+            ctx["kind"] = kind
+        if attempt is not None:
+            ctx["a"] = attempt
+        if label:
+            ctx["label"] = label
+        if extra:
+            ctx.update(extra)
+        return ctx
 
     def get_wait(self, timeout: int | None = None) -> WebDriverWait:
         """
@@ -71,14 +97,23 @@ class CASession:
         # Raises LoginError if login does not succeed.
         self.driver.get(config.CA_DASHBOARD_URL)
         self.wait.until(EC.url_contains(config.CA_BASE_DOMAIN))
+        ctx = self._ctx(kind="login")
 
         # If we're already on the dashboard, nothing to do
         if not self.driver.current_url.startswith(config.CA_LOGIN_URL):
-            self.logger.debug("Already logged in at %s", self.driver.current_url)
+            self.emit_diag(
+                Cat.NAV,
+                f"Already logged in at {self.driver.current_url}",
+                **ctx,
+            )
             return
         
         # Otherwise, perform login
-        self.logger.info("Logging into Cloud Assess...")
+        self.emit_signal(
+            Cat.NAV,
+            "Logging into Cloud Assess...",
+            **ctx,
+        )
         u = self.driver.find_element(By.ID, config.SELECTORS["username_id"])
         u.clear()
         u.send_keys(self.username or "")
@@ -95,12 +130,21 @@ class CASession:
         # - we stay on login page and see an error message
         try:
             self.wait.until(EC.url_contains(config.CA_DASHBOARD_URL))
-            self.logger.info("Logged in successfully.")
+            self.emit_signal(
+                Cat.NAV,
+                "Logged in successfully.",
+                **ctx,
+            )
             return
         except Exception:
             # Still on login page or somewhere unexpected
             current = self.driver.current_url
-            self.logger.error(f"Did not reach dashboard after login attempt (URL={current})")
+            self.emit_signal(
+                Cat.NAV,
+                f"Did not reach dashboard after login attempt (URL={current})",
+                level="error",
+                **ctx,
+            )
 
             # Try to detect a CA error message on the login page (flash alert)
             error_text = None
@@ -113,9 +157,19 @@ class CASession:
                 pass
 
             if error_text:
-                self.logger.error(f"Cloud Assess reported a login error: {error_text}")
+                self.emit_signal(
+                    Cat.NAV,
+                    f"Cloud Assess reported a login error: {error_text}",
+                    level="error",
+                    **ctx,
+                )
             else:
-                self.logger.error("No explicit error message found on login page.")
+                self.emit_signal(
+                    Cat.NAV,
+                    "No explicit error message found on login page.",
+                    level="error",
+                    **ctx,
+                )
 
             # # Optional: save screenshot for debugging
             # try:
@@ -164,7 +218,6 @@ class CASession:
             True if click (and optional post_wait) succeeded, else False.
         """
         driver = self.driver
-        logger = self.logger
         wait = self.wait
 
         if not label:
@@ -177,6 +230,8 @@ class CASession:
                 except Exception:
                     html = ""
                 label = html[:120] if html else "<element>"
+
+        ctx_base = self._ctx(kind="click", label=label)
 
         def _resolve_element() -> WebElement:
             if isinstance(target, tuple):
@@ -195,7 +250,12 @@ class CASession:
             try:
                 el = _resolve_element()
                 if el is None:
-                    logger.warning("click_element_safely: could not resolve element %s", label or target)
+                    self.emit_signal(
+                        Cat.UISTATE,
+                        f"click_element_safely: could not resolve element {label or target}",
+                        level="warning",
+                        **self._ctx(kind="click", label=label, attempt=attempt),
+                    )
                     continue
 
                 # Ensure it's interactable (best effort)
@@ -219,13 +279,16 @@ class CASession:
 
                 try:
                     el.click()
-                    logger.debug("click_element_safely: clicked (native) %s on attempt %d", label or "", attempt)
+                    self.emit_diag(
+                        Cat.UISTATE,
+                        f"click_element_safely: clicked (native) {label or ''} on attempt {attempt}",
+                        **self._ctx(kind="click", label=label, attempt=attempt),
+                    )
                 except (ElementClickInterceptedException, ElementNotInteractableException, WebDriverException) as e:
-                    logger.debug(
-                        "click_element_safely: native click failed %s on attempt %d: %s",
-                        label or "",
-                        attempt,
-                        e,
+                    self.emit_diag(
+                        Cat.UISTATE,
+                        f"click_element_safely: native click failed {label or ''} on attempt {attempt}: {e}",
+                        **self._ctx(kind="click", label=label, attempt=attempt),
                     )
                     if not use_js_fallback:
                         raise
@@ -233,13 +296,16 @@ class CASession:
                     # JS click fallback
                     try:
                         driver.execute_script("arguments[0].click();", el)
-                        logger.debug("click_element_safely: clicked (js) %s on attempt %d", label or "", attempt)
+                        self.emit_diag(
+                            Cat.UISTATE,
+                            f"click_element_safely: clicked (js) {label or ''} on attempt {attempt}",
+                            **self._ctx(kind="click", label=label, attempt=attempt),
+                        )
                     except Exception as e2:
-                        logger.debug(
-                            "click_element_safely: JS click failed %s on attempt %d: %s",
-                            label or "",
-                            attempt,
-                            e2,
+                        self.emit_diag(
+                            Cat.UISTATE,
+                            f"click_element_safely: JS click failed {label or ''} on attempt {attempt}: {e2}",
+                            **self._ctx(kind="click", label=label, attempt=attempt),
                         )
                         raise
 
@@ -250,10 +316,11 @@ class CASession:
                             EC.presence_of_element_located(post_wait)
                         )
                     except TimeoutException:
-                        logger.warning(
-                            "click_element_safely: post_wait not satisfied after click %s (attempt %d).",
-                            label or "",
-                            attempt,
+                        self.emit_signal(
+                            Cat.UISTATE,
+                            f"click_element_safely: post_wait not satisfied after click {label or ''} (attempt {attempt}).",
+                            level="warning",
+                            **self._ctx(kind="click", label=label, attempt=attempt),
                         )
                         # This may still be a valid click in Turbo UI; retry if attempts remain
                         if attempt < retries:
@@ -264,33 +331,36 @@ class CASession:
                 return True
 
             except StaleElementReferenceException:
-                logger.debug(
-                    "click_element_safely: stale element %s on attempt %d; retrying...",
-                    label or "",
-                    attempt,
+                self.emit_diag(
+                    Cat.UISTATE,
+                    f"click_element_safely: stale element {label or ''} on attempt {attempt}; retrying...",
+                    **self._ctx(kind="click", label=label, attempt=attempt),
                 )
                 time.sleep(0.2)
                 continue
             except TimeoutException as e:
-                logger.debug(
-                    "click_element_safely: timeout locating/clicking %s on attempt %d: %s",
-                    label or "",
-                    attempt,
-                    e,
+                self.emit_diag(
+                    Cat.UISTATE,
+                    f"click_element_safely: timeout locating/clicking {label or ''} on attempt {attempt}: {e}",
+                    **self._ctx(kind="click", label=label, attempt=attempt),
                 )
                 time.sleep(0.2)
                 continue
             except Exception as e:
-                logger.debug(
-                    "click_element_safely: unexpected error %s on attempt %d: %s",
-                    label or "",
-                    attempt,
-                    e,
+                self.emit_diag(
+                    Cat.UISTATE,
+                    f"click_element_safely: unexpected error {label or ''} on attempt {attempt}: {e}",
+                    **self._ctx(kind="click", label=label, attempt=attempt),
                 )
                 time.sleep(0.2)
                 continue
 
-        logger.warning("click_element_safely: giving up on %s after %d attempts.", label or target, retries)
+        self.emit_signal(
+            Cat.UISTATE,
+            f"click_element_safely: giving up on {label or target} after {retries} attempts.",
+            level="warning",
+            **ctx_base,
+        )
         return False
     
     def handle_modal_dialogs(self, mode: str = "confirm", timeout: int = 10) -> bool:
@@ -307,14 +377,19 @@ class CASession:
         """
         driver = self.driver
         wait = self.get_wait(timeout)
-        logger = self.logger
+        ctx = self._ctx(kind="modal", mode=mode)
 
         # We look for a generic visible modal. CA appears to use standard
         # Bootstrap-style modals, so we'll use '.modal.show' as a starting point.
         modal_sel = ".modal.show, [role='dialog'][aria-modal='true']"
 
         try:
-            logger.info(f"Waiting for modal dialog (mode='{mode}') up to {timeout}s...")
+            self.counters.inc("session.modal_waits")
+            self.emit_diag(
+                Cat.UISTATE,
+                f"Waiting for modal dialog (mode='{mode}') up to {timeout}s...",
+                **ctx,
+            )
 
             def modal_visible(_):
                 try:
@@ -327,7 +402,11 @@ class CASession:
             try:
                 wait.until(modal_visible)
             except TimeoutException:
-                logger.info("No modal dialog appeared within timeout.")
+                self.emit_diag(
+                    Cat.UISTATE,
+                    "No modal dialog appeared within timeout.",
+                    **ctx,
+                )
                 return False
 
             # At this point, we should have at least one visible modal
@@ -337,11 +416,20 @@ class CASession:
                 if el.is_displayed()
             ]
             if not modals:
-                logger.info("Modal seemed to appear then disappear; nothing to handle.")
+                self.emit_diag(
+                    Cat.UISTATE,
+                    "Modal seemed to appear then disappear; nothing to handle.",
+                    **ctx,
+                )
                 return False
 
             modal = modals[-1]  # assume the last one is the active one
-            logger.info("Modal dialog detected; attempting to handle it...")
+            self.counters.inc("session.modal_seen")
+            self.emit_diag(
+                Cat.UISTATE,
+                "Modal dialog detected; attempting to handle it...",
+                **ctx,
+            )
 
             # Gather clickable candidates inside the modal
             buttons = modal.find_elements(By.CSS_SELECTOR, "button, a.btn, a[role='button']")
@@ -380,10 +468,19 @@ class CASession:
                             confirm_btn = b
                             break
                 if not confirm_btn:
-                    logger.warning("No suitable confirm button found in modal.")
+                    self.emit_signal(
+                        Cat.UISTATE,
+                        "No suitable confirm button found in modal.",
+                        level="warning",
+                        **ctx,
+                    )
                     return False
 
-                logger.info(f"Clicking confirm button in modal: '{confirm_btn.text.strip()}'")
+                self.emit_diag(
+                    Cat.UISTATE,
+                    f"Clicking confirm button in modal: '{confirm_btn.text.strip()}'",
+                    **ctx,
+                )
                 driver.execute_script("arguments[0].click();", confirm_btn)
 
             elif mode == "cancel":
@@ -399,14 +496,28 @@ class CASession:
                             cancel_btn = b
                             break
                 if not cancel_btn:
-                    logger.warning("No suitable cancel button found in modal.")
+                    self.emit_signal(
+                        Cat.UISTATE,
+                        "No suitable cancel button found in modal.",
+                        level="warning",
+                        **ctx,
+                    )
                     return False
 
-                logger.info(f"Clicking cancel button in modal: '{cancel_btn.text.strip()}'")
+                self.emit_diag(
+                    Cat.UISTATE,
+                    f"Clicking cancel button in modal: '{cancel_btn.text.strip()}'",
+                    **ctx,
+                )
                 driver.execute_script("arguments[0].click();", cancel_btn)
 
             else:
-                logger.warning(f"Unknown modal handling mode: {mode}")
+                self.emit_signal(
+                    Cat.UISTATE,
+                    f"Unknown modal handling mode: {mode}",
+                    level="warning",
+                    **ctx,
+                )
                 return False
             
             # --- Wait for modal to close, then clean up body state ---
@@ -420,9 +531,19 @@ class CASession:
 
             try:
                 wait.until(no_visible_modal)
-                logger.info("Modal dialog has closed.")
+                self.counters.inc("session.modal_closed")
+                self.emit_diag(
+                    Cat.UISTATE,
+                    "Modal dialog has closed.",
+                    **ctx,
+                )
             except TimeoutException:
-                logger.warning("Modal dialog did not fully close within timeout.")
+                self.emit_signal(
+                    Cat.UISTATE,
+                    "Modal dialog did not fully close within timeout.",
+                    level="warning",
+                    **ctx,
+                )
 
             # Clean up typical Bootstrap-style 'modal-open' artifacts
             try:
@@ -467,17 +588,35 @@ class CASession:
                         window.dispatchEvent(new Event('resize'));
                     })();
                 """)
-                logger.info("Body/html scroll and overlay state cleaned after modal.")
+                self.emit_diag(
+                    Cat.UISTATE,
+                    "Body/html scroll and overlay state cleaned after modal.",
+                    **ctx,
+                )
             except Exception as e:
-                logger.debug(f"Ignoring error while cleaning scroll/overlay state: {e}")
+                self.emit_diag(
+                    Cat.UISTATE,
+                    f"Ignoring error while cleaning scroll/overlay state: {e}",
+                    **ctx,
+                )
 
             return True        
 
         except WebDriverException as e:
-            logger.warning(f"WebDriverException while handling modal dialog: {e}")
+            self.emit_signal(
+                Cat.UISTATE,
+                f"WebDriverException while handling modal dialog: {e}",
+                level="warning",
+                **ctx,
+            )
             return False
         except Exception as e:
-            logger.warning(f"Unexpected error while handling modal dialog: {e}")
+            self.emit_signal(
+                Cat.UISTATE,
+                f"Unexpected error while handling modal dialog: {e}",
+                level="warning",
+                **ctx,
+            )
             return False
 
     def clear_and_type(self, el: WebElement, text: str, *, click_first: bool = True) -> None:
@@ -506,7 +645,7 @@ class CASession:
         )
         driver = self.driver
         wait = self.wait
-        logger = self.logger
+        ctx = self._ctx(kind="templates_nav", status="inactive" if inactive else "active")
 
         if not force:
             url = ""
@@ -522,15 +661,25 @@ class CASession:
                 # DOM sentinel to prevent false positives
                 try:
                     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "turbo-frame#templates")))
-                    logger.info(
-                        "Already on Activity Templates page (%s); skipping navigation.",
-                        "inactive" if inactive else "active",
+                    self.emit_diag(
+                        Cat.NAV,
+                        f"Already on Activity Templates page ({'inactive' if inactive else 'active'}); skipping navigation.",
+                        **ctx,
                     )
                     return
                 except TimeoutException:
-                    logger.info("Templates URL matches, but frame sentinel missing; reloading page.")
+                    self.emit_signal(
+                        Cat.NAV,
+                        "Templates URL matches, but frame sentinel missing; reloading page.",
+                        level="warning",
+                        **ctx,
+                    )
 
-        logger.info("Navigating to Activity Templates page: %s", target)
+        self.emit_signal(
+            Cat.NAV,
+            f"Navigating to Activity Templates page: {target}",
+            **ctx,
+        )
         driver.get(target)
 
         # Post-nav confirm (best effort)
@@ -541,7 +690,12 @@ class CASession:
                 )
             )
         except TimeoutException:
-            logger.warning("Activity Templates page loaded but 'Create Activity' button not detected (timeout=%s).", timeout)
+            self.emit_signal(
+                Cat.NAV,
+                f"Activity Templates page loaded but 'Create Activity' button not detected (timeout={timeout}).",
+                level="warning",
+                **ctx,
+            )
 
     def close(self):
         self.driver.quit()
@@ -807,18 +961,14 @@ class CASession:
         """
         Single formatting point so logs are consistent.
         """
-        logger = self.logger
         msg = "UI_PROBE: %s" % probe
-        if level == "debug":
-            logger.debug(msg)
-        elif level == "warning":
-            logger.warning(msg)
-        else:
-            logger.info(msg)
+        self.emit_diag(
+            Cat.UISTATE,
+            msg,
+            **self._ctx(kind="ui_probe", level=level),
+        )
 
     def log_ui_probe_heavy(self, probe: dict[str, Any], *, level: str = "warning") -> None:
-        logger = self.logger
-
         # Short headline first (easy to scan in logs)
         expected = probe.get("expected", {})
         observed = probe.get("observed", {})
@@ -835,12 +985,11 @@ class CASession:
 
         msg = f"UI_PROBE_HEAVY: headline={headline} details={probe}"
 
-        if level == "debug":
-            logger.debug(msg)
-        elif level == "info":
-            logger.info(msg)
-        else:
-            logger.warning(msg)
+        self.emit_diag(
+            Cat.UISTATE,
+            msg,
+            **self._ctx(kind="ui_probe_heavy", level=level),
+        )
 
     def _norm_title(self,s: str) -> str:
         return re.sub(r"\s+", " ", (s or "").strip()).casefold()
@@ -860,8 +1009,8 @@ class CASession:
         - Proves Turbo updates via staleness of a known element (no sleeps).
         - Falls back to pagination scan if needed.
         """
-        logger = self.logger
         target = self._norm_title(title)
+        ctx = self._ctx(kind="template_search", status=status, title=title)
 
         self.go_to_activity_templates(inactive=(status == "inactive"))
 
@@ -880,7 +1029,11 @@ class CASession:
             # Changing items triggers a turbo stream update; best-effort prove by waiting for frame to be ready again
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
         except Exception as e:
-            logger.debug("Could not set results per page (continuing): %s", e)
+            self.emit_diag(
+                Cat.NAV,
+                f"Could not set results per page (continuing): {e}",
+                **ctx,
+            )
 
         # Grab a "before" element to prove update after typing
         before_first_row = None
@@ -996,14 +1149,25 @@ class CASession:
             return True
         return False
     
-    def emit_signal(self, cat: Cat, msg: str, **ctx):
+    def emit_signal(self, cat: Cat, msg: str, *, level: str | int = "info", **ctx):
         # always allowed
         prefix = f"[{cat}]"
         if self.instr_policy.include_ctx:
             c = format_ctx(**ctx)
             if c:
                 msg = f"{msg} :: {c}"
-        self.logger.info(f"{prefix} {msg}")
+        if isinstance(level, int):
+            self.logger.log(level, f"{prefix} {msg}")
+            return
+        lvl = (level or "info").lower()
+        if lvl in ("warn", "warning"):
+            self.logger.warning(f"{prefix} {msg}")
+        elif lvl in ("error", "err", "critical", "fatal"):
+            self.logger.error(f"{prefix} {msg}")
+        elif lvl in ("debug", "trace"):
+            self.logger.debug(f"{prefix} {msg}")
+        else:
+            self.logger.info(f"{prefix} {msg}")
 
     def emit_diag(self, cat: Cat, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx):
         # gated by mode; DEBUG+ only for now

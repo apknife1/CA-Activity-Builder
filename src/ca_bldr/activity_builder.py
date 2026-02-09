@@ -64,14 +64,16 @@ class CAActivityBuilder:
         self.hard_resync_count = 0
 
     def _ctx(self, *, kind: str | None = None, sec=None, fid=None, spec=None, fi=None, a: str | None=None) -> dict[str, Any]:
-        return {
+        ctx = {
             "sec": sec or (self.sections.current_section_id or ""),
             "kind": kind or "",
             "fid": fid,
             "type": getattr(spec, "key", None) if spec else None,
             "fi": fi,
-            "a": a,
         }
+        if a is not None:
+            ctx["a"] = a
+        return ctx
 
     def open_dev_unit(self, unit_url: str):
         self.session.emit_diag(
@@ -123,6 +125,7 @@ class CAActivityBuilder:
                 Cat.SIDEBAR,
                 f"Config error: missing tab selector for kind={kind}",
                 kind=kind,
+                level="error",
             )
             return False
 
@@ -208,6 +211,7 @@ class CAActivityBuilder:
                     self.session.emit_signal(
                         Cat.SIDEBAR,
                         f"Sections toggle button not found",
+                        level="error",
                         **ctx_attempt,
                     )
                     return False
@@ -226,6 +230,7 @@ class CAActivityBuilder:
                 self.session.emit_signal(
                     Cat.SIDEBAR,
                     f"Unknown sidebar kind: {kind}.",
+                    level="error",
                     **ctx_attempt,
                 )
                 return False
@@ -246,6 +251,7 @@ class CAActivityBuilder:
                         self.session.emit_signal(
                             Cat.SIDEBAR,
                             f"FAILED to click {kind} sidebar toggle after {max_attempts} attempts",
+                            level="error",
                             **ctx_attempt,
                         )
                         return False
@@ -295,6 +301,7 @@ class CAActivityBuilder:
                     self.session.emit_signal(
                         Cat.SIDEBAR,
                         f"Timed out ensuring {kind} sidebar visibility after {max_attempts} attempts",
+                        level="warning",
                         **ctx_attempt,
                     )
                     return False
@@ -309,6 +316,7 @@ class CAActivityBuilder:
                     self.session.emit_signal(
                         Cat.SIDEBAR,
                         f"Giving up ensuring {kind} sidebar visibility after {max_attempts} attempts due to stale elements.",
+                        level="error",
                         **ctx_attempt,
                     )
                     return False
@@ -323,6 +331,7 @@ class CAActivityBuilder:
                     self.session.emit_signal(
                         Cat.SIDEBAR,
                         f"Giving up ensuring {kind} sidebar visibility after {max_attempts} attempts due to WebDriver errors.",
+                        level="error",
                         **ctx_attempt,
                     )
                     return False
@@ -330,6 +339,7 @@ class CAActivityBuilder:
                 self.session.emit_signal(
                     Cat.SIDEBAR,
                     f"Unexpected error while ensuring {kind} sidebar visibility on attempt {attempt}: {str(e)}",
+                    level="error",
                     **ctx_attempt,
                 )
                 return False
@@ -338,6 +348,7 @@ class CAActivityBuilder:
         self.session.emit_signal(
             Cat.SIDEBAR,
             f"Unexpected outcome while ensuring {kind} sidebar visibility. Needs investigation.",
+            level="error",
             **ctx,
         )
         return False
@@ -381,6 +392,7 @@ class CAActivityBuilder:
             self.session.emit_signal(
                 Cat.SIDEBAR,
                 "Fields sidebar root not visible when activating tab",
+                level="error",
                 **ctx,
             )
             return None
@@ -391,6 +403,7 @@ class CAActivityBuilder:
             self.session.emit_signal(
                 Cat.SIDEBAR,
                 f"Could not find tab button '{spec.sidebar_tab_label}'",
+                level="error",
                 **ctx,
             )
             return None
@@ -408,6 +421,7 @@ class CAActivityBuilder:
             self.session.emit_signal(
                 Cat.SIDEBAR,
                 f"Could not click '{spec.sidebar_tab_label}' tab button",
+                level="error",
                 **ctx,
             )
             return None
@@ -523,6 +537,7 @@ class CAActivityBuilder:
                     Cat.PHANTOM,
                     "Hard resync already used for this add attempt",
                     reason=reason,
+                    level="warning",
                     **ctx,
                 )
                 return False
@@ -549,6 +564,7 @@ class CAActivityBuilder:
                     count=self.hard_resync_count,
                     limit=max_resync,
                     reason=reason,
+                    level="warning",
                     **ctx,
                 )
                 if abort_on_fail:
@@ -562,6 +578,7 @@ class CAActivityBuilder:
                     Cat.PHANTOM,
                     "Hard resync helper missing",
                     reason=reason,
+                    level="warning",
                     **ctx,
                 )
                 if abort_on_fail:
@@ -585,6 +602,7 @@ class CAActivityBuilder:
                     Cat.PHANTOM,
                     "Hard resync attempt failed",
                     reason=reason,
+                    level="warning",
                     **ctx,
                 )
                 if abort_on_fail:
@@ -607,6 +625,7 @@ class CAActivityBuilder:
                 "Could not prepare question section",
                 section_title=section_title,
                 section_index=section_index,
+                level="error",
                 **self._ctx(kind="section_prepare"),
             )
             return None
@@ -619,6 +638,7 @@ class CAActivityBuilder:
                 section_id=sec_handle.section_id,
                 section_title=sec_handle.title,
                 field_type=spec.display_name,
+                level="error",
                 **self._ctx(kind="canvas_align"),
             )
             return None
@@ -628,6 +648,7 @@ class CAActivityBuilder:
             self.session.emit_signal(
                 Cat.SECTION,
                 "Section fields container missing",
+                level="error",
                 **self._ctx(kind="section_mode"),
             )
             return None
@@ -949,6 +970,7 @@ class CAActivityBuilder:
                     self.session.emit_signal(
                         Cat.PHANTOM,
                         "Field creation not confirmed within timeout; attempting DOM-delta recovery",
+                        level="warning",
                         **phantom_ctx,
                     )
 
@@ -980,6 +1002,7 @@ class CAActivityBuilder:
                         self.session.emit_signal(
                             Cat.PHANTOM,
                             "Empty-section phantom detected; retrying locally before hard resync",
+                            level="warning",
                             **phantom_ctx,
                         )
 
@@ -1003,6 +1026,7 @@ class CAActivityBuilder:
                         self.session.emit_signal(
                             Cat.PHANTOM,
                             "Empty-section phantom persisted on final create attempt; allowing hard resync",
+                            level="warning",
                             **phantom_ctx,
                         )
 
@@ -1157,6 +1181,7 @@ class CAActivityBuilder:
                                 Cat.PHANTOM,
                                 "No acceptable new field found after drag success; attempting hard resync",
                                 max_attempts=max_create_attempts,
+                                level="warning",
                                 **phantom_ctx,
                             )
 
@@ -1428,6 +1453,7 @@ class CAActivityBuilder:
             self.session.emit_signal(
                 Cat.DROP,
                 "Failed to obtain new field handle after drag/drop attempts",
+                level="error",
                 **self._ctx(kind="drop", spec=spec, fi=fi_index, a="finalize"),
             )
             return None
@@ -1438,6 +1464,7 @@ class CAActivityBuilder:
             self.session.emit_signal(
                 Cat.REG,
                 "Could not infer field id for newly created field",
+                level="error",
                 **self._ctx(kind="registry", spec=spec, fi=fi_index, a="finalize"),
             )
             handle = FieldHandle(
@@ -1495,6 +1522,7 @@ class CAActivityBuilder:
             self.session.emit_signal(
                 Cat.SIDEBAR,
                 "Fields sidebar could not be shown; cannot select tab",
+                level="error",
                 **ctx,
             )
             return None
@@ -1509,6 +1537,7 @@ class CAActivityBuilder:
                     "Could not activate fields tab",
                     a=f"attempt={attempt}/3",
                     tab=spec.sidebar_tab_label,
+                    level="warning",
                     **ctx,
                 )
                 if attempt == 3:
@@ -1637,6 +1666,7 @@ class CAActivityBuilder:
                     "Timed out waiting for tab and pane to become active",
                     a=f"attempt={attempt}/3",
                     tab=spec.sidebar_tab_label,
+                    level="warning",
                     **ctx,
                 )
                 # try again if attempts remain
@@ -1657,6 +1687,7 @@ class CAActivityBuilder:
             Cat.SIDEBAR,
             "Failed to ensure field tab visible after retries",
             tab=spec.sidebar_tab_label,
+            level="error",
             **ctx,
         )
         return None
@@ -2573,7 +2604,6 @@ class CAActivityBuilder:
                     self.session.emit_diag(
                         Cat.DROP,
                         "Sortable reorder aborted: invalid anchor for after_field",
-                        anchor_field_id=anchor_field_id,
                         max_attempts=max_attempts,
                         **ctx_attempt,
                     )
@@ -2585,7 +2615,6 @@ class CAActivityBuilder:
                 self.session.emit_diag(
                     Cat.DROP,
                     "Sortable reorder aborted: unknown target",
-                    target=target,
                     **ctx_attempt,
                 )
                 return False
@@ -2623,7 +2652,6 @@ class CAActivityBuilder:
                 self.session.emit_diag(
                     Cat.DROP,
                     "Sortable reorder: drag handle unavailable",
-                    attempt=attempt,
                     max_attempts=max_attempts,
                     **ctx_attempt,
                 )
@@ -2651,9 +2679,7 @@ class CAActivityBuilder:
             self.session.emit_diag(
                 Cat.DROP,
                 "Sortable reorder attempt",
-                attempt=attempt,
                 max_attempts=max_attempts,
-                target=target,
                 target_id=target_id,
                 drop_bias=drop_bias,
                 dx=dx,
@@ -2684,7 +2710,6 @@ class CAActivityBuilder:
                     self.session.emit_diag(
                         Cat.DROP,
                         "Sortable reorder: native drag start OK",
-                        attempt=attempt,
                         max_attempts=max_attempts,
                         **ctx_zone,
                     )
@@ -2787,7 +2812,6 @@ class CAActivityBuilder:
                 self.session.emit_diag(
                     Cat.DROP,
                     "Sortable reorder: drag attempt failed unexpectedly",
-                    attempt=attempt,
                     max_attempts=max_attempts,
                     exception=str(e),
                     **ctx_zone,
@@ -2804,8 +2828,6 @@ class CAActivityBuilder:
                 self.session.emit_diag(
                     Cat.DROP,
                     "Sortable reorder: confirmation success",
-                    attempt=attempt,
-                    target=target,
                     ok=True,
                     **ctx_zone,
                 )
@@ -2814,8 +2836,6 @@ class CAActivityBuilder:
                 self.session.emit_diag(
                     Cat.DROP,
                     "Sortable reorder: confirmation still pending (timeout)",
-                    attempt=attempt,
-                    target=target,
                     ok=False,
                     **ctx_zone,
                 )

@@ -1,10 +1,14 @@
 import re
 
+import re
+from typing import Any
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 
 from .activity_registry import ActivityRegistry
+from .instrumentation import Cat
 from .session import CASession
 from .field_handles import FieldHandle
 
@@ -31,8 +35,30 @@ class ActivityDeleter:
         self.session = session
         self.driver = session.driver
         self.wait = session.wait
-        self.logger = session.logger
         self.registry = registry
+
+    def _ctx(
+        self,
+        *,
+        field_id: str | None = None,
+        section_id: str | None = None,
+        field_type: str | None = None,
+        kind: str | None = None,
+        attempt: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        ctx: dict[str, Any] = {
+            "sec": section_id or "",
+            "fid": field_id,
+            "type": field_type,
+        }
+        if kind:
+            ctx["kind"] = kind
+        if attempt:
+            ctx["a"] = attempt
+        if extra:
+            ctx.update(extra)
+        return ctx
 
     # ---------- field discovery ----------
 
@@ -45,7 +71,11 @@ class ActivityDeleter:
         """
         sel = field_selector or self.FIELD_SELECTOR
         fields = self.driver.find_elements(By.CSS_SELECTOR, sel)
-        self.logger.info(f"Found {len(fields)} fields on the canvas (selector='{sel}').")
+        self.session.emit_diag(
+            Cat.SECTION,
+            f"Found {len(fields)} fields on the canvas (selector='{sel}').",
+            **self._ctx(kind="field_discovery"),
+        )
         return fields
 
     def get_last_field(self, field_selector: str | None = None):
@@ -59,7 +89,11 @@ class ActivityDeleter:
         if not fields:
             raise TimeoutException(f"No fields found on the canvas (selector='{field_selector or self.FIELD_SELECTOR}').")
         last = fields[-1]
-        self.logger.info("Using last field on the canvas for deletion.")
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Using last field on the canvas for deletion.",
+            **self._ctx(kind="field_discovery"),
+        )
         return last
 
     # ---------- single-field deletion ----------
@@ -78,7 +112,7 @@ class ActivityDeleter:
         Returns True if it appears to have been deleted, False otherwise.
         """
         driver = self.driver
-        logger = self.logger
+        self.session.counters.inc("deleter.delete_attempts")
 
         # Try to capture something stable to detect deletion (e.g. data attr or id)
         # CA field id (numeric) and raw DOM id for logging
@@ -86,6 +120,7 @@ class ActivityDeleter:
         dom_field_id = field_el.get_attribute("id") or "<no-dom-id>"
 
         id_for_log = ca_field_id or dom_field_id
+        ctx = self._ctx(field_id=ca_field_id, kind="delete_field", dom_id=dom_field_id)
 
         try:
             # 1. Scroll field into view
@@ -105,7 +140,11 @@ class ActivityDeleter:
                 "a[data-turbo-method='delete']"
             )
 
-            logger.info(f"Clicking delete control for field {id_for_log} via JS...")
+            self.session.emit_diag(
+                Cat.SECTION,
+                f"Clicking delete control for field {id_for_log} via JS...",
+                **ctx,
+            )
 
             # 3. Click via JS to avoid any hover/visibility issues
             driver.execute_script("arguments[0].click();", delete_link)
@@ -115,13 +154,25 @@ class ActivityDeleter:
             handled_modal = False
             if hasattr(self.session, "handle_modal_dialogs"):
                 try:
+                    self.session.counters.inc("deleter.modal_waits")
                     handled_modal = self.session.handle_modal_dialogs(
                         mode="confirm",
                         timeout=confirm_timeout
                     )
-                    logger.info(f"Modal handler result for field {id_for_log}: {handled_modal}")
+                    if handled_modal:
+                        self.session.counters.inc("deleter.modal_confirmed")
+                    self.session.emit_diag(
+                        Cat.SECTION,
+                        f"Modal handler result for field {id_for_log}: {handled_modal}",
+                        **ctx,
+                    )
                 except Exception as e:
-                    logger.warning(f"Error while handling modal dialogs: {e}")
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        f"Error while handling modal dialogs: {e}",
+                        level="warning",
+                        **ctx,
+                    )
 
             # 5. Wait for field to disappear from DOM
             def field_gone(_):
@@ -134,26 +185,55 @@ class ActivityDeleter:
 
             try:
                 self.wait.until(field_gone)
-                logger.info(f"Field {id_for_log} deleted (no longer present in DOM).")
+                self.session.counters.inc("deleter.fields_deleted")
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    f"Field {id_for_log} deleted (no longer present in DOM).",
+                    **ctx,
+                )
                 
                 # Update registry: remove this field handle if we know its CA id
                 if ca_field_id:
                     try:
                         self.registry.remove_field(ca_field_id)
-                        logger.debug("Registry: removed field handle for id %s.", ca_field_id)
+                        self.session.emit_diag(
+                            Cat.REG,
+                            f"Registry: removed field handle for id {ca_field_id}.",
+                            **self._ctx(field_id=ca_field_id, kind="registry_remove"),
+                        )
                     except Exception as e:
-                        logger.warning("Registry: error while removing field id %s: %s", ca_field_id, e)
+                        self.session.emit_signal(
+                            Cat.REG,
+                            f"Registry: error while removing field id {ca_field_id}: {e}",
+                            level="warning",
+                            **self._ctx(field_id=ca_field_id, kind="registry_remove"),
+                        )
 
                 return True
             except TimeoutException:
-                logger.warning(f"Timeout waiting for field {id_for_log} to disappear after delete.")
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    f"Timeout waiting for field {id_for_log} to disappear after delete.",
+                    level="warning",
+                    **ctx,
+                )
                 return False
 
         except WebDriverException as e:
-            logger.warning(f"Could not delete field {id_for_log}: {e}")
+            self.session.emit_signal(
+                Cat.SECTION,
+                f"Could not delete field {id_for_log}: {e}",
+                level="warning",
+                **ctx,
+            )
             return False
         except Exception as e:
-            logger.warning(f"Unexpected error while deleting field {id_for_log}: {e}")
+            self.session.emit_signal(
+                Cat.SECTION,
+                f"Unexpected error while deleting field {id_for_log}: {e}",
+                level="warning",
+                **ctx,
+            )
             return False
 
     # ---------- convenience helpers ----------
@@ -167,7 +247,12 @@ class ActivityDeleter:
         try:
             field_el = self.get_last_field(field_selector=field_selector)
         except TimeoutException as e:
-            self.logger.warning(str(e))
+            self.session.emit_signal(
+                Cat.SECTION,
+                str(e),
+                level="warning",
+                **self._ctx(kind="delete_last_field"),
+            )
             return False
 
         return self.delete_field(field_el)
@@ -184,7 +269,11 @@ class ActivityDeleter:
           - etc.
         """
         sel = field_selector or self.FIELD_SELECTOR
-        self.logger.info(f"Starting bulk delete for fields matching selector='{sel}'")
+        self.session.emit_diag(
+            Cat.SECTION,
+            f"Starting bulk delete for fields matching selector='{sel}'",
+            **self._ctx(kind="bulk_delete"),
+        )
 
         count = 0
 
@@ -196,15 +285,20 @@ class ActivityDeleter:
             field_el = fields[-1]  # always delete from the bottom
             if not self.delete_field(field_el):
                 # If a deletion fails, stop rather than looping forever
-                self.logger.warning(
-                    "Deletion of a field failed during bulk delete; stopping early."
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Deletion of a field failed during bulk delete; stopping early.",
+                    level="warning",
+                    **self._ctx(kind="bulk_delete"),
                 )
                 break
 
             count += 1
 
-        self.logger.info(
-            f"Deleted {count} field(s) from the canvas (selector='{sel}')."
+        self.session.emit_diag(
+            Cat.SECTION,
+            f"Deleted {count} field(s) from the canvas (selector='{sel}').",
+            **self._ctx(kind="bulk_delete"),
         )
         return count
     
@@ -215,8 +309,6 @@ class ActivityDeleter:
         This mirrors the logic ActivityEditor uses: we look for known id patterns
         inside the field and extract the numeric suffix.
         """
-        logger = self.logger
-
         # 1) Try model-answer description id
         try:
             model_block = field_el.find_element(
@@ -243,7 +335,11 @@ class ActivityDeleter:
         except NoSuchElementException:
             pass
 
-        logger.debug("Could not infer CA field id for field element during deletion.")
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Could not infer CA field id for field element during deletion.",
+            **self._ctx(kind="field_id"),
+        )
         return None
     
     def _get_field_element_by_id(self, field_id: str):
@@ -270,30 +366,48 @@ class ActivityDeleter:
 
         Returns True if deletion appears successful, False otherwise.
         """
-        logger = self.logger
-
         field_id = (handle.field_id or "").strip()
         if not field_id:
-            logger.warning("FieldHandle has no field_id; cannot delete by handle.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "FieldHandle has no field_id; cannot delete by handle.",
+                level="warning",
+                **self._ctx(kind="delete_by_handle"),
+            )
             return False
 
         try:
             field_el = self._get_field_element_by_id(field_id)
         except Exception as e:
-            logger.warning(
-                "Could not locate field element for id %s (type=%s, section=%s): %s",
-                handle.field_id,
-                handle.field_type_key,
-                handle.section_id,
-                e,
+            self.session.emit_signal(
+                Cat.SECTION,
+                (
+                    "Could not locate field element for id {fid} (type={ftype}, section={sec}): {err}"
+                ).format(
+                    fid=handle.field_id,
+                    ftype=handle.field_type_key,
+                    sec=handle.section_id,
+                    err=e,
+                ),
+                level="warning",
+                **self._ctx(
+                    field_id=handle.field_id,
+                    section_id=handle.section_id,
+                    field_type=handle.field_type_key,
+                    kind="delete_by_handle",
+                ),
             )
             return False
 
-        logger.info(
-            "Deleting field by handle: id=%s, type=%s, section=%s.",
-            handle.field_id,
-            handle.field_type_key,
-            handle.section_id,
+        self.session.emit_diag(
+            Cat.SECTION,
+            "Deleting field by handle.",
+            **self._ctx(
+                field_id=handle.field_id,
+                section_id=handle.section_id,
+                field_type=handle.field_type_key,
+                kind="delete_by_handle",
+            ),
         )
 
         return self.delete_field(field_el, confirm_timeout=confirm_timeout)
@@ -302,17 +416,30 @@ class ActivityDeleter:
         """
         Delete the field identified by CA field id, if present on canvas.
         """
-        logger = self.logger
         field_id = (field_id or "").strip()
         if not field_id:
-            logger.warning("No field_id provided to delete_field_by_id.")
+            self.session.emit_signal(
+                Cat.SECTION,
+                "No field_id provided to delete_field_by_id.",
+                level="warning",
+                **self._ctx(kind="delete_by_id"),
+            )
             return False
 
         try:
             field_el = self._get_field_element_by_id(field_id)
         except Exception as e:
-            logger.warning("Could not locate field element for id %s: %s", field_id, e)
+            self.session.emit_signal(
+                Cat.SECTION,
+                f"Could not locate field element for id {field_id}: {e}",
+                level="warning",
+                **self._ctx(field_id=field_id, kind="delete_by_id"),
+            )
             return False
 
-        logger.info("Deleting field by id=%s.", field_id)
+        self.session.emit_diag(
+            Cat.SECTION,
+            f"Deleting field by id={field_id}.",
+            **self._ctx(field_id=field_id, kind="delete_by_id"),
+        )
         return self.delete_field(field_el, confirm_timeout=confirm_timeout)
