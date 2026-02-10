@@ -22,7 +22,7 @@ from .field_handles import FieldHandle
 from .activity_sections import ActivitySections
 from .activity_editor import ActivityEditor
 from .activity_registry import ActivityRegistry
-from .instrumentation import Cat
+from .instrumentation import Cat, LogMode
 from .. import config  # src/config.py
 
 @dataclass(frozen=True)
@@ -145,6 +145,8 @@ class CAActivityBuilder:
 
         # Fast path: if the tab is already visible, we're done.
         if _tab_is_visible():
+            if kind == "fields":
+                self.session.counters.inc("sidebar.fields.fastpath_hits")
             self.session.emit_diag(
                 Cat.SIDEBAR,
                 f"{kind} sidebar already visible (fast-path)",
@@ -160,6 +162,7 @@ class CAActivityBuilder:
 
             if kind == "fields":
                 toggle_sel = cfg.get("toggle_button", "button[data-type='fields']")
+                self.session.counters.inc("sidebar.fields.toggle_clicks")
                 self.session.emit_diag(
                     Cat.SIDEBAR,
                     f"{kind} sidebar toggle click",
@@ -353,6 +356,110 @@ class CAActivityBuilder:
         )
         return False
 
+    def _fields_sidebar_tab_visible(self) -> bool:
+        sel = config.BUILDER_SELECTORS["sidebars"]["fields"]["tab"]
+        try:
+            el = self.session.driver.find_element(By.CSS_SELECTOR, sel)
+            return el.is_displayed()
+        except Exception:
+            return False
+
+    def _try_open_fields_sidebar_from_field_settings(
+        self,
+        *,
+        timeout: int = 5,
+        ctx: dict | None = None,
+    ) -> bool:
+        """
+        Fast-path: when the Field Settings sidebar is open, click the "Add new field"
+        button to return to the Fields sidebar without a full ensure pass.
+        """
+        if self._fields_sidebar_tab_visible():
+            return True
+
+        ctx = ctx or self._ctx(kind="fields_tab")
+        self.session.counters.inc("sidebar.fields.add_new_fastpath_attempts")
+        self.session.emit_diag(
+            Cat.SIDEBAR,
+            "Attempting add-new-field fastpath",
+            **ctx,
+        )
+
+        driver = self.session.driver
+        wait = self.session.get_wait(timeout)
+
+        try:
+            panel = driver.find_element(
+                By.CSS_SELECTOR, config.BUILDER_SELECTORS["properties"]["root"]
+            )
+        except Exception:
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                "Field settings panel not visible for add-new-field fastpath",
+                **ctx,
+            )
+            self.session.counters.inc("sidebar.fields.add_new_fastpath_fallback")
+            return False
+
+        candidates: list = []
+        for btn in panel.find_elements(By.TAG_NAME, "button"):
+            try:
+                text = (btn.text or "").strip().lower()
+                aria = (btn.get_attribute("aria-label") or "").strip().lower()
+                title = (btn.get_attribute("title") or "").strip().lower()
+            except Exception:
+                continue
+
+            if "add new field" in text or "add new field" in aria or "add new field" in title:
+                candidates.append(btn)
+                continue
+            if text == "add field" or aria == "add field" or title == "add field":
+                candidates.append(btn)
+
+        if not candidates:
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                "Add-new-field button not found in field settings panel",
+                **ctx,
+            )
+            self.session.counters.inc("sidebar.fields.add_new_fastpath_fallback")
+            return False
+
+        for btn in candidates:
+            clicked = False
+            try:
+                if hasattr(self.session, "click_element_safely"):
+                    clicked = self.session.click_element_safely(btn)
+                if not clicked:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'});", btn
+                    )
+                    driver.execute_script("arguments[0].click();", btn)
+            except Exception:
+                continue
+
+            try:
+                wait.until(lambda _: self._fields_sidebar_tab_visible())
+            except TimeoutException:
+                continue
+
+            if self._fields_sidebar_tab_visible():
+                self.session.counters.inc("sidebar.fields.add_new_fastpath_ok")
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    "Add-new-field fastpath succeeded",
+                    **ctx,
+                )
+                return True
+
+        self.session.counters.inc("sidebar.fields.add_new_fastpath_fallback")
+        self.session.emit_diag(
+            Cat.SIDEBAR,
+            "Add-new-field fastpath did not open fields sidebar; falling back",
+            **ctx,
+        )
+        return False
+
     def _activate_fields_tab_for_spec(self, spec: FieldTypeSpec):
         """
         Activate the correct tab button in the Fields sidebar based on spec.sidebar_tab_label.
@@ -408,13 +515,33 @@ class CAActivityBuilder:
             )
             return None
 
-        self.session.emit_diag(
-            Cat.SIDEBAR,
-            f"Activating '{spec.sidebar_tab_label}' tab",
-            **ctx,
-        )
-
         try:
+            already_active = False
+            try:
+                cls = tab_btn.get_attribute("class") or ""
+                aria = (tab_btn.get_attribute("aria-selected") or "").lower()
+                already_active = ("active" in cls) or (aria == "true")
+            except StaleElementReferenceException:
+                already_active = False
+
+            if already_active:
+                self.session.counters.inc("sidebar.tab.fastpath")
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    f"Tab already active; skipping click",
+                    tab=spec.sidebar_tab_label,
+                    key="SIDEBAR.tab.fastpath",
+                    every_s=1.0,
+                    **ctx,
+                )
+                return tab_btn
+
+            self.session.counters.inc("sidebar.tab.activate")
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                f"Activating '{spec.sidebar_tab_label}' tab",
+                **ctx,
+            )
             driver.execute_script("arguments[0].click();", tab_btn)
             return tab_btn
         except Exception:
@@ -529,6 +656,13 @@ class CAActivityBuilder:
             """
             return editor.get_field_by_id(fid)
 
+        def _wrapper_matches_type(fid: str) -> bool:
+            try:
+                wrapper = driver.find_element(By.CSS_SELECTOR, f"#section-field-{fid}")
+                return bool(wrapper.find_elements(By.CSS_SELECTOR, canvas_sel))
+            except Exception:
+                return False
+
         def _hard_resync_once_or_bail(reason: str) -> bool:
             nonlocal used_hard_resync
             if used_hard_resync:
@@ -587,6 +721,7 @@ class CAActivityBuilder:
 
             self.hard_resync_count += 1
             self.session.counters.inc("section.hard_resyncs")
+            self.session.counters.inc("phantom.resync_triggered")
             ctx = self._ctx(kind="hard_resync", fi=fi_index, a="triggered")
             self.session.emit_signal(
                 Cat.PHANTOM,
@@ -598,6 +733,7 @@ class CAActivityBuilder:
             )
             ok = sections.hard_resync_current_section()
             if not ok:
+                self.session.counters.inc("phantom.resync_failed")
                 self.session.emit_signal(
                     Cat.PHANTOM,
                     "Hard resync attempt failed",
@@ -609,6 +745,7 @@ class CAActivityBuilder:
                     raise RuntimeError(f"Hard resync failed: {reason}")
                 return False
 
+            self.session.counters.inc("phantom.resync_succeeded")
             return True  # resynced; retry add
 
         # -----------------------------
@@ -823,6 +960,7 @@ class CAActivityBuilder:
                             continue
 
                         deadline = time.time() + 2.0
+                        dom_poll_start = time.monotonic()
                         dom_now_ids: list[str] | None = None
                         while time.time() < deadline:
                             dom_now_ids = self._get_active_section_field_ids() or []
@@ -830,6 +968,7 @@ class CAActivityBuilder:
                                 break
                             time.sleep(0.08)
 
+                        dom_poll_elapsed = round(time.monotonic() - dom_poll_start, 2)
                         dom_after_release_ids = dom_now_ids or []
                         dom_changed_after_release = len(dom_after_release_ids) > len(dom_before_ids)
 
@@ -841,6 +980,7 @@ class CAActivityBuilder:
                                 section_id=self.sections.current_section_id or "",
                                 before=len(dom_before_ids),
                                 after=len(dom_after_release_ids),
+                                dom_poll_s=dom_poll_elapsed,
                                 **drop_ctx,
                             )
                         else:
@@ -851,6 +991,7 @@ class CAActivityBuilder:
                                 section_id=self.sections.current_section_id or "",
                                 before=len(dom_before_ids),
                                 after=len(dom_after_release_ids),
+                                dom_poll_s=dom_poll_elapsed,
                                 **drop_ctx,
                             )
 
@@ -930,6 +1071,53 @@ class CAActivityBuilder:
             # -----------------------------
             # Detect new field (id-diff + registry filter)
             # -----------------------------
+            drop_summary_ctx = self._ctx(
+                kind="drop",
+                spec=spec,
+                fi=fi_index,
+                a=f"create={create_attempt}",
+            )
+
+            fast_confirmed = False
+            if dom_changed_after_release and dom_after_release_ids is not None:
+                dom_delta_candidates = [
+                    fid for fid in dom_after_release_ids
+                    if fid not in dom_before_set and fid not in registry_ids
+                ]
+                typed_candidates = [fid for fid in dom_delta_candidates if _wrapper_matches_type(fid)]
+                candidates = typed_candidates or dom_delta_candidates
+
+                if len(candidates) == 1:
+                    candidate_id = candidates[0]
+                    try:
+                        new_field = _verify_field_by_id(candidate_id)
+                    except Exception as e:
+                        new_field = None
+                        self.session.emit_diag(
+                            Cat.PHANTOM,
+                            "DOM-count fastpath candidate failed verification",
+                            new_field_id=candidate_id,
+                            exc=str(e),
+                            **drop_summary_ctx,
+                        )
+
+                    if new_field is not None:
+                        new_id = candidate_id
+                        try:
+                            index_in_section = dom_after_release_ids.index(candidate_id)
+                        except ValueError:
+                            index_in_section = -1
+                        self.session.counters.inc("drop.confirm_fastpath")
+                        self.session.emit_diag(
+                            Cat.DROP,
+                            "DOM-count fastpath accepted new field",
+                            new_field_id=new_id,
+                            index=index_in_section,
+                            candidates=candidates[:8],
+                            **drop_summary_ctx,
+                        )
+                        fast_confirmed = True
+
             # Wait for new field presence for this create attempt (Turbo-friendly: ID-based)
             def _snapshot_has_growth_or_candidate() -> bool:
                 try:
@@ -941,9 +1129,17 @@ class CAActivityBuilder:
                     return False
 
             try:
-                wait.until(lambda d: _snapshot_has_growth_or_candidate())
+                if not fast_confirmed:
+                    confirm_timeout = 6 if dom_changed_after_release else 10
+                    confirm_wait = self.session.get_wait(confirm_timeout)
+                    iddiff_wait_start = time.monotonic()
+                    confirm_wait.until(lambda d: _snapshot_has_growth_or_candidate())
+                    iddiff_wait_s = round(time.monotonic() - iddiff_wait_start, 2)
+                else:
+                    iddiff_wait_s = 0.0
 
             except TimeoutException:
+                iddiff_wait_s = 0.0
                 # Final re-check before declaring "not confirmed":
                 # Turbo can hydrate late; a fresh snapshot can show the new id even if the wait timed out.
                 try:
@@ -959,6 +1155,7 @@ class CAActivityBuilder:
                     a=f"create={create_attempt}",
                 )
                 if late_candidates:
+                    self.session.counters.inc("phantom.late_candidates")
                     self.session.emit_diag(
                         Cat.PHANTOM,
                         "Creation timeout but late candidates appeared; continuing with id-diff",
@@ -975,10 +1172,12 @@ class CAActivityBuilder:
                     )
 
                     self._debug_dump_section_registry_vs_dom(
-                        note=f"phantom-timeout BEFORE resync create_attempt={create_attempt}"
+                        note=f"phantom-timeout BEFORE resync create_attempt={create_attempt}",
+                        max_items=30,
                     )
                     self._debug_dump_section_order_alignment(
-                        note=f"phantom-timeout BEFORE resync create_attempt={create_attempt}"
+                        note=f"phantom-timeout BEFORE resync create_attempt={create_attempt}",
+                        max_items=30,
                     )
 
                     # ----- DOM-delta candidates (preferred) -----
@@ -1075,13 +1274,6 @@ class CAActivityBuilder:
                         if fid not in dom_before_set and fid not in section_reg_ids
                     ]
 
-                    def _wrapper_matches_type(fid: str) -> bool:
-                        try:
-                            wrapper = driver.find_element(By.CSS_SELECTOR, f"#section-field-{fid}")
-                            return bool(wrapper.find_elements(By.CSS_SELECTOR, canvas_sel))
-                        except Exception:
-                            return False
-
                     typed_candidates = [fid for fid in dom_delta_candidates if _wrapper_matches_type(fid)]
                     candidates = typed_candidates or dom_delta_candidates
 
@@ -1114,8 +1306,10 @@ class CAActivityBuilder:
                                 new_field_id=new_id,
                                 index=index_in_section,
                                 candidates=candidates[:8],
+                                path="dom_delta",
                                 **phantom_ctx,
                             )
+                            self.session.counters.inc("phantom.dom_delta_recoveries")
                             break  # success: break out of create_attempt loop
 
                     # --- Last-chance: if count increased, try to accept the last element ---
@@ -1163,9 +1357,11 @@ class CAActivityBuilder:
                                         "Accepted new field by last-element fallback",
                                         new_field_id=new_id,
                                         index=index_in_section,
+                                        path="last_element",
                                         **phantom_ctx,
                                     )
 
+                                    self.session.counters.inc("phantom.last_element_recoveries")
                                     # ✅ break out of create_attempt loop as success
                                     break
 
@@ -1267,70 +1463,67 @@ class CAActivityBuilder:
                         continue
                     return None
 
-            after_fields, after_ids = _snapshot_fields()
-            diff_ids = list(after_ids - before_ids)
-            candidate_ids = [i for i in diff_ids if i and i not in registry_ids]
+            if not fast_confirmed:
+                after_fields, after_ids = _snapshot_fields()
+                diff_ids = list(after_ids - before_ids)
+                candidate_ids = [i for i in diff_ids if i and i not in registry_ids]
 
-            drop_summary_ctx = self._ctx(
-                kind="drop",
-                spec=spec,
-                fi=fi_index,
-                a=f"create={create_attempt}",
-            )
-            self.session.emit_diag(
-                Cat.DROP,
-                "ID-diff after drop",
-                before_ids=len(before_ids),
-                after_ids=len(after_ids),
-                diff=diff_ids,
-                registry_known=len(registry_ids),
-                candidates=candidate_ids,
-                **drop_summary_ctx,
-            )
-
-            # Choose an id
-            new_id = ""
-
-            if len(candidate_ids) == 1:
-                new_id = candidate_ids[0]
-            elif len(candidate_ids) > 1:
-                # choose the last candidate in DOM order
-                for el in reversed(after_fields):
-                    fid = _field_id_strict(el)
-                    if fid in candidate_ids:
-                        new_id = fid
-                        break
-            else:
-                # No usable candidate; treat as unstable snapshot and retry
-                self.session.emit_diag(
-                    Cat.PHANTOM,
-                    "No usable new id candidate; retrying create attempt",
-                    diff=diff_ids,
-                    **drop_summary_ctx,
-                )
-                continue
-
-            # Verify existence by re-find
-            try:
-                new_field = _verify_field_by_id(new_id)
                 self.session.emit_diag(
                     Cat.DROP,
-                    "New field verified by id",
-                    new_field_id=new_id,
-                    section_id=self.sections.current_section_id or "",
+                    "ID-diff after drop",
+                    before_ids=len(before_ids),
+                    after_ids=len(after_ids),
+                    diff=diff_ids,
+                    registry_known=len(registry_ids),
+                    candidates=candidate_ids,
+                    iddiff_wait_s=iddiff_wait_s,
                     **drop_summary_ctx,
                 )
-            except Exception as e:
-                self.session.emit_diag(
-                    Cat.PHANTOM,
-                    "Detected new id but could not re-find field; retrying",
-                    new_field_id=new_id,
-                    exc=str(e),
-                    **drop_summary_ctx,
-                )
-                new_field = None
+
+                # Choose an id
                 new_id = ""
-                continue
+
+                if len(candidate_ids) == 1:
+                    new_id = candidate_ids[0]
+                elif len(candidate_ids) > 1:
+                    # choose the last candidate in DOM order
+                    for el in reversed(after_fields):
+                        fid = _field_id_strict(el)
+                        if fid in candidate_ids:
+                            new_id = fid
+                            break
+                else:
+                    # No usable candidate; treat as unstable snapshot and retry
+                    self.session.emit_diag(
+                        Cat.PHANTOM,
+                        "No usable new id candidate; retrying create attempt",
+                        diff=diff_ids,
+                        **drop_summary_ctx,
+                    )
+                    continue
+
+                # Verify existence by re-find
+                try:
+                    new_field = _verify_field_by_id(new_id)
+                    self.session.emit_diag(
+                        Cat.DROP,
+                        "New field verified by id",
+                        new_field_id=new_id,
+                        section_id=self.sections.current_section_id or "",
+                        **drop_summary_ctx,
+                    )
+                except Exception as e:
+                    self.session.emit_diag(
+                        Cat.PHANTOM,
+                        "Detected new id but could not re-find field; retrying",
+                        new_field_id=new_id,
+                        exc=str(e),
+                        **drop_summary_ctx,
+                    )
+                    new_field = None
+                    new_id = ""
+                    continue
+                self.session.counters.inc("drop.confirm_fallback")
 
             # Hard guard: never accept an id already known in registry for this section/type
             if new_id in registry_ids:
@@ -1517,8 +1710,24 @@ class CAActivityBuilder:
         wait = self.session.wait
         ctx = self._ctx(kind="fields_tab", spec=spec)
 
-        # 1. Make sure the Fields sidebar is open
-        if not self._ensure_sidebar_visible("fields", timeout=timeout):
+        # 1. Make sure the Fields sidebar is open (try add-new-field fastpath first)
+        if not self._fields_sidebar_tab_visible():
+            if not self._try_open_fields_sidebar_from_field_settings(
+                timeout=timeout,
+                ctx=ctx,
+            ):
+                if not self._ensure_sidebar_visible("fields", timeout=timeout):
+                    self.session.emit_signal(
+                        Cat.SIDEBAR,
+                        "Fields sidebar could not be shown; cannot select tab",
+                        level="error",
+                        **ctx,
+                    )
+                    return None
+        elif self._instrument():
+            self.session.counters.inc("sidebar.fields.fastpath_hits")
+
+        if not self._fields_sidebar_tab_visible():
             self.session.emit_signal(
                 Cat.SIDEBAR,
                 "Fields sidebar could not be shown; cannot select tab",
@@ -1819,6 +2028,7 @@ class CAActivityBuilder:
         # Try offsets
         for (ox, oy) in offsets:
             try:
+                self.session.counters.inc("drop.offset_attempts")
                 if not self._wait_for_drag_mode(timeout=0.2):
                     self.session.counters.inc("drop.drag_mode_collapsed")
                     self.session.emit_diag(Cat.DROP, "Drag mode collapsed", note="drag_mode_collapsed", **ctx)
@@ -1856,6 +2066,7 @@ class CAActivityBuilder:
                 actions.perform()
 
                 self.session.counters.inc("drop.successes")
+                self.session.counters.inc("drop.offset_success")
                 self.session.emit_diag(
                     Cat.DROP,
                     "Drag/drop gesture released",
@@ -1891,6 +2102,7 @@ class CAActivityBuilder:
                             px, py
                         )
                         self.session.counters.inc("drop.js_fallbacks")
+                        self.session.counters.inc("drop.offset_success")
                         self.session.emit_diag(
                             Cat.DROP,
                             "Drop gesture JS fallback success",
@@ -1948,6 +2160,7 @@ class CAActivityBuilder:
                 pass
 
         for attempt in range(1, max_attempts + 1):
+            self.session.counters.inc("drop.scroll_attempts")
             # 1) Best-effort scrollIntoView first (cheap + helps Turbo lazily render)
             try:
                 driver.execute_script(
@@ -1994,6 +2207,9 @@ class CAActivityBuilder:
             huge = height > (vh * 0.85)
             intersects = (bottom >= 10) and (top <= vh - 10)
 
+            if huge:
+                self.session.counters.inc("drop.scroll_huge")
+
             self.session.emit_diag(
                 Cat.DROP,
                 "Dropzone rect metrics",
@@ -2006,6 +2222,8 @@ class CAActivityBuilder:
                 huge=huge,
                 intersects=intersects,
                 block=block,
+                key="DROP.dropzone.rect",
+                every_s=1.0,
                 **ctx_scroll,
             )
 
@@ -2310,6 +2528,8 @@ class CAActivityBuilder:
                 section_id=section_id,
                 anchor_field_id=anchor_field_id,
                 tail=tail,
+                key="DROP.placement.unverified",
+                every_s=1.0,
                 **ctx,
             )
             return False
@@ -2326,6 +2546,8 @@ class CAActivityBuilder:
                 section_id=section_id,
                 anchor_field_id=anchor_field_id,
                 tail=tail,
+                key="DROP.placement.ok",
+                every_s=1.0,
                 **ctx,
             )
             return True
@@ -2684,6 +2906,8 @@ class CAActivityBuilder:
                 drop_bias=drop_bias,
                 dx=dx,
                 dy=dy,
+                key="DROP.sortable.attempt",
+                every_s=1.0,
                 **ctx_attempt,
             )
 
@@ -2697,6 +2921,8 @@ class CAActivityBuilder:
                     "Sortable reorder: target rect + viewport",
                     rect=tr,
                     viewport=(vw, vh),
+                    key="DROP.sortable.rect",
+                    every_s=1.0,
                     **ctx_zone,
                 )
 
@@ -2711,6 +2937,8 @@ class CAActivityBuilder:
                         Cat.DROP,
                         "Sortable reorder: native drag start OK",
                         max_attempts=max_attempts,
+                        key="DROP.sortable.native_start",
+                        every_s=1.0,
                         **ctx_zone,
                     )
                 except Exception as e_start:
@@ -2751,6 +2979,8 @@ class CAActivityBuilder:
                         self.session.emit_diag(
                             Cat.DROP,
                             "Sortable reorder: native drop succeeded",
+                            key="DROP.sortable.native_drop",
+                            every_s=1.0,
                             **ctx_zone,
                         )
                     
@@ -2858,6 +3088,17 @@ class CAActivityBuilder:
             sec=self.sections.current_section_id or "",
             a="sortable_cleanup",
         )
+
+        try:
+            active = driver.execute_script(
+                """
+                return !!document.querySelector('.sortable-ghost, .sortable-chosen, #section-fields.sortable--dragging, [class*="sortable--dragging"]');
+                """
+            )
+            if not active:
+                return
+        except Exception:
+            pass
 
         # 1) ESC a couple times (often cancels drag mode)
         try:
@@ -3237,6 +3478,9 @@ class CAActivityBuilder:
         """
         if not self._instrument():
             return
+        self.session.counters.inc("trace.registry_vs_dom_dumps")
+        if self.session.instr_policy.mode != LogMode.TRACE:
+            return
 
         sid = section_id or (self.sections.current_section_id or "")
         ctx_dump = self._ctx(kind="registry", sec=sid, a="debug_dump_registry")
@@ -3266,7 +3510,7 @@ class CAActivityBuilder:
         dom_ids_disp = dom_ids[:max_items]
         reg_triplets_disp = reg_triplets[:max_items]
 
-        self.session.emit_diag(
+        self.session.emit_trace(
             Cat.REG,
             "Section registry vs DOM snapshot",
             note=note,
@@ -3280,6 +3524,8 @@ class CAActivityBuilder:
             reg_triplets=reg_triplets_disp,
             dom_only_sample=dom_only[:20],
             reg_only_sample=reg_only[:20],
+            key="REG.snapshot",
+            every_s=2.0,
             **ctx_dump,
         )
 
@@ -3300,6 +3546,9 @@ class CAActivityBuilder:
         - DOM order annotated with registry info when available
         """
         if not self._instrument():
+            return
+        self.session.counters.inc("trace.order_alignment_dumps")
+        if self.session.instr_policy.mode != LogMode.TRACE:
             return
 
         sid = section_id or (self.sections.current_section_id or "")
@@ -3341,7 +3590,7 @@ class CAActivityBuilder:
         dom_only = list(dom_set - reg_set)
         reg_only = list(reg_set - dom_set)
 
-        self.session.emit_diag(
+        self.session.emit_trace(
             Cat.REG,
             "Section order alignment snapshot",
             note=note,
@@ -3354,5 +3603,7 @@ class CAActivityBuilder:
             dom_annotated=dom_annotated_disp,
             dom_only_sample=dom_only[:20],
             reg_only_sample=reg_only[:20],
+            key="REG.order.snapshot",
+            every_s=2.0,
             **ctx_order,
         )

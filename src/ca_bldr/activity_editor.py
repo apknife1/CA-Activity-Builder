@@ -39,7 +39,7 @@ from .field_configs import (
     SingleChoiceConfig,
     )
 from .. import config
-from .instrumentation import Cat
+from .instrumentation import Cat, LogMode
 
 FIELD_ID_SUFFIX_RE = re.compile(r"--(\d+)$")
 
@@ -418,6 +418,7 @@ class ActivityEditor:
         Cheap + safe to call repeatedly.
         """
         driver = self.driver
+        self.session.counters.inc("editor.canvas_resets")
         try:
             driver.switch_to.active_element.send_keys(Keys.ESCAPE)
         except Exception:
@@ -510,13 +511,28 @@ class ActivityEditor:
         self.session.counters.inc("editor.configure_attempts")
         self.session.emit_diag(Cat.CONFIGURE, "Configure field start", **ctx_config)
 
-        def _cleanup_canvas() -> WebElement:
+        def _cleanup_canvas(stage: str) -> WebElement:
+            t0 = time.monotonic()
+            self.session.counters.inc("editor.cleanup_calls")
+            self.session.counters.inc(f"editor.cleanup_{stage}")
             self._reset_canvas_ui_state()
             fresh = self.get_field_by_id(handle.field_id)
             try:
                 self._ensure_field_active(fresh)
             except Exception:
                 pass
+            elapsed_s = round(time.monotonic() - t0, 2)
+            self.session.emit_diag(
+                Cat.UISTATE,
+                "Cleanup canvas complete",
+                elapsed_s=elapsed_s,
+                **self._editor_ctx(
+                    field_id=handle.field_id,
+                    section_id=handle.section_id,
+                    kind="ui_state",
+                    stage=f"cleanup_{stage}",
+                ),
+            )
             return fresh     
 
         if not isinstance(config, BaseFieldConfig):
@@ -551,7 +567,7 @@ class ActivityEditor:
                 phase="pre-props",
                 allow_refind=True,
             )
-            field_el = _cleanup_canvas()
+            field_el = _cleanup_canvas("post_body")
 
         # --- 2) Configure Interactive table structure BEFORE properties ----------
         if handle.field_type_key == "interactive_table" and isinstance(config, TableConfig):
@@ -576,7 +592,7 @@ class ActivityEditor:
                     kind="table_config",
                 ),
             )
-            field_el = _cleanup_canvas()
+            field_el = _cleanup_canvas("post_table")
 
         if handle.field_type_key =="single_choice" and isinstance(config, SingleChoiceConfig):
             try:
@@ -591,7 +607,7 @@ class ActivityEditor:
                     requested={"field_type_key": handle.field_type_key},
                 )
                 raise
-            field_el = _cleanup_canvas()
+            field_el = _cleanup_canvas("post_single_choice")
 
         # --- 3) Visibility + marking properties ----------------------------
         # Question-like configs extend BaseFieldConfig with these attributes.
@@ -1173,6 +1189,10 @@ class ActivityEditor:
 
         expected_by_field_id: {field_id: expected_html}
         """
+        if self.session.instr_policy.mode == LogMode.LIVE:
+            self.session.counters.inc("editor.body_audit_skipped")
+            return {"ok": 0, "missing": [], "unknown": []}
+
         ctx = self._editor_ctx(kind="body_audit", stage=label)
         self._wait_turbo_idle(timeout=5.0)
 
@@ -2175,17 +2195,23 @@ class ActivityEditor:
             saw_loaded_frame = False
 
             for attempt in range(1, retries + 1):
+                self.session.counters.inc("editor.properties_open_attempts")
                 try:
                     frame = _get_loaded_frame_or_none()
                     if frame is not None:
                         saw_loaded_frame = True
                         if self._is_field_settings_open_for_field(field_el):
+                            self.session.counters.inc("editor.properties_frame_reuse")
+                            self.session.counters.inc("editor.properties_binding_proven")
                             self.session.emit_diag(
                                 Cat.UISTATE,
                                 "UI_STATE: frame loaded and matches this field.",
+                                key="UISTATE.binding.proven",
+                                every_s=1.0,
                                 **self._editor_ctx(field_id=fid, kind="ui_state", stage="frame_loaded"),
                             )
                             return frame
+                        self.session.counters.inc("editor.properties_binding_mismatch")
                         self.session.emit_signal(
                             Cat.UISTATE,
                             f"UI_STATE: loaded frame is misbound (attempt {attempt}/{retries}).",
@@ -2203,6 +2229,7 @@ class ActivityEditor:
                         # binding proof gate
                         if self._is_field_settings_open_for_field(field_el):
                             self.session.counters.inc("editor.properties_opens")
+                            self.session.counters.inc("editor.properties_binding_proven")
                             return frame
 
                         # mismatch -> log probes then recovery then retry
@@ -2267,6 +2294,7 @@ class ActivityEditor:
                 level="warning",
                 **self._editor_ctx(field_id=fid, kind="ui_state", stage="binding_failure"),
             )
+            self.session.counters.inc("editor.properties_binding_failed")
            
             # One final heavy snapshot (single-shot)
             _log_misbind_probes("final_misbound_skip", attempt=retries, retries=retries, heavy=True)
@@ -3040,6 +3068,7 @@ class ActivityEditor:
         - Between stages, re-find the field element by id to avoid stale anchors.
         - Retry each stage a few times on stale/DOM churn.
         """
+        self.session.counters.inc("editor.table_config_calls")
         ctx = self._editor_ctx(kind="table_config")
 
         # Resolve a stable id for the field so we can re-find the root element
@@ -3078,6 +3107,9 @@ class ActivityEditor:
                 stage=stage_name,
             )
             for attempt in range(1, attempts + 1):
+                self.session.counters.inc(f"editor.table_stage_{stage_name}_attempts")
+                if attempt > 1:
+                    self.session.counters.inc(f"editor.table_stage_{stage_name}_retries")
                 try:
                     fresh = _fresh_field_el()
                     fn(fresh)

@@ -104,7 +104,8 @@ Provides stability by:
 - preventing rediscovery
 - supporting strict new-field detection
 
-The registry is a safety mechanism, not a cache.
+The registry is a safety mechanism, not a cache. It guards against duplicate IDs
+and mismatched field types, and it emits diagnostics when drift is detected.
 
 ---
 
@@ -162,7 +163,9 @@ Examples:
 - Paragraph: no assessor update
 - Auto-marked: may require correct answer
 
-Editor logic must treat unsupported controls as no-ops.
+Editor logic must treat unsupported controls as no-ops. The current capability
+matrix lives in `FIELD_CAPABILITIES.md` and should be kept aligned with
+`ActivityEditor` gating.
 
 ---
 
@@ -174,6 +177,7 @@ Performance optimisations must:
 - never remove guards
 - be driven by measured timing data
 
+Use instrumentation counters and TRACE-gated diagnostics to justify changes.
 The goal is *predictable correctness*, not raw speed.
 
 ---
@@ -190,7 +194,7 @@ Silent corruption is never acceptable.
 
 ## Future Architecture Work
 
-- Formal field capability matrix
+- Keep `FIELD_CAPABILITIES.md` authoritative and up to date with UI changes
 - Revision-aware editing workflow
 - Dropzone resolution improvements
 - Declarative selector contracts

@@ -18,6 +18,7 @@ CA_ACTIVITY_TEMPLATES_INACTIVE_URL = f"{CA_ACTIVITY_TEMPLATES_URL}?type=inactive
 
 # Explicit wait time for Selenium + Headless mode
 WAIT_TIME = int(os.getenv("CA_WAIT_TIME", "10"))
+IMPLICIT_WAIT = int(os.getenv("CA_IMPLICIT_WAIT", "3"))
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 # Very short cache to avoid re-scanning the sidebar repeatedly in tight loops.
@@ -28,6 +29,7 @@ SECTIONS_LIST_CACHE_TTL = 0.75
 INSTRUMENT_DROPS: bool = True
 INSTRUMENT_UI_STATE: bool = True
 LOG_MODE = os.getenv("CA_LOG_MODE", "live").lower()  # live | debug | trace
+TEMPLATE_SEARCH_INACTIVE_FIRST = os.getenv("CA_TEMPLATE_SEARCH_INACTIVE_FIRST", "false").lower() == "true"
 LOG_RATE_LIMITS_S = {
     "SECTION.canvas_aligned": 1.0,
     "SIDEBAR.fields_visible": 1.0,

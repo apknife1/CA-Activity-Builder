@@ -155,18 +155,25 @@ class ActivityDeleter:
             if hasattr(self.session, "handle_modal_dialogs"):
                 try:
                     self.session.counters.inc("deleter.modal_waits")
+                    modal_wait_start = time.monotonic()
                     handled_modal = self.session.handle_modal_dialogs(
                         mode="confirm",
                         timeout=confirm_timeout
                     )
+                    modal_wait_s = round(time.monotonic() - modal_wait_start, 2)
                     if handled_modal:
                         self.session.counters.inc("deleter.modal_confirmed")
+                        self.session.counters.inc("deleter.modal_present")
+                    else:
+                        self.session.counters.inc("deleter.modal_absent")
                     self.session.emit_diag(
                         Cat.SECTION,
                         f"Modal handler result for field {id_for_log}: {handled_modal}",
+                        modal_wait_s=modal_wait_s,
                         **ctx,
                     )
                 except Exception as e:
+                    self.session.counters.inc("deleter.modal_errors")
                     self.session.emit_signal(
                         Cat.SECTION,
                         f"Error while handling modal dialogs: {e}",
@@ -211,6 +218,7 @@ class ActivityDeleter:
 
                 return True
             except TimeoutException:
+                self.session.counters.inc("deleter.delete_timeouts")
                 self.session.emit_signal(
                     Cat.SECTION,
                     f"Timeout waiting for field {id_for_log} to disappear after delete.",
@@ -220,6 +228,7 @@ class ActivityDeleter:
                 return False
 
         except WebDriverException as e:
+            self.session.counters.inc("deleter.delete_errors")
             self.session.emit_signal(
                 Cat.SECTION,
                 f"Could not delete field {id_for_log}: {e}",
@@ -228,6 +237,7 @@ class ActivityDeleter:
             )
             return False
         except Exception as e:
+            self.session.counters.inc("deleter.delete_errors")
             self.session.emit_signal(
                 Cat.SECTION,
                 f"Unexpected error while deleting field {id_for_log}: {e}",
@@ -278,9 +288,20 @@ class ActivityDeleter:
         count = 0
 
         while True:
+            self.session.counters.inc("deleter.bulk_loop_iters")
+            self.session.counters.inc("deleter.bulk_scan_calls")
             fields = self.get_all_fields(field_selector=field_selector)
             if not fields:
                 break
+
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Bulk delete scan result",
+                count=len(fields),
+                key="deleter.bulk_scan",
+                every_s=2.0,
+                **self._ctx(kind="bulk_delete"),
+            )
 
             field_el = fields[-1]  # always delete from the bottom
             if not self.delete_field(field_el):

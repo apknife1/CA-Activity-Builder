@@ -11,5 +11,5 @@ def create_driver():
     options.add_argument("--start-maximized")
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()),
                               options=options)
-    driver.implicitly_wait(3)  # we’ll still use explicit waits, but this helps
+    driver.implicitly_wait(config.IMPLICIT_WAIT)  # we’ll still use explicit waits, but this helps
     return driver

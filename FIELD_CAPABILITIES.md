@@ -4,6 +4,8 @@ This document defines which UI controls are supported per field type.
 
 The goal is to prevent the editor from attempting unsupported operations (e.g. setting assessor visibility to update on paragraphs).
 
+Last reviewed: 2026-02-10. Re-verify after UI changes.
+
 ---
 
 ## Related docs
@@ -36,7 +38,7 @@ The goal is to prevent the editor from attempting unsupported operations (e.g. s
 
 ---
 
-## Proposed Matrix (v1)
+## Current Matrix (v1)
 
 ### paragraph
 
@@ -130,7 +132,15 @@ The goal is to prevent the editor from attempting unsupported operations (e.g. s
 
 - apply a config knob only if supported
 - otherwise skip silently and log at DEBUG
+- treat this matrix as the reference, but use ActivityEditor gating as the source of truth
 
 Related tech debt: [TD-011 — Field capability rules are not encoded](TECH_DEBT.md#td-011--field-capability-rules-are-not-encoded)
 
 This turns "No radio found" warnings into intentional no-ops.
+
+---
+
+## How to Update
+
+- When adding a new field type, update this matrix and the capability gating in `ActivityEditor`.
+- If UI behavior changes, update both the matrix and the relevant tests or run notes.

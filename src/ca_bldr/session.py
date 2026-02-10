@@ -60,6 +60,7 @@ class CASession:
             kind="startup",
             log_mode=mode.value,
             wait_time=config.WAIT_TIME,
+            implicit_wait=config.IMPLICIT_WAIT,
         )
 
     def _ctx(
@@ -644,7 +645,7 @@ class CASession:
             else config.CA_ACTIVITY_TEMPLATES_URL
         )
         driver = self.driver
-        wait = self.wait
+        wait = self.get_wait(timeout)
         ctx = self._ctx(kind="templates_nav", status="inactive" if inactive else "active")
 
         if not force:
@@ -675,6 +676,8 @@ class CASession:
                         **ctx,
                     )
 
+        self.counters.inc("nav.templates_requests")
+        nav_start = time.monotonic()
         self.emit_signal(
             Cat.NAV,
             f"Navigating to Activity Templates page: {target}",
@@ -690,10 +693,19 @@ class CASession:
                 )
             )
         except TimeoutException:
+            self.counters.inc("nav.templates_failures")
             self.emit_signal(
                 Cat.NAV,
                 f"Activity Templates page loaded but 'Create Activity' button not detected (timeout={timeout}).",
                 level="warning",
+                **ctx,
+            )
+        else:
+            nav_elapsed = round(time.monotonic() - nav_start, 2)
+            self.emit_diag(
+                Cat.NAV,
+                "Activity Templates navigation completed",
+                elapsed_s=nav_elapsed,
                 **ctx,
             )
 
@@ -714,6 +726,17 @@ class CASession:
         canvas_snippet_len: int = 800,
         include_overlay_details: bool = True,
     ) -> dict[str, Any]:
+        if self.instr_policy.mode != LogMode.TRACE:
+            self.counters.inc("ui_probe_heavy_skipped_non_trace")
+            return {
+                "label": label,
+                "expected": {},
+                "observed": {},
+                "skipped": True,
+                "mode": self.instr_policy.mode.value,
+            }
+
+        self.counters.inc("ui_probe_heavy_calls")
         driver = self.driver
 
         out: dict[str, Any] = {
@@ -852,6 +875,7 @@ class CASession:
         include_frame_html_snippet: bool = False,
         frame_html_snippet_len: int = 600,
     ) -> UIProbeSnapshot:
+        self.counters.inc("ui_probe_calls")
         driver = self.driver
 
         out: UIProbeSnapshot = {
@@ -985,7 +1009,7 @@ class CASession:
 
         msg = f"UI_PROBE_HEAVY: headline={headline} details={probe}"
 
-        self.emit_diag(
+        self.emit_trace(
             Cat.UISTATE,
             msg,
             **self._ctx(kind="ui_probe_heavy", level=level),
@@ -1024,8 +1048,12 @@ class CASession:
         # Optional: set results per page = 100 (reduces paging overhead)
         try:
             per_page = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["per_page_select"])))
-            if per_page.get_attribute("value") != "100":
+            current = per_page.get_attribute("value") or ""
+            if current != "100":
                 Select(per_page).select_by_value("100")
+                self.counters.inc("templates.per_page_set")
+            else:
+                self.counters.inc("templates.per_page_already")
             # Changing items triggers a turbo stream update; best-effort prove by waiting for frame to be ready again
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
         except Exception as e:
@@ -1172,6 +1200,20 @@ class CASession:
     def emit_diag(self, cat: Cat, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx):
         # gated by mode; DEBUG+ only for now
         if self.instr_policy.mode == LogMode.LIVE:
+            return
+        if key and every_s:
+            if not self._rate.allow(key, every_s):
+                return
+
+        prefix = f"[{cat}]"
+        if self.instr_policy.include_ctx:
+            c = format_ctx(**ctx)
+            if c:
+                msg = f"{msg} :: {c}"
+        self.logger.debug(f"{prefix} {msg}")
+
+    def emit_trace(self, cat: Cat, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx):
+        if self.instr_policy.mode != LogMode.TRACE:
             return
         if key and every_s:
             if not self._rate.allow(key, every_s):

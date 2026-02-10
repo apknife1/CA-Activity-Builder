@@ -15,7 +15,7 @@ from .session import CASession
 from .activity_deleter import ActivityDeleter
 from .section_handles import SectionHandle
 from .activity_registry import ActivityRegistry
-from .instrumentation import Cat
+from .instrumentation import Cat, LogMode
 from .. import config  # src/config.py
 
 _SECTION_ID_RE = re.compile(r"--(\d+)$")
@@ -72,22 +72,27 @@ class ActivitySections:
     def _sections_cache_get(self) -> Optional[list]:
         cached = self._sections_list_cache
         if not cached:
+            self.session.counters.inc("section.cache.miss")
             return None
 
         ts, items = cached
         ttl = config.SECTIONS_LIST_CACHE_TTL
         if (time.monotonic() - ts) <= ttl:
+            self.session.counters.inc("section.cache.hit")
             return items
 
         # expired
+        self.session.counters.inc("section.cache.expired")
         self._sections_cache_invalidate(reason="ttl_expired")
         return None
 
     def _sections_cache_set(self, items: list) -> None:
         self._sections_list_cache = (time.monotonic(), items)
+        self.session.counters.inc("section.cache.set")
 
     def _sections_cache_invalidate(self, reason: str = "") -> None:
         if self._sections_list_cache is not None:
+            self.session.counters.inc("section.cache.invalidate")
             self.session.emit_diag(
                 Cat.SECTION,
                 "Invalidating sections list cache",
@@ -557,12 +562,12 @@ class ActivitySections:
             )
             return None
 
-    def _select_from_current_handle(self) -> bool:
+    def _select_from_current_handle(self) -> tuple[bool, bool]:
         """
         Refresh selection to current stored handle.
 
-        Returns True if selection succeeded (or is already effectively selected),
-        False otherwise.
+        Returns (selection_ok, canvas_aligned).
+        canvas_aligned is True only when we can prove alignment.
 
         Turbo-safe principle:
         - If we can prove canvas alignment for current section, we skip sidebar work.
@@ -578,7 +583,7 @@ class ActivitySections:
                 level="warning",
                 **ctx,
             )
-            return False
+            return False, False
 
         # ✅ Fast-path: if canvas is already aligned for current section, don't touch sidebar.
         # This avoids a lot of Turbo-stale churn.
@@ -587,19 +592,14 @@ class ActivitySections:
                 self.session.counters.inc("section.fastpath_hits")
                 self.session.emit_diag(
                     Cat.SECTION,
-                    "Canvas already aligned for current section",
-                    key="SECTION.canvas.fastpath",
-                    every_s=1.0,
-                    **self._section_ctx(action="select", attempt="fastpath"),
-                )
-                self.session.emit_diag(
-                    Cat.SECTION,
                     "Fast-path: canvas already aligned for current section",
                     section_id=handle.section_id,
                     section_title=handle.title,
+                    key="SECTION.canvas.fastpath",
+                    every_s=1.0,
                     **ctx,
                 )
-                return True
+                return True, True
         except Exception:
             # If alignment check itself fails, fall through to robust selection.
             pass
@@ -617,7 +617,7 @@ class ActivitySections:
                         attempt=attempt,
                         **ctx,
                     )
-                    return True
+                    return True, False
 
                 self.session.emit_signal(
                     Cat.SECTION,
@@ -677,7 +677,7 @@ class ActivitySections:
                     section_id=handle.section_id,
                     **ctx,
                 )
-                return True
+                return True, False
         except Exception as e:
             self.session.emit_signal(
                 Cat.SECTION,
@@ -696,7 +696,7 @@ class ActivitySections:
                     section_title=handle.title,
                     **ctx,
                 )
-                return True
+                return True, False
         except Exception as e:
             self.session.emit_signal(
                 Cat.SECTION,
@@ -715,7 +715,7 @@ class ActivitySections:
             level="error",
             **ctx,
         )
-        return False
+        return False, False
 
     def select_by_handle(self, handle: SectionHandle) -> Optional[SectionHandle]:
         """
@@ -1063,6 +1063,7 @@ class ActivitySections:
         Returns True if we end up with the intended section selected,
         False otherwise.
         """
+        start_ts = time.monotonic()
         driver = self.driver
         wait = self.session.get_wait(timeout)
         ctx = self._section_ctx(action="hard_resync")
@@ -1149,6 +1150,7 @@ class ActivitySections:
             self.session.emit_signal(
                 Cat.SECTION,
                 "Hard resync completed in Information-only mode",
+                elapsed_s=round(time.monotonic() - start_ts, 2),
                 **ctx,
             )
             return True
@@ -1190,13 +1192,15 @@ class ActivitySections:
                     )
                     try:
                         frame = self._get_sections_frame()
-                        snippet = (frame.get_attribute("innerHTML") or "")[:500]
-                        self.session.emit_diag(
-                            Cat.SECTION,
-                            "Hard resync: sections frame innerHTML (first 500 chars)",
-                            snippet=snippet,
-                            **ctx,
-                        )
+                        self.session.counters.inc("trace.sections_frame_html_dumps")
+                        if self.session.instr_policy.mode == LogMode.TRACE:
+                            snippet = (frame.get_attribute("innerHTML") or "")[:500]
+                            self.session.emit_trace(
+                                Cat.SECTION,
+                                "Hard resync: sections frame innerHTML (first 500 chars)",
+                                snippet=snippet,
+                                **ctx,
+                            )
                     except Exception:
                         pass
                     return False
@@ -1251,6 +1255,7 @@ class ActivitySections:
             "Hard resync completed",
             section_id=ch.section_id,
             section_title=ch.title,
+            elapsed_s=round(time.monotonic() - start_ts, 2),
             **ctx,
         )
         return True
@@ -1537,12 +1542,15 @@ class ActivitySections:
             current = self.current_section_handle
 
             if current is None:
+                self.session.counters.inc("section.fastpath_bypass.no_current")
                 return None
             
             if not _desired_is_current(current):
+                self.session.counters.inc("section.fastpath_bypass.mismatch")
                 return None
 
             if not _canvas_aligned(timeout=3):
+                self.session.counters.inc("section.fastpath_bypass.not_aligned")
                 return None
 
             # If we’re here: the requested/current section is already active and safe.
@@ -1617,7 +1625,7 @@ class ActivitySections:
 
             # 1) Primary selection mechanism
             try:
-                ok = self._select_from_current_handle()
+                ok, aligned = self._select_from_current_handle()
             except Exception as e:
                 self.session.emit_signal(
                     Cat.SECTION,
@@ -1628,6 +1636,7 @@ class ActivitySections:
                     **ctx,
                 )
                 ok = False
+                aligned = False
 
             if not ok:
                 self.session.emit_signal(
@@ -1642,7 +1651,7 @@ class ActivitySections:
                 return None
 
             # 2) Fast alignment check (avoid paying 10s repeatedly)
-            if _canvas_aligned(timeout=3):
+            if aligned or _canvas_aligned(timeout=3):
                 return handle
             self.session.emit_signal(
                 Cat.SECTION,
@@ -2072,6 +2081,8 @@ class ActivitySections:
                 self.session.emit_diag(
                     Cat.SECTION,
                     "Canvas now aligned with Information section",
+                    key="SECTION.canvas.aligned.info",
+                    every_s=1.0,
                     **ctx,
                 )
                 return True
@@ -2128,6 +2139,8 @@ class ActivitySections:
                 Cat.SECTION,
                 "Canvas now aligned with section",
                 section_id=section_id,
+                key="SECTION.canvas.aligned",
+                every_s=1.0,
                 **ctx,
             )
             return True

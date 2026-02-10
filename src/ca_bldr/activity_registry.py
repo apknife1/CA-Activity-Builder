@@ -51,6 +51,10 @@ class ActivityRegistry:
         if self._session:
             self._session.emit_diag(Cat.REG, msg, key=key, every_s=every_s, **ctx)
 
+    def _emit_trace(self, msg: str, *, key: str | None = None, every_s: float | None = None, **ctx: Any) -> None:
+        if self._session:
+            self._session.emit_trace(Cat.REG, msg, key=key, every_s=every_s, **ctx)
+
     def _inc_counter(self, key: str, n: int = 1) -> None:
         if self._session:
             self._session.counters.inc(key, n)
@@ -97,6 +101,18 @@ class ActivityRegistry:
         duplicate_field = handle.field_id in self._fields
         if duplicate_field:
             self._inc_counter("registry.duplicate_field_ids")
+            existing = self._fields.get(handle.field_id)
+            if existing and existing.field_type_key != handle.field_type_key:
+                self._inc_counter("registry.duplicate_field_type_mismatch")
+                self._emit_signal(
+                    "Duplicate field id with mismatched type; keeping existing handle",
+                    note="duplicate_field_type_mismatch",
+                    level="error",
+                    existing_type=existing.field_type_key,
+                    new_type=handle.field_type_key,
+                    **ctx,
+                )
+                return
             self._emit_signal(
                 "Duplicate field handle re-registered",
                 note="duplicate_field_id",
@@ -199,6 +215,7 @@ class ActivityRegistry:
             )
             return None
 
+        self._inc_counter("registry.anchor_hits")
         best = max(candidates, key=lambda fh: cast(int, fh.fi_index))
         return best.field_id
 
@@ -206,12 +223,30 @@ class ActivityRegistry:
 
     def remove_field(self, field_id: str) -> None:
         handle = self._fields.pop(field_id, None)
+        if handle is None:
+            self._inc_counter("registry.remove_missing_field")
+            self._emit_signal(
+                "Remove field called for missing field id",
+                reason="missing_field_id",
+                level="warning",
+                fid=field_id,
+            )
+            return
         if handle and handle.section_id in self._sections:
             rec = self._sections[handle.section_id]
             rec.fields = [f for f in rec.fields if f.field_id != field_id]
 
     def remove_section(self, section_id: str) -> None:
         rec = self._sections.pop(section_id, None)
+        if rec is None:
+            self._inc_counter("registry.remove_missing_section")
+            self._emit_signal(
+                "Remove section called for missing section id",
+                reason="missing_section_id",
+                level="warning",
+                sec=section_id,
+            )
+            return
         if rec:
             for f in rec.fields:
                 self._fields.pop(f.field_id, None)
@@ -259,7 +294,7 @@ class ActivityRegistry:
         }
 
         self._inc_counter("registry.snapshot_count")
-        self._emit_diag(
+        self._emit_trace(
             "Registry snapshot emitted",
             key="REG.snapshot",
             every_s=60.0,

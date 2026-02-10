@@ -9,8 +9,10 @@ This project prioritises **correctness, determinism, and recoverability** over r
 ## Documentation
 
 - [Architecture & invariants](ARCHITECTURE.md)
+- [Instrumentation & logging matrix](INSTRUMENTATION_LOGGING_MATRIX.md)
 - [Tech debt ledger](TECH_DEBT.md)
 - [Field capability matrix](FIELD_CAPABILITIES.md)
+- Review documentation (other than `TECH_DEBT.md` / `CHECKLIST.md`) lives under `notes/`
 
 > Tip: If you’re changing builder/editor behaviour, read **ARCHITECTURE.md** first.
 
@@ -213,9 +215,11 @@ You will be prompted to select one or more spec files.
 
 ## Logging & Diagnostics
 
-- Logs are written to `ca_activity_builder.log`
-- Verbose instrumentation can be enabled via config flags
-- Timing data is captured using a `phase_timer` context manager
+- Logs are written under `runs/<timestamp>/logs/`
+- `runs/codex/` is reserved for Codex/agent artifacts and is ignored by git
+- Instrumentation level is controlled by `CA_LOG_MODE` (`live`, `debug`, `trace`)
+- Timing data is captured using `phase_timer` instrumentation signals
+ - TRACE mode enables heavy dumps (registry snapshots, UI probe heavy, DOM alignment dumps)
 
 Logs include:
 
@@ -282,7 +286,7 @@ Instrumentation flags exist to help diagnose:
 - covered dropzones
 - mis-bound properties panels
 
-Leave instrumentation enabled during development; disable only for production runs.
+Leave instrumentation enabled during development; use `CA_LOG_MODE=live` for production runs.
 
 ---
 
@@ -292,7 +296,7 @@ Planned future work:
 
 - Activity revision workflow (locked templates)
 - Dropzone coverage reduction to lower phantom adds
-- Formal field capability matrix
+- Keep field capability matrix current as CloudAssess UI changes
 - Split large AR mapping tables into logical sections
 - Clean-up of legacy debug utilities
 

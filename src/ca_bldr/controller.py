@@ -49,6 +49,12 @@ class FaultPlan:
     configure_fail_fi_index: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class CreateOutcome:
+    status: str  # "created" | "duplicate" | "error"
+    error: str | None = None
+
+
 class ActivityBuildController:
     def __init__(self, ctx: AppContext):
         self.ctx = ctx
@@ -188,66 +194,99 @@ class ActivityBuildController:
                 try:
                     with phase_timer(session, f"{act.activity_code}: locate existing template"):
                         lookup_hops = 0
-                        match = session.find_activity_template_by_title(act.activity_title or "", status="active")
+                        first_status = "inactive" if config.TEMPLATE_SEARCH_INACTIVE_FIRST else "active"
+                        match = session.find_activity_template_by_title(
+                            act.activity_title or "",
+                            status=first_status,
+                        )
                         lookup_hops += 1
-                        if not match:
-                            match = session.find_activity_template_by_title(act.activity_title or "", status="inactive")
-                            lookup_hops += 1
-
                     lookup_ctx = self._nav_ctx(act, step="template_lookup")
                     self.session.counters.inc("nav.template_lookup_attempts")
-                    self.session.counters.inc("nav.template_lookup_hops", lookup_hops)
+
                     if match:
                         status_label = (match.status or "found").strip().lower().replace(" ", "_")
+                        self.session.counters.inc("nav.template_lookup_hops", lookup_hops)
                         self.session.counters.inc("nav.template_lookup_found")
                         self.session.counters.inc(f"nav.template_status_{status_label}")
-                        lookup_result = f"found({match.status})"
-                    else:
-                        self.session.counters.inc("nav.template_lookup_missing")
-                        lookup_result = "not_found"
+                        self.session.emit_signal(
+                            Cat.NAV,
+                            f"Template locate result=found({match.status})",
+                            hops=lookup_hops,
+                            **lookup_ctx,
+                        )
+                        status = ActivityStatus.SKIPPED_EXISTING
+                        reason = "template_exists" if match.status != "inactive" else "template_exists_inactive"
+                        continue
 
+                    # No active match found → attempt create (optimistic path)
+                    with phase_timer(session, f"{act.activity_code}: create template"):
+                        create_outcome = self._create_activity_from_instruction(act)
+                        if create_outcome.status == "error":
+                            status = ActivityStatus.FAILED
+                            reason = "create_template"
+                            continue
+
+                    if create_outcome.status == "duplicate":
+                        with phase_timer(session, f"{act.activity_code}: locate inactive template"):
+                            match = session.find_activity_template_by_title(
+                                act.activity_title or "",
+                                status="inactive",
+                            )
+                            lookup_hops += 1
+
+                        self.session.counters.inc("nav.template_lookup_hops", lookup_hops)
+                        if match:
+                            status_label = (match.status or "inactive").strip().lower().replace(" ", "_")
+                            self.session.counters.inc("nav.template_lookup_found")
+                            self.session.counters.inc(f"nav.template_status_{status_label}")
+                            self.session.emit_signal(
+                                Cat.NAV,
+                                f"Template locate result=found({match.status})",
+                                hops=lookup_hops,
+                                **lookup_ctx,
+                            )
+                            # TODO future revision to enable editing of inactive templates 
+                            # that have no students assigned
+                            status = ActivityStatus.SKIPPED_EXISTING
+                            reason = "template_exists_inactive"
+                            continue
+
+                        self.session.counters.inc("nav.template_lookup_missing")
+                        self.session.emit_signal(
+                            Cat.NAV,
+                            "Duplicate detected but inactive template not found",
+                            error=create_outcome.error,
+                            hops=lookup_hops,
+                            level="error",
+                            **lookup_ctx,
+                        )
+                        status = ActivityStatus.FAILED
+                        reason = "create_duplicate_not_found"
+                        continue
+
+                    # Created successfully; treat as missing pre-existing template.
+                    self.session.counters.inc("nav.template_lookup_hops", lookup_hops)
+                    self.session.counters.inc("nav.template_lookup_missing")
                     self.session.emit_signal(
                         Cat.NAV,
-                        f"Template locate result={lookup_result}",
+                        "Template locate result=not_found (created)",
                         hops=lookup_hops,
                         **lookup_ctx,
                     )
 
-                    if match and match.status != "inactive":
-                        status = ActivityStatus.SKIPPED_EXISTING 
-                        reason = "template_exists"
-                        continue
-
-                    elif match and match.status == "inactive":
-                        # TODO future revision to enable editing of inactive templates 
-                        # that have no students assigned
-                        status = ActivityStatus.SKIPPED_EXISTING 
-                        reason = "template_exists_inactive"
-                        continue
-
-                    else:
-                        # No match found → create new
-                        # 5.1 Create the new activity template via offcanvas
-                        with phase_timer(session, f"{act.activity_code}: create template"):
-                            created = self._create_activity_from_instruction(act)
-                            if not created:
-                                status = ActivityStatus.FAILED
-                                reason = "create_template"
-                                return
-                        
-                        # 5.2 open the builder page
-                        with phase_timer(session, f"{act.activity_code}: open Activity Builder"):
-                            if not self._open_activity_builder_for_new_activity(act=act):
-                                status = ActivityStatus.FAILED
-                                reason = "open_activity_builder"
-                                return
-
-                        # 5.3 Run the build loop for this single activity
-                        ok = self._build_from_instruction(act, run_dir=run_dir)
-                        if not ok:
+                    # 5.2 open the builder page
+                    with phase_timer(session, f"{act.activity_code}: open Activity Builder"):
+                        if not self._open_activity_builder_for_new_activity(act=act):
                             status = ActivityStatus.FAILED
-                            reason = "build_activity"
-                            return
+                            reason = "open_activity_builder"
+                            continue
+
+                    # 5.3 Run the build loop for this single activity
+                    ok = self._build_from_instruction(act, run_dir=run_dir)
+                    if not ok:
+                        status = ActivityStatus.FAILED
+                        reason = "build_activity"
+                        continue
 
                     status = ActivityStatus.OK
                     reason = None                        
@@ -390,7 +429,7 @@ class ActivityBuildController:
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-    def _create_activity_from_instruction(self, act) -> bool:
+    def _create_activity_from_instruction(self, act) -> CreateOutcome:
         """
         Use the 'Create Activity' offcanvas to create a new template.
 
@@ -398,16 +437,52 @@ class ActivityBuildController:
           - act.activity_title
           - act.activity_code
 
-        Returns True on success, False if something obviously failed.
+        Returns CreateOutcome with status "created", "duplicate", or "error".
         """
         driver = self.session.driver
         wait   = self.session.wait
         ctx = self._ctx(act=act, step="create_template")
 
-        # 1. Ensure that we are on the correct page
-        self.session.go_to_activity_templates()
+        def _collect_form_errors(form_el) -> list[str]:
+            selectors = [
+                ".invalid-feedback",
+                ".form-error",
+                ".field-error",
+                ".alert.alert-danger",
+                ".alert-danger",
+                ".text-danger",
+                ".error",
+            ]
+            texts: list[str] = []
+            for sel in selectors:
+                for el in form_el.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if not el.is_displayed():
+                            continue
+                    except Exception:
+                        pass
+                    text = (el.text or "").strip()
+                    if text:
+                        texts.append(text)
+            # de-dupe, preserve order
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for t in texts:
+                if t not in seen:
+                    seen.add(t)
+                    deduped.append(t)
+            return deduped
 
-        # 2. Click "Create Activity" button on the Activity Templates landing page
+        def _looks_like_duplicate(messages: list[str]) -> bool:
+            keywords = ("already", "exists", "taken", "duplicate", "in use", "has been taken")
+            for m in messages:
+                lm = m.lower()
+                if any(k in lm for k in keywords):
+                    return True
+            return False
+
+        # 1. Use the "Create Activity" button in the current view (active or inactive)
+        # Both views should expose it, so avoid any navigation churn.
         try:
             create_btn = wait.until(
                 EC.element_to_be_clickable(
@@ -422,7 +497,7 @@ class ActivityBuildController:
                 level="error",
                 **ctx,
             )
-            return False
+            return CreateOutcome(status="error", error="create_button_not_found")
 
         if not self.session.click_element_safely(create_btn):
             create_btn.click()
@@ -440,7 +515,7 @@ class ActivityBuildController:
                 level="error",
                 **ctx,
             )
-            return False
+            return CreateOutcome(status="error", error="offcanvas_not_visible")
 
         # 4. Fill Activity Title
         try:
@@ -454,7 +529,7 @@ class ActivityBuildController:
                 level="error",
                 **ctx,
             )
-            return False
+            return CreateOutcome(status="error", error="title_input_not_found")
 
         title_val = getattr(act, "activity_title", "") or ""
         self._set_text_input(title_input, title_val)
@@ -494,7 +569,7 @@ class ActivityBuildController:
                 level="error",
                 **ctx,
             )
-            return False
+            return CreateOutcome(status="error", error="code_input_not_found")
 
         code_val = getattr(act, "activity_code", "") or ""
         self._set_text_input(code_input, code_val)
@@ -514,22 +589,38 @@ class ActivityBuildController:
                 level="error",
                 **ctx,
             )
-            return False
+            return CreateOutcome(status="error", error="create_submit_not_found")
 
         if not self.session.click_element_safely(create_btn):
             create_btn.click()
 
-        # 9. Wait for offcanvas to disappear (best-effort)
+        # 9. Wait for offcanvas to disappear or detect validation errors
         try:
             wait.until(EC.invisibility_of_element(form))
         except TimeoutException:
-            # Not fatal; CA sometimes just hides it via classes.
-            self.session.emit_diag(
+            errors = _collect_form_errors(form)
+            if errors:
+                err_text = " | ".join(errors)
+                is_dup = _looks_like_duplicate(errors)
+                self.session.emit_signal(
+                    Cat.NAV,
+                    "Create Activity validation error",
+                    error=err_text,
+                    duplicate=is_dup,
+                    stage="offcanvas_validation",
+                    level="warning" if is_dup else "error",
+                    **ctx,
+                )
+                return CreateOutcome(status="duplicate" if is_dup else "error", error=err_text)
+
+            self.session.emit_signal(
                 Cat.NAV,
-                "Create Activity offcanvas did not fully disappear within timeout; continuing",
+                "Create Activity form still visible after submit; unknown state",
                 stage="offcanvas_hide",
+                level="error",
                 **ctx,
             )
+            return CreateOutcome(status="error", error="offcanvas_not_hidden")
 
         self.session.emit_signal(
             Cat.NAV,
@@ -538,7 +629,7 @@ class ActivityBuildController:
             activity_title=title_val,
             **ctx,
         )
-        return True
+        return CreateOutcome(status="created")
 
     def _set_text_input(self, element, value: str) -> None:
         """
