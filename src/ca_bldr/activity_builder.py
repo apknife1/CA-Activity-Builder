@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Any
 from collections import Counter
+from contextlib import contextmanager
 import re
 
 from selenium.webdriver.common.by import By
@@ -74,6 +75,15 @@ class CAActivityBuilder:
         if a is not None:
             ctx["a"] = a
         return ctx
+    
+    @contextmanager
+    def _implicit_wait(self, seconds: float):
+        driver = self.driver
+        driver.implicitly_wait(seconds)
+        try:
+            yield
+        finally:
+            driver.implicitly_wait(config.IMPLICIT_WAIT)
 
     def open_dev_unit(self, unit_url: str):
         self.session.emit_diag(
@@ -388,33 +398,74 @@ class CAActivityBuilder:
         driver = self.session.driver
         wait = self.session.get_wait(timeout)
 
-        try:
-            panel = driver.find_element(
-                By.CSS_SELECTOR, config.BUILDER_SELECTORS["properties"]["root"]
-            )
-        except Exception:
-            self.session.emit_diag(
-                Cat.SIDEBAR,
-                "Field settings panel not visible for add-new-field fastpath",
-                **ctx,
-            )
-            self.session.counters.inc("sidebar.fields.add_new_fastpath_fallback")
-            return False
+        def _find_add_new_buttons(root) -> list:
+            candidates: list = []
+            for btn in root.find_elements(By.TAG_NAME, "button"):
+                try:
+                    onclick = (btn.get_attribute("onclick") or "").strip().lower()
+                    text = (btn.text or "").strip().lower()
+                    aria = (btn.get_attribute("aria-label") or "").strip().lower()
+                    title = (btn.get_attribute("title") or "").strip().lower()
+                except Exception:
+                    continue
+
+                if "toggleaddfields" in onclick:
+                    candidates.append(btn)
+                    continue
+                if "add new field" in text or "add new field" in aria or "add new field" in title:
+                    candidates.append(btn)
+                    continue
+                if text == "add field" or aria == "add field" or title == "add field":
+                    candidates.append(btn)
+            return candidates
 
         candidates: list = []
-        for btn in panel.find_elements(By.TAG_NAME, "button"):
-            try:
-                text = (btn.text or "").strip().lower()
-                aria = (btn.get_attribute("aria-label") or "").strip().lower()
-                title = (btn.get_attribute("title") or "").strip().lower()
-            except Exception:
-                continue
 
-            if "add new field" in text or "add new field" in aria or "add new field" in title:
-                candidates.append(btn)
-                continue
-            if text == "add field" or aria == "add field" or title == "add field":
-                candidates.append(btn)
+        # Preferred root: the field-settings sidebar tab (matches Add new field button DOM)
+        try:
+            field_settings_tab_sel = (
+                config.BUILDER_SELECTORS.get("sidebars", {})
+                .get("field_settings", {})
+                .get("tab", ".designer__sidebar__tab[data-type='field-settings']")
+            )
+            field_settings_tab = driver.find_element(By.CSS_SELECTOR, field_settings_tab_sel)
+            if field_settings_tab.is_displayed():
+                add_btn_sel = (
+                    config.BUILDER_SELECTORS.get("sidebars", {})
+                    .get("field_settings", {})
+                    .get("add_new_button", "button[onclick*='toggleAddFields']")
+                )
+                candidates = field_settings_tab.find_elements(By.CSS_SELECTOR, add_btn_sel)
+                if not candidates:
+                    candidates = _find_add_new_buttons(field_settings_tab)
+                if candidates:
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        "Add-new-field button found in field-settings tab",
+                        **ctx,
+                    )
+        except Exception:
+            pass
+
+        # Fallback root: properties panel (legacy)
+        if not candidates:
+            try:
+                panel = driver.find_element(
+                    By.CSS_SELECTOR, config.BUILDER_SELECTORS["properties"]["root"]
+                )
+                candidates = _find_add_new_buttons(panel)
+                if candidates:
+                    self.session.emit_diag(
+                        Cat.SIDEBAR,
+                        "Add-new-field button found in properties panel",
+                        **ctx,
+                    )
+            except Exception:
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    "Field settings panel not visible for add-new-field fastpath",
+                    **ctx,
+                )
 
         if not candidates:
             self.session.emit_diag(
@@ -592,6 +643,51 @@ class CAActivityBuilder:
         spec: FieldTypeSpec = FIELD_TYPES[key]
         canvas_sel = spec.canvas_field_selector
 
+        def _emit_step_timing(step: str, start: float, cat: Cat = Cat.DROP, **extra) -> None:
+            try:
+                self.session.emit_diag(
+                    cat,
+                    "Step timing",
+                    step=step,
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    **self._ctx(kind="timing", spec=spec, fi=fi_index, a=step),
+                    **extra,
+                )
+            except Exception:
+                pass
+
+        def _log_sidebar_state(stage: str) -> None:
+            try:
+                fields_tab_visible = False
+                field_settings_tab_visible = False
+                fields_tab_sel = config.BUILDER_SELECTORS.get("sidebars", {}).get("fields", {}).get("tab")
+                if fields_tab_sel:
+                    try:
+                        el = driver.find_element(By.CSS_SELECTOR, fields_tab_sel)
+                        fields_tab_visible = el.is_displayed()
+                    except Exception:
+                        fields_tab_visible = False
+                try:
+                    tab = driver.find_element(
+                        By.CSS_SELECTOR,
+                        ".designer__sidebar__tab[data-type='field-settings']",
+                    )
+                    field_settings_tab_visible = tab.is_displayed()
+                except Exception:
+                    field_settings_tab_visible = False
+
+                self.session.emit_diag(
+                    Cat.SIDEBAR,
+                    f"Sidebar state {stage}",
+                    fields_tab_visible=fields_tab_visible,
+                    field_settings_tab_visible=field_settings_tab_visible,
+                    **self._ctx(kind="sidebar_state", spec=spec, fi=fi_index, a=stage),
+                )
+            except Exception:
+                pass
+
+        _log_sidebar_state("pre_add")
+
         handle = None
         sec_handle = None
 
@@ -610,8 +706,20 @@ class CAActivityBuilder:
             Return (elements, ids) for this field type in current section.
             IDs are strict and may be temporarily incomplete if DOM is mid-rerender.
             """
+            t_local = time.monotonic()
             els = driver.find_elements(By.CSS_SELECTOR, canvas_sel)
-            ids = { _field_id_strict(e) for e in els }
+            _emit_step_timing(
+                "snapshot_elements",
+                t_local,
+                count=len(els),
+            )
+            t_local = time.monotonic()
+            ids = {_field_id_strict(e) for e in els}
+            _emit_step_timing(
+                "snapshot_ids",
+                t_local,
+                count=len(ids),
+            )
             ids.discard("")
             return els, ids
         
@@ -752,9 +860,16 @@ class CAActivityBuilder:
         # Ensure section + canvas
         # -----------------------------
 
+        t_step = time.monotonic()
         sec_handle = sections.ensure_section_ready(
             section_title=section_title,
             index=section_index,
+        )
+        _emit_step_timing(
+            "ensure_section_ready",
+            t_step,
+            cat=Cat.SECTION,
+            section_id=getattr(sec_handle, "section_id", None),
         )
         if sec_handle is None:
             self.session.emit_signal(
@@ -767,21 +882,48 @@ class CAActivityBuilder:
             )
             return None
 
-        # Wait for the canvas to actually match the section we think is active
-        if not sections.wait_for_canvas_for_current_section():
-            self.session.emit_signal(
-                Cat.SECTION,
-                "Canvas not aligned with current section",
-                section_id=sec_handle.section_id,
-                section_title=sec_handle.title,
-                field_type=spec.display_name,
-                level="error",
-                **self._ctx(kind="canvas_align"),
+        # Fast probe, then fall back to the full wait if needed
+        t_step = time.monotonic()
+        with self._implicit_wait(0):
+            fast_aligned = sections.is_canvas_aligned_with_current_section()
+        _emit_step_timing(
+            "canvas_align_fast_probe",
+            t_step,
+            cat=Cat.SECTION,
+            aligned=fast_aligned,
+        )
+        if not fast_aligned:
+            self.session.counters.inc("section.canvas_align_fastpath_retry")
+            t_step = time.monotonic()
+            wait_ok = sections.wait_for_canvas_for_current_section()
+            _emit_step_timing(
+                "canvas_align_wait",
+                t_step,
+                cat=Cat.SECTION,
+                aligned=wait_ok,
             )
-            return None
+            if not wait_ok:
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Canvas not aligned with current section",
+                    section_id=sec_handle.section_id,
+                    section_title=sec_handle.title,
+                    field_type=spec.display_name,
+                    level="error",
+                    **self._ctx(kind="canvas_align"),
+                )
+                return None
 
         # Sanity check: we expect section layout (#section-fields) to be present
-        if not driver.find_elements(By.CSS_SELECTOR, "#section-fields"):
+        t_step = time.monotonic()
+        has_section_fields = bool(driver.find_elements(By.CSS_SELECTOR, "#section-fields"))
+        _emit_step_timing(
+            "section_fields_present",
+            t_step,
+            cat=Cat.SECTION,
+            present=has_section_fields,
+        )
+        if not has_section_fields:
             self.session.emit_signal(
                 Cat.SECTION,
                 "Section fields container missing",
@@ -803,11 +945,21 @@ class CAActivityBuilder:
 
         for create_attempt in range(1, max_create_attempts + 1):
             # Recompute before-count each create attempt, in case previous attempts partially changed things
-            before_fields, before_ids = _snapshot_fields()
+            t_step = time.monotonic()
+            with self._implicit_wait(0):
+                before_fields, before_ids = _snapshot_fields()
             before_count = len(before_fields)
             registry_ids = _registry_ids_for_current_section()
             dom_before_ids = self._get_active_section_field_ids() or []
             dom_before_set = set(dom_before_ids)
+            _emit_step_timing(
+                "snapshot_before",
+                t_step,
+                create_attempt=create_attempt,
+                before_count=before_count,
+                dom_before=len(dom_before_ids),
+                registry_known=len(registry_ids),
+            )
             self.session.emit_diag(
                 Cat.DROP,
                 "Create attempt section snapshot",
@@ -819,7 +971,14 @@ class CAActivityBuilder:
             )
 
             # Ensure correct sidebar tab + toolbox card is visible
+            t_step = time.monotonic()
             pane_locator = self._ensure_field_tab_visible(spec)
+            _emit_step_timing(
+                "ensure_field_tab_visible",
+                t_step,
+                pane_ready=bool(pane_locator),
+                create_attempt=create_attempt,
+            )
             if not pane_locator:
                 return None
 
@@ -935,6 +1094,7 @@ class CAActivityBuilder:
                         a=f"create={create_attempt}/drag={drag_attempt}",
                     )
                     try:
+                        t_drag = time.monotonic()
                         gesture = self._perform_drag_drop_gesture_by_id(
                             toolbox_item=toolbox_item,
                             dz_id=dz_id,
@@ -944,6 +1104,14 @@ class CAActivityBuilder:
                             drag_attempt=drag_attempt,
                             fi_index=fi_index,
                             dump_pre_drop_state=(not pre_drop_dumped),
+                        )
+                        _emit_step_timing(
+                            "drag_gesture",
+                            t_drag,
+                            create_attempt=create_attempt,
+                            drag_attempt=drag_attempt,
+                            ok=gesture.ok,
+                            reason=gesture.reason,
                         )
 
                         pre_drop_dumped = True
@@ -1708,6 +1876,7 @@ class CAActivityBuilder:
             (by, value) locator tuple for the active tab pane, or None on failure.
         """
         wait = self.session.wait
+        driver = self.session.driver
         ctx = self._ctx(kind="fields_tab", spec=spec)
 
         # 1. Make sure the Fields sidebar is open (try add-new-field fastpath first)
@@ -1813,6 +1982,27 @@ class CAActivityBuilder:
                 pane_value = config.BUILDER_SELECTORS["fields_sidebar"]["active_tab_pane"]
 
             pane_locator = (pane_by, pane_value)
+
+            # Fast probe: if tab is already active and pane is visible, skip waits.
+            try:
+                cls = tab_btn.get_attribute("class") or ""
+                aria = (tab_btn.get_attribute("aria-selected") or "").lower()
+                tab_ok = ("active" in cls) and (aria == "true")
+                if tab_ok:
+                    pane_el = driver.find_element(*pane_locator)
+                    pane_classes = pane_el.get_attribute("class") or ""
+                    pane_ok = ("show" in pane_classes) and ("active" in pane_classes)
+                    if pane_ok or pane_el.is_displayed():
+                        self.session.emit_diag(
+                            Cat.SIDEBAR,
+                            "Toolbox tab already active (fast-probe)",
+                            a=f"attempt={attempt}/3",
+                            tab=spec.sidebar_tab_label,
+                            **ctx,
+                        )
+                        return pane_locator
+            except Exception:
+                pass
 
             # 4. Wait until THIS tab is active and its pane is visible
             try:

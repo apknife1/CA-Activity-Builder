@@ -66,6 +66,7 @@ class ActivityBuildController:
         self.registry = ctx.registry
         self.reader = ctx.reader  # you said you’ve added this to AppContext
         self.deleter = ctx.deleter
+        self._builder_open_ts: float | None = None
 
     def _ctx(
         self,
@@ -280,6 +281,7 @@ class ActivityBuildController:
                             status = ActivityStatus.FAILED
                             reason = "open_activity_builder"
                             continue
+                    self._builder_open_ts = perf_counter()
 
                     # 5.3 Run the build loop for this single activity
                     ok = self._build_from_instruction(act, run_dir=run_dir)
@@ -483,6 +485,7 @@ class ActivityBuildController:
 
         # 1. Use the "Create Activity" button in the current view (active or inactive)
         # Both views should expose it, so avoid any navigation churn.
+        t_step = perf_counter()
         try:
             create_btn = wait.until(
                 EC.element_to_be_clickable(
@@ -499,10 +502,19 @@ class ActivityBuildController:
             )
             return CreateOutcome(status="error", error="create_button_not_found")
 
+        self.session.emit_diag(
+            Cat.NAV,
+            "Step timing",
+            step="create_button_ready",
+            elapsed_s=round(perf_counter() - t_step, 3),
+            **ctx,
+        )
+
         if not self.session.click_element_safely(create_btn):
             create_btn.click()
 
         # 3. Wait for offcanvas form to appear
+        t_step = perf_counter()
         try:
             form = wait.until(
                 EC.visibility_of_element_located((By.CSS_SELECTOR, "form#new_template"))
@@ -516,6 +528,14 @@ class ActivityBuildController:
                 **ctx,
             )
             return CreateOutcome(status="error", error="offcanvas_not_visible")
+
+        self.session.emit_diag(
+            Cat.NAV,
+            "Step timing",
+            step="create_offcanvas_visible",
+            elapsed_s=round(perf_counter() - t_step, 3),
+            **ctx,
+        )
 
         # 4. Fill Activity Title
         try:
@@ -1072,6 +1092,19 @@ class ActivityBuildController:
                 current_section_key = (sec_title, sec_index)
 
                 if fi_index == 0:
+                    if self._builder_open_ts is not None:
+                        self.session.emit_diag(
+                            Cat.NAV,
+                            "Step timing",
+                            step="builder_open_to_first_field",
+                            elapsed_s=round(perf_counter() - self._builder_open_ts, 3),
+                            **self._ctx(
+                                act=act,
+                                step="builder_open_to_first_field",
+                                extra={"sec_title": sec_title, "sec_index": sec_index},
+                            ),
+                        )
+                        self._builder_open_ts = None
                     self.session.emit_diag(
                         Cat.UISTATE,
                         "AUDIT SENTINEL: entered first section block",
@@ -1240,7 +1273,7 @@ class ActivityBuildController:
                     # If we successfully added a field, reset consecutive failure count
                     consecutive_failures = 0
 
-                    # ---- 2. Configure field ----
+                # ---- 2. Configure field ----
                 with phase_timer(session, f"{act.activity_code}: configure field {field_key}"):
                     # Build config from spec + defaults and configure the new field
                     cfg = build_field_config(fi)
@@ -1282,7 +1315,7 @@ class ActivityBuildController:
                             continue
                         if faults.should_fail_configure(fi_index):
                             raise RuntimeError(f"FAULT_INJECT: forced configure failure at fi_index={fi_index}")                       
-                        editor.configure_field_from_config(handle=handle, config=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
+                        editor.configure_field_from_config(handle=handle, cfg=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
 
                     except TableResizeError as e:
                         self.session.emit_signal(
@@ -1298,7 +1331,7 @@ class ActivityBuildController:
                         try:
                             self.session.refresh_page()  # or session.refresh_page() depending on your wiring
                             self.sections.ensure_section_ready(section_title=sec_title, index=sec_index)
-                            editor.configure_field_from_config(handle=handle, config=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
+                            editor.configure_field_from_config(handle=handle, cfg=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
                             consecutive_failures = 0
                             continue
                         except Exception as e2:
@@ -1315,7 +1348,7 @@ class ActivityBuildController:
                             self.deleter.delete_field_by_handle(handle)   # or activity_deleter.delete_field_by_id(handle.field_id)
                             new_handle = builder.add_field_from_spec(key=field_key, section_title=sec_title, section_index=sec_index)
                             if new_handle:
-                                editor.configure_field_from_config(handle=new_handle, config=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
+                                editor.configure_field_from_config(handle=new_handle, cfg=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
                                 consecutive_failures = 0
                                 continue
                             raise RuntimeError("Recreate returned None")
@@ -1340,7 +1373,7 @@ class ActivityBuildController:
                         try:
                             builder.session.refresh_page()
                             self.sections.ensure_section_ready(section_title=sec_title, index=sec_index)
-                            editor.configure_field_from_config(handle=handle, config=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
+                            editor.configure_field_from_config(handle=handle, cfg=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
                             consecutive_failures = 0
                             continue
                         except Exception as e2:
@@ -1835,7 +1868,7 @@ class ActivityBuildController:
 
                     # configure immediately (same as main loop)
                     cfg = build_field_config(fi)
-                    editor.configure_field_from_config(handle=handle, config=cfg, last_successful_handle=None)
+                    editor.configure_field_from_config(handle=handle, cfg=cfg, last_successful_handle=None)
 
                     # if configure recorded skips, not resolved
                     evs = editor.pop_skip_events()
@@ -1889,7 +1922,7 @@ class ActivityBuildController:
                         raise RuntimeError("recreate returned None during configure retry")
 
                     cfg = build_field_config(fi)
-                    editor.configure_field_from_config(handle=new_handle, config=cfg, last_successful_handle=None)
+                    editor.configure_field_from_config(handle=new_handle, cfg=cfg, last_successful_handle=None)
 
                     evs = editor.pop_skip_events()
                     if evs:

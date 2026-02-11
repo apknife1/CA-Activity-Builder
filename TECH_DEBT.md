@@ -56,6 +56,24 @@ Living ledger of known issues, TODOs, and refactor targets. Keep this list short
 **Symptom:** conservative sidebar ensures add overhead per field.
 **Next:** decide whether caching sidebar visibility / active tab state is safe. If yes, define proof + invalidation rules.
 
+### TD-023 - Field settings panel closes between fields
+
+**Status:** open
+**Symptom:** post-config cleanup/defocus closes field settings, forcing a sidebar toggle before each add.
+**Next:** decide whether to keep field settings open between adds and define safe UI reset behavior.
+
+### TD-024 - Complete add_field_from_spec flow review
+
+**Status:** open
+**Symptom:** flow review started; remaining steps may still contain avoidable waits.
+**Next:** finish the attempt-loop review and identify any additional safe optimizations.
+
+### TD-025 - Intermittent missing table headers during config
+
+**Status:** open
+**Symptom:** table fields occasionally lose header values (run-specific, non-deterministic).
+**Next:** capture repro run id(s), determine whether this is UI timing or config application, and implement a fix or workaround.
+
 ---
 
 ## 3. Feature Completeness

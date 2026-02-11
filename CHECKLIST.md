@@ -54,6 +54,21 @@ Definition of Done
 
 ---
 
+### CL-008 - Complete add_field_from_spec flow review
+
+Origin: TD-024
+
+Goal
+Finish the attempt-loop review and identify any additional safe optimizations.
+
+Definition of Done
+
+- Attempt-loop steps audited for redundant waits
+- Any safe optimizations implemented or explicitly rejected (with rationale)
+- Notes captured for follow-up if blocked by larger reset/flow work
+
+---
+
 ### CL-003 - Repo hygiene and artefact management
 
 Origin: TD-041
@@ -87,6 +102,38 @@ Definition of Done
 ---
 
 ## LATER (design or investigation)
+
+### CL-009 - Intermittent missing table headers in runs
+
+Origin: TD-025
+Risk: table outputs incomplete (header rows missing)
+
+Goal
+Investigate occasional missing table headers/values during field configuration runs.
+
+Definition of Done
+
+- Repro steps captured with run id(s)
+- Root cause identified (UI timing vs config/data)
+- Fix implemented or documented workaround
+
+---
+
+### CL-007 - Field settings panel retention between fields
+
+Origin: TD-023
+Risk: repeated sidebar toggles increase run time
+
+Goal
+Keep field settings open between sequential fields when safe, without breaking UI proof guarantees.
+
+Definition of Done
+
+- Decision documented (retain open or keep current close behavior)
+- If retaining open: define safe UI reset that preserves binding proof
+- Reduced `fields_sidebar` counter in runs without increased UI_STATE errors
+
+---
 
 ### CL-004 - TableCellConfig cell_type implementation
 

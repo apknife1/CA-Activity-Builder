@@ -84,6 +84,10 @@ BUILDER_SELECTORS = {
             "toggle_button": "button[data-type='fields']",
             "frame": None,  # no turbo-frame for fields
         },
+        "field_settings": {
+            "tab": ".designer__sidebar__tab[data-type='field-settings']",
+            "add_new_button": "button[onclick*='toggleAddFields']",
+        },
         "sections": {
             "tab": ".designer__sidebar__tab[data-type='sections']",
             # we still need special handling for onclick/text here, so this is optional

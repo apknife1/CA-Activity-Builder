@@ -1036,17 +1036,35 @@ class CASession:
         target = self._norm_title(title)
         ctx = self._ctx(kind="template_search", status=status, title=title)
 
+        def _emit_search_step(step: str, start: float, **extra) -> None:
+            try:
+                self.emit_diag(
+                    Cat.NAV,
+                    "Step timing",
+                    step=step,
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    **ctx,
+                    **extra,
+                )
+            except Exception:
+                pass
+
+        t_step = time.monotonic()
         self.go_to_activity_templates(inactive=(status == "inactive"))
+        _emit_search_step("nav_to_templates", t_step)
 
         sel = config.TEMPLATES_SELECTORS  # or config.TEMPLATES_SELECTORS
         wait = self.wait  # WebDriverWait instance
         driver = self.driver
 
         # Sentinel: results frame present
+        t_step = time.monotonic()
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
+        _emit_search_step("page_sentinel_wait", t_step)
 
         # Optional: set results per page = 100 (reduces paging overhead)
         try:
+            t_step = time.monotonic()
             per_page = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["per_page_select"])))
             current = per_page.get_attribute("value") or ""
             if current != "100":
@@ -1054,9 +1072,13 @@ class CASession:
                 self.counters.inc("templates.per_page_set")
             else:
                 self.counters.inc("templates.per_page_already")
+            _emit_search_step("per_page_select", t_step, current=current, target="100")
             # Changing items triggers a turbo stream update; best-effort prove by waiting for frame to be ready again
+            t_step = time.monotonic()
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
+            _emit_search_step("per_page_update_wait", t_step)
         except Exception as e:
+            _emit_search_step("per_page_select_failed", t_step, exc=type(e).__name__)
             self.emit_diag(
                 Cat.NAV,
                 f"Could not set results per page (continuing): {e}",
@@ -1070,23 +1092,31 @@ class CASession:
             before_first_row = rows[0]
 
         # Type into search (this uses table-search controller)
+        t_step = time.monotonic()
         search = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel["search_input"])))
         search.clear()
         search.send_keys(title)
+        _emit_search_step("search_input_fill", t_step)
 
         # Prove the list updated after typing (Turbo)
         if before_first_row is not None:
             try:
+                t_step = time.monotonic()
                 WebDriverWait(driver, 6).until(EC.staleness_of(before_first_row))
+                _emit_search_step("search_update_wait", t_step, mode="staleness")
             except Exception:
                 # If staleness didn't happen (sometimes it reuses nodes), we still proceed,
                 # but we avoid long waits; we'll scan what is present now.
+                _emit_search_step("search_update_wait", t_step, mode="staleness", ok=False)
                 pass
         else:
             # No rows beforehand; just wait for either rows to appear or some stable frame presence
+            t_step = time.monotonic()
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
+            _emit_search_step("search_update_wait", t_step, mode="sentinel")
 
-        def scan_current_page() -> TemplateMatch | None:
+        def scan_current_page(label: str) -> TemplateMatch | None:
+            t_scan = time.monotonic()
             rows = driver.find_elements(By.CSS_SELECTOR, sel["rows"])
             for r in rows:
                 try:
@@ -1111,18 +1141,27 @@ class CASession:
                     except Exception:
                         pass
 
-                    return TemplateMatch(title=row_title.strip(), code=code, href=href, template_id=template_id, status=status)
+                    match = TemplateMatch(
+                        title=row_title.strip(),
+                        code=code,
+                        href=href,
+                        template_id=template_id,
+                        status=status,
+                    )
+                    _emit_search_step(f"scan_{label}", t_scan, rows=len(rows), match=True)
+                    return match
                 except Exception:
                     continue
+            _emit_search_step(f"scan_{label}", t_scan, rows=len(rows), match=False)
             return None
 
         # First scan (usually sufficient because search filters globally)
-        match = scan_current_page()
+        match = scan_current_page("page_1")
         if match:
             return match
 
         # Fallback: paginate a few pages (only if search doesn’t filter globally / edge cases)
-        for _ in range(max_pages - 1):
+        for page_idx in range(2, max_pages + 1):
             next_btn = self._find_templates_next_button(driver)
             if next_btn is None:
                 break
@@ -1133,14 +1172,16 @@ class CASession:
             rows = driver.find_elements(By.CSS_SELECTOR, sel["rows"])
             before = rows[0] if rows else next_btn
 
+            t_step = time.monotonic()
             self.click_element_safely(next_btn)  # your safe click
 
             try:
                 WebDriverWait(driver, 6).until(EC.staleness_of(before))
             except Exception:
                 pass
+            _emit_search_step(f"paginate_wait_page_{page_idx}", t_step)
 
-            match = scan_current_page()
+            match = scan_current_page(f"page_{page_idx}")
             if match:
                 return match
 

@@ -436,7 +436,7 @@ class ActivityEditor:
     def configure_field_from_config(
         self,
         handle: FieldHandle,
-        config: BaseFieldConfig,
+        cfg: BaseFieldConfig,
         last_successful_handle: FieldHandle | None,
         prop_fault_inject: bool = False,
     ) -> None:
@@ -445,7 +445,7 @@ class ActivityEditor:
 
         This method is the main “edit” entry-point: it locates the field on the
         canvas using the provided FieldHandle, then applies any non-None settings
-        from the config object.
+        from the cfg object.
 
         Key behaviour / ordering
         ------------------------
@@ -454,15 +454,15 @@ class ActivityEditor:
         - If needed, derives the field_id from the element for downstream calls.
 
         2) Generic content:
-        - title (config.title) -> set_field_title()
-        - body_html (config.body_html) -> set_field_body()
+        - title (cfg.title) -> set_field_title()
+        - body_html (cfg.body_html) -> set_field_body()
 
         3) Type-specific structure (before properties):
         - Interactive table: when handle.field_type_key == "interactive_table"
-            and config is a TableConfig, applies table structure/overrides via
+            and cfg is a TableConfig, applies table structure/overrides via
             _configure_table_from_config() BEFORE toggling properties.
 
-        - Signature: when handle.field_type_key == "signature" and config is a
+        - Signature: when handle.field_type_key == "signature" and cfg is a
             SignatureConfig, derives signature-specific visibility/required values
             via _set_signature_config_specifics().
 
@@ -491,7 +491,7 @@ class ActivityEditor:
             FieldHandle describing the target field (field_id, field_type_key, and
             any other identifying metadata captured when the field was created or
             discovered on the canvas).
-        config:
+        cfg:
             BaseFieldConfig instance (or subclass such as ParagraphConfig,
             LongAnswerConfig, TableConfig, SignatureConfig). Only non-None attributes
             are applied.
@@ -499,7 +499,7 @@ class ActivityEditor:
         Raises
         ------
         TypeError
-            If config is not an instance of BaseFieldConfig.
+            If cfg is not an instance of BaseFieldConfig.
         """
 
         ctx_config = self._editor_ctx(
@@ -510,6 +510,24 @@ class ActivityEditor:
         )
         self.session.counters.inc("editor.configure_attempts")
         self.session.emit_diag(Cat.CONFIGURE, "Configure field start", **ctx_config)
+
+        def _emit_step_timing(step: str, start: float, cat: Cat = Cat.CONFIGURE, **extra) -> None:
+            try:
+                self.session.emit_diag(
+                    cat,
+                    "Step timing",
+                    step=step,
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    **self._editor_ctx(
+                        field_id=handle.field_id,
+                        section_id=handle.section_id,
+                        kind="configure",
+                        stage=step,
+                    ),
+                    **extra,
+                )
+            except Exception:
+                pass
 
         def _cleanup_canvas(stage: str) -> WebElement:
             t0 = time.monotonic()
@@ -535,14 +553,14 @@ class ActivityEditor:
             )
             return fresh     
 
-        if not isinstance(config, BaseFieldConfig):
+        if not isinstance(cfg, BaseFieldConfig):
             raise TypeError(
-                f"config must be a BaseFieldConfig, got {type(config).__name__}"
+                f"cfg must be a BaseFieldConfig, got {type(cfg).__name__}"
             )
 
         # Paragraph fields cannot be assessor update in CA.
-        if isinstance(config, ParagraphConfig) and config.assessor_visibility == "update":
-            config.assessor_visibility = "read"
+        if isinstance(cfg, ParagraphConfig) and cfg.assessor_visibility == "update":
+            cfg.assessor_visibility = "read"
 
         field_el = self.get_field_by_id(handle.field_id)
         pivot_el = None
@@ -554,77 +572,93 @@ class ActivityEditor:
                 pivot_el = None
 
         # --- 1) Generic title + body ---------------------------------------
-        if config.title is not None:
-            self.set_field_title(field_el, config.title)
+        if cfg.title is not None:
+            t_step = time.monotonic()
+            self.set_field_title(field_el, cfg.title)
+            _emit_step_timing("set_title", t_step)
             # field_el = _cleanup_canvas()
 
-        if config.body_html is not None:
-            self.set_field_body(field_el, config.body_html)
+        if cfg.body_html is not None:
+            t_step = time.monotonic()
+            self.set_field_body(field_el, cfg.body_html)
+            _emit_step_timing("set_body", t_step, cat=Cat.FROALA)
+            t_step = time.monotonic()
             self._probe_body_persistence(
                 field_id=handle.field_id,
                 field_el=field_el,
-                desired_html=config.body_html,
+                desired_html=cfg.body_html,
                 phase="pre-props",
                 allow_refind=True,
             )
+            _emit_step_timing("probe_body_pre_props", t_step, cat=Cat.FROALA)
+            t_step = time.monotonic()
             field_el = _cleanup_canvas("post_body")
+            _emit_step_timing("cleanup_post_body", t_step, cat=Cat.UISTATE)
 
         # --- 2) Configure Interactive table structure BEFORE properties ----------
-        if handle.field_type_key == "interactive_table" and isinstance(config, TableConfig):
+        if handle.field_type_key == "interactive_table" and isinstance(cfg, TableConfig):
             try:
-                self._configure_table_from_config(field_el, config)
+                t_step = time.monotonic()
+                self._configure_table_from_config(field_el, cfg)
+                _emit_step_timing("table_config", t_step, cat=Cat.TABLE)
             except Exception as e:
                 self._record_config_skip(
                     kind="configure",
                     reason=f"table configure exception: {type(e).__name__}: {e}",
                     retryable=True,
                     field_id=handle.field_id,
-                    field_title=config.title,
+                    field_title=cfg.title,
                     requested={"field_type_key": handle.field_type_key},
                 )
                 raise                
             self.session.emit_diag(
                 Cat.TABLE,
-                f"Interactive table: {config.title!r} configured.",
+                f"Interactive table: {cfg.title!r} configured.",
                 **self._editor_ctx(
                     field_id=handle.field_id,
                     section_id=handle.section_id,
                     kind="table_config",
                 ),
             )
+            t_step = time.monotonic()
             field_el = _cleanup_canvas("post_table")
+            _emit_step_timing("cleanup_post_table", t_step, cat=Cat.UISTATE)
 
-        if handle.field_type_key =="single_choice" and isinstance(config, SingleChoiceConfig):
+        if handle.field_type_key =="single_choice" and isinstance(cfg, SingleChoiceConfig):
             try:
-                self._configure_single_choice_answers(field_el, config.options, config.correct_index)
+                t_step = time.monotonic()
+                self._configure_single_choice_answers(field_el, cfg.options, cfg.correct_index)
+                _emit_step_timing("single_choice_config", t_step, cat=Cat.CONFIGURE)
             except Exception as e:
                 self._record_config_skip(
                     kind="configure",
                     reason=f"single choice configure exception: {type(e).__name__}: {e}",
                     retryable=True,
                     field_id=handle.field_id,
-                    field_title=config.title,
+                    field_title=cfg.title,
                     requested={"field_type_key": handle.field_type_key},
                 )
                 raise
+            t_step = time.monotonic()
             field_el = _cleanup_canvas("post_single_choice")
+            _emit_step_timing("cleanup_post_single_choice", t_step, cat=Cat.UISTATE)
 
         # --- 3) Visibility + marking properties ----------------------------
         # Question-like configs extend BaseFieldConfig with these attributes.
-        required = getattr(config, "required", None)
-        marking_type = getattr(config, "marking_type", None)
-        model_answer_html = getattr(config, "model_answer_html", None)
-        enable_assessor_comments = getattr(config, "enable_assessor_comments", None)
+        required = getattr(cfg, "required", None)
+        marking_type = getattr(cfg, "marking_type", None)
+        model_answer_html = getattr(cfg, "model_answer_html", None)
+        enable_assessor_comments = getattr(cfg, "enable_assessor_comments", None)
 
         field_el = self.get_field_by_id(handle.field_id)
         field_id = handle.field_id or self.get_field_id_from_element(field_el)
 
         # --- 4) Set signature specifics ------------------------
-        if handle.field_type_key == "signature" and isinstance(config, SignatureConfig):
-            learner_visibility, assessor_visibility, sig_required = self._set_signature_config_specifics(config)
+        if handle.field_type_key == "signature" and isinstance(cfg, SignatureConfig):
+            learner_visibility, assessor_visibility, sig_required = self._set_signature_config_specifics(cfg)
             # Update config with derived values
-            config.learner_visibility = learner_visibility
-            config.assessor_visibility = assessor_visibility
+            cfg.learner_visibility = learner_visibility
+            cfg.assessor_visibility = assessor_visibility
             required = sig_required
 
         # Bug out early if we are skipping the property setting because of debug fault injector
@@ -648,9 +682,9 @@ class ActivityEditor:
         )
 
         props_list = [
-            ("hide_in_report", config.hide_in_report),
-            ("learner_visibility", config.learner_visibility),
-            ("assessor_visibility", config.assessor_visibility),
+            ("hide_in_report", cfg.hide_in_report),
+            ("learner_visibility", cfg.learner_visibility),
+            ("assessor_visibility", cfg.assessor_visibility),
             ("required", required),
             ("marking_type", marking_type),
             ("enable_model_answer", enable_model_answer),
@@ -676,31 +710,40 @@ class ActivityEditor:
         if any(
             value is not None
             for value in (
-                config.hide_in_report,
-                config.learner_visibility,
-                config.assessor_visibility,
+                cfg.hide_in_report,
+                cfg.learner_visibility,
+                cfg.assessor_visibility,
                 required,
                 marking_type,
                 enable_assessor_comments,
                 model_answer_html,
             )
         ):
+            t_step = time.monotonic()
             self.set_field_properties(
                 field_el,
                 pivot_el,
-                hide_in_report=config.hide_in_report,
-                learner_visibility=config.learner_visibility,
-                assessor_visibility=config.assessor_visibility,
+                hide_in_report=cfg.hide_in_report,
+                learner_visibility=cfg.learner_visibility,
+                assessor_visibility=cfg.assessor_visibility,
                 required=required,
                 marking_type=marking_type,
                 enable_model_answer=enable_model_answer,
                 enable_assessor_comments=enable_assessor_comments,
             )
+            _emit_step_timing(
+                "set_properties",
+                t_step,
+                cat=Cat.PROPS,
+                properties=",".join(requested_props),
+            )
 
         # 5) Model answer content (canvas Froala)
         if model_answer_html and field_id:
             try:
+                t_step = time.monotonic()
                 self.set_field_model_answer(field_id, model_answer_html)
+                _emit_step_timing("set_model_answer", t_step, cat=Cat.FROALA)
             except TimeoutException:
                 self.session.emit_signal(
                     Cat.FROALA,
@@ -726,10 +769,46 @@ class ActivityEditor:
                 )
             return
         
+        t_step = time.monotonic()
         self._verify_body_after_properties_and_recover_once(
             handle=handle,
-            desired_html=config.body_html,
+            desired_html=cfg.body_html,
         )
+        _emit_step_timing("verify_body_post_props", t_step, cat=Cat.FROALA)
+
+        try:
+            fields_tab_visible = False
+            field_settings_tab_visible = False
+            fields_tab_sel = config.BUILDER_SELECTORS.get("sidebars", {}).get("fields", {}).get("tab")
+            if fields_tab_sel:
+                try:
+                    el = self.driver.find_element(By.CSS_SELECTOR, fields_tab_sel)
+                    fields_tab_visible = el.is_displayed()
+                except Exception:
+                    fields_tab_visible = False
+            try:
+                tab = self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    ".designer__sidebar__tab[data-type='field-settings']",
+                )
+                field_settings_tab_visible = tab.is_displayed()
+            except Exception:
+                field_settings_tab_visible = False
+
+            self.session.emit_diag(
+                Cat.SIDEBAR,
+                "Sidebar state after configure",
+                fields_tab_visible=fields_tab_visible,
+                field_settings_tab_visible=field_settings_tab_visible,
+                **self._editor_ctx(
+                    field_id=handle.field_id,
+                    section_id=handle.section_id,
+                    kind="sidebar_state",
+                    stage="post_configure",
+                ),
+            )
+        except Exception:
+            pass
 
     # ---------- title ----------
 
@@ -745,6 +824,19 @@ class ActivityEditor:
         except Exception:
             fid = None
         ctx = self._editor_ctx(field_id=fid, kind="title")
+
+        def _emit_title_step(step: str, start: float, **extra) -> None:
+            try:
+                self.session.emit_diag(
+                    Cat.CONFIGURE,
+                    "Step timing",
+                    step=f"title_{step}",
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    **ctx,
+                    **extra,
+                )
+            except Exception:
+                pass
 
         def _refresh_field_el():
             nonlocal field_el
@@ -790,10 +882,12 @@ class ActivityEditor:
             try:
                 _refresh_field_el()
 
+                t_step = time.monotonic()
                 title_display = field_el.find_element(
                     By.CSS_SELECTOR,
                     ".designer__field__editable-label--title h2.field__editable-label"
                 )
+                _emit_title_step(f"locate_display_a{attempt}", t_step)
 
                 self.session.emit_diag(
                     Cat.CONFIGURE,
@@ -802,17 +896,22 @@ class ActivityEditor:
                 )
 
                 # Activate editor
+                t_step = time.monotonic()
                 if not self.session.click_element_safely(title_display):
                     title_display.click()
+                _emit_title_step(f"activate_a{attempt}", t_step)
 
                 # Find the input directly (no closure variable)
+                t_step = time.monotonic()
                 title_input = field_el.find_element(
                     By.CSS_SELECTOR,
                     ".designer__field__editable-label--title input[name='title']"
                 )
 
                 WebDriverWait(self.driver, 2.0).until(lambda d: title_input.is_displayed() and title_input.is_enabled())
+                _emit_title_step(f"input_ready_a{attempt}", t_step)
 
+                t_step = time.monotonic()
                 try:
                     title_input.clear()
                 except Exception:
@@ -821,10 +920,13 @@ class ActivityEditor:
 
                 title_input.send_keys(title_text)
                 title_input.send_keys(Keys.TAB)
+                _emit_title_step(f"apply_text_a{attempt}", t_step)
 
                 # Verification: prefer input value if still present; else read the display title
+                t_step = time.monotonic()
                 _refresh_field_el()
                 observed = _read_input_value_if_present() or _read_display_title()
+                _emit_title_step(f"verify_a{attempt}", t_step)
 
                 if observed == desired:
                     self.session.emit_diag(
@@ -1172,6 +1274,7 @@ class ActivityEditor:
         Froala/CA may normalize tags/whitespace, so we compare a text signature.
         """
         s = (s or "").strip()
+        s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
         s = re.sub(r"<[^>]+>", "", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s[:max_len]
@@ -1203,6 +1306,7 @@ class ActivityEditor:
         def sig_full(html: str) -> str:
             # stronger signature than 60 chars to avoid collisions
             txt = re.sub(r"<[^>]+>", "", (html or ""))
+            txt = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", txt)
             txt = re.sub(r"\s+", " ", txt).strip()
             # include length + head/tail
             if not txt:
@@ -1296,6 +1400,20 @@ class ActivityEditor:
         except Exception:
             fid = None
         ctx = self._editor_ctx(field_id=fid, kind="froala", stage=log_label)
+
+        def _emit_froala_step(step: str, start: float, **extra) -> None:
+            try:
+                self.session.emit_diag(
+                    Cat.FROALA,
+                    "Step timing",
+                    step=step,
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    block=log_label,
+                    **ctx,
+                    **extra,
+                )
+            except Exception:
+                pass
 
         def _refind_field():
             nonlocal field_el
@@ -1406,14 +1524,23 @@ class ActivityEditor:
             except Exception:
                 pass
 
+            t_step = time.monotonic()
             wait.until(_block_and_editor_present)
+            _emit_froala_step("froala_block_ready", t_step)
 
             last_state = None
             last_reason = None
 
             for attempt in range(1, 4):
                 try:
+                    t_step = time.monotonic()
                     res = driver.execute_script(script_set, field_el, desired, block_selector, textarea_selector) or {}
+                    _emit_froala_step(
+                        f"froala_js_set_a{attempt}",
+                        t_step,
+                        ok=res.get("ok"),
+                        reason=res.get("reason"),
+                    )
                     if not res.get("ok"):
                         last_reason = res.get("reason")
                         self.session.emit_diag(
@@ -1426,24 +1553,31 @@ class ActivityEditor:
                         continue
 
                     # Defocus to encourage commit
+                    t_step = time.monotonic()
                     try:
                         canvas = driver.find_element(By.CSS_SELECTOR, "#section-fields")
                         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", canvas)
                         canvas.click()
                     except Exception:
                         pass
+                    _emit_froala_step(f"froala_defocus_a{attempt}", t_step)
 
                     # Best-effort allow Turbo patch/hydration
+                    t_step = time.monotonic()
                     self._wait_turbo_idle(timeout=2.5)
+                    _emit_froala_step(f"froala_idle_1_a{attempt}", t_step)
 
                     # Read immediately (current node)
+                    t_step = time.monotonic()
                     state1 = self._read_froala_block_state(
                         field_el,
                         block_selector=block_selector,
                         textarea_selector=textarea_selector,
                     )
                     last_state = state1
-                    if not _contains_signature(state1):
+                    ok1 = _contains_signature(state1)
+                    _emit_froala_step(f"froala_verify_1_a{attempt}", t_step, ok=ok1)
+                    if not ok1:
                         self.session.emit_diag(
                             Cat.FROALA,
                             (
@@ -1457,16 +1591,21 @@ class ActivityEditor:
                         continue
 
                     # Re-find field (forces us to survive Turbo swaps) and verify again
+                    t_step = time.monotonic()
                     _refind_field()
                     self._wait_turbo_idle(timeout=2.5)
+                    _emit_froala_step(f"froala_refind_idle_a{attempt}", t_step)
 
+                    t_step = time.monotonic()
                     state2 = self._read_froala_block_state(
                         field_el,
                         block_selector=block_selector,
                         textarea_selector=textarea_selector,
                     )
                     last_state = state2
-                    if _contains_signature(state2):
+                    ok2 = _contains_signature(state2)
+                    _emit_froala_step(f"froala_verify_2_a{attempt}", t_step, ok=ok2)
+                    if ok2:
                         self.session.emit_diag(
                             Cat.FROALA,
                             f"{log_label} set successfully (persisted + verified).",
@@ -2354,6 +2493,19 @@ class ActivityEditor:
         field_type = _infer_field_type_key(field_el)
         fid = self.get_field_id_from_element(field_el)
         title = self.get_field_title(field_el)
+
+        def _emit_prop_step(step: str, start: float, **extra) -> None:
+            try:
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    "Step timing",
+                    step=step,
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    **self._editor_ctx(field_id=fid, kind="properties", stage=step),
+                    **extra,
+                )
+            except Exception:
+                pass
         self.session.emit_diag(
             Cat.PROPS,
             f"set_field_properties: field_type={field_type} field_id={fid} title={title!r}",
@@ -2414,7 +2566,9 @@ class ActivityEditor:
             enable_assessor_comments = None
 
         # --- get the properties frame robustly ---
+        t_step = time.monotonic()
         frame = _open_props_frame_with_retry(retries=3)
+        _emit_prop_step("props_open_frame", t_step, ok=frame is not None)
         if frame is None:
             fid = None
             title_txt = None
@@ -2458,7 +2612,16 @@ class ActivityEditor:
         # --- hide_in_report ---
         try:
             if hide_in_report is not None:
-                self._set_checkbox(props["hide_in_report_checkbox"], hide_in_report, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+                t_step = time.monotonic()
+                self._set_checkbox(
+                    props["hide_in_report_checkbox"],
+                    hide_in_report,
+                    root=frame,
+                    expected_field_id=fid,
+                    expected_title=title,
+                    field_el=field_el,
+                )
+                _emit_prop_step("props_hide_in_report", t_step, desired=hide_in_report)
         except Exception as e:
             self.session.emit_diag(
                 Cat.PROPS,
@@ -2478,12 +2641,19 @@ class ActivityEditor:
                 }
                 target_value = value_map.get(learner_visibility)
                 if target_value:
+                    t_step = time.monotonic()
                     ok = _set_radio_by_value_with_verify(
                         frame,
                         name="learners",
                         target_value=target_value,
                         label=f"learner visibility ({learner_visibility})",
                                     )
+                    _emit_prop_step(
+                        "props_learner_visibility",
+                        t_step,
+                        desired=learner_visibility,
+                        ok=ok,
+                    )
                     if not ok:
                         missed["learner_visibility"] = f"verify failed (wanted={target_value})"
                 else:
@@ -2512,11 +2682,18 @@ class ActivityEditor:
                 }
                 target_value = value_map.get(assessor_visibility)
                 if target_value:
+                    t_step = time.monotonic()
                     ok = _set_radio_by_value_with_verify(
                         frame,
                         name="assessors",
                         target_value=target_value,
                         label=f"assessor visibility ({assessor_visibility})",
+                    )
+                    _emit_prop_step(
+                        "props_assessor_visibility",
+                        t_step,
+                        desired=assessor_visibility,
+                        ok=ok,
                     )
                     if not ok:
                         missed["assessor_visibility"] = f"verify failed (wanted={target_value})"
@@ -2539,7 +2716,16 @@ class ActivityEditor:
         # --- required_field ---
         try:
             if required is not None:
-                self._set_checkbox(props["required_checkbox"], required, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+                t_step = time.monotonic()
+                self._set_checkbox(
+                    props["required_checkbox"],
+                    required,
+                    root=frame,
+                    expected_field_id=fid,
+                    expected_title=title,
+                    field_el=field_el,
+                )
+                _emit_prop_step("props_required", t_step, desired=required)
         except Exception as e:
             self.session.emit_diag(
                 Cat.PROPS,
@@ -2567,7 +2753,9 @@ class ActivityEditor:
                     f"Setting marking_type to '{marking_type}'...",
                     **self._editor_ctx(field_id=fid, kind="properties"),
                 )
+                t_step = time.monotonic()
                 ok = driver.execute_script(script, frame, marking_type)
+                _emit_prop_step("props_marking_type", t_step, desired=marking_type, ok=ok)
                 if not ok:
                     missed["marking_type"] = "select[name='marking_type'] not found or change not applied"
         except Exception as e:
@@ -2580,7 +2768,16 @@ class ActivityEditor:
         # --- model_answer switch ---
         try:
             if enable_model_answer is not None:
-                self._set_checkbox(props["model_answer_toggle"], enable_model_answer, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+                t_step = time.monotonic()
+                self._set_checkbox(
+                    props["model_answer_toggle"],
+                    enable_model_answer,
+                    root=frame,
+                    expected_field_id=fid,
+                    expected_title=title,
+                    field_el=field_el,
+                )
+                _emit_prop_step("props_model_answer_toggle", t_step, desired=enable_model_answer)
         except Exception as e:
             self.session.emit_diag(
                 Cat.PROPS,
@@ -2592,7 +2789,16 @@ class ActivityEditor:
         # --- assessor_comments switch ---
         try:
             if enable_assessor_comments is not None:
-                self._set_checkbox(props["assessor_comments_toggle"], enable_assessor_comments, root=frame, expected_field_id=fid, expected_title=title, field_el=field_el)
+                t_step = time.monotonic()
+                self._set_checkbox(
+                    props["assessor_comments_toggle"],
+                    enable_assessor_comments,
+                    root=frame,
+                    expected_field_id=fid,
+                    expected_title=title,
+                    field_el=field_el,
+                )
+                _emit_prop_step("props_assessor_comments_toggle", t_step, desired=enable_assessor_comments)
         except Exception as e:
             self.session.emit_diag(
                 Cat.PROPS,
@@ -3091,6 +3297,24 @@ class ActivityEditor:
             field_handle = self.registry.get_field(field_id)
             section_id = field_handle.section_id if field_handle else ""
 
+        def _emit_table_step(step: str, start: float, **extra) -> None:
+            try:
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    "Step timing",
+                    step=step,
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    **self._editor_ctx(
+                        field_id=field_id,
+                        section_id=section_id,
+                        kind="table",
+                        stage=step,
+                    ),
+                    **extra,
+                )
+            except Exception:
+                pass
+
         def _fresh_field_el():
             if not field_id:
                 return field_el
@@ -3110,6 +3334,7 @@ class ActivityEditor:
                 self.session.counters.inc(f"editor.table_stage_{stage_name}_attempts")
                 if attempt > 1:
                     self.session.counters.inc(f"editor.table_stage_{stage_name}_retries")
+                t_step = time.monotonic()
                 try:
                     fresh = _fresh_field_el()
                     fn(fresh)
@@ -3120,6 +3345,7 @@ class ActivityEditor:
                         attempt=attempt,
                         **ctx_stage,
                     )
+                    _emit_table_step(f"table_{stage_name}_a{attempt}", t_step, ok=True)
                     return True
                 except StaleElementReferenceException as e:
                     self.session.counters.inc(f"editor.table_stage_{stage_name}_stale")
@@ -3130,6 +3356,7 @@ class ActivityEditor:
                         exc=str(e),
                         **ctx_stage,
                     )
+                    _emit_table_step(f"table_{stage_name}_a{attempt}", t_step, ok=False, exc=type(e).__name__)
                 except NoSuchElementException as e:
                     self.session.counters.inc(f"editor.table_stage_{stage_name}_missing")
                     self.session.emit_diag(
@@ -3139,6 +3366,7 @@ class ActivityEditor:
                         exc=str(e),
                         **ctx_stage,
                     )
+                    _emit_table_step(f"table_{stage_name}_a{attempt}", t_step, ok=False, exc=type(e).__name__)
                 except TableResizeError as e:
                     self.session.counters.inc(f"editor.table_stage_{stage_name}_resize_error")
                     self.session.emit_diag(
@@ -3148,6 +3376,7 @@ class ActivityEditor:
                         exc=str(e),
                         **ctx_stage,
                     )
+                    _emit_table_step(f"table_{stage_name}_a{attempt}", t_step, ok=False, exc=type(e).__name__)
                     raise
                 except Exception as e:
                     self.session.counters.inc(f"editor.table_stage_{stage_name}_error")
@@ -3158,6 +3387,7 @@ class ActivityEditor:
                         exc=str(e),
                         **ctx_stage,
                     )
+                    _emit_table_step(f"table_{stage_name}_a{attempt}", t_step, ok=False, exc=type(e).__name__)
 
                 if attempt < attempts:
                     time.sleep(sleep_s)

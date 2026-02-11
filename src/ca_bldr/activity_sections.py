@@ -3,6 +3,7 @@
 import re
 import time
 from typing import Optional, Iterable, Any
+from contextlib import contextmanager
 
 from dataclasses import replace
 
@@ -55,6 +56,15 @@ class ActivitySections:
         self.current_section_handle: Optional[SectionHandle] = None
 
         self._sections_list_cache = None
+
+    @contextmanager
+    def _implicit_wait(self, seconds: float):
+        driver = self.driver
+        driver.implicitly_wait(seconds)
+        try:
+            yield
+        finally:
+            driver.implicitly_wait(config.IMPLICIT_WAIT)
 
     def _section_ctx(self, *, action: str, attempt: str | None = None) -> dict[str, Any]:
         ctx: dict[str, Any] = {
@@ -338,19 +348,20 @@ class ActivitySections:
 
         def _fetch() -> list:
             # Prefer not to toggle sidebar if already visible
+            frame = None
             try:
                 if self._is_sections_sidebar_visible():
-                    pass
+                    try:
+                        with self._implicit_wait(0):
+                            frame = self._get_sections_frame()
+                    except Exception:
+                        frame = None
                 else:
-                    if not self._ensure_sidebar_visible():
-                        self.session.emit_signal(
-                            Cat.SECTION,
-                            "Sections sidebar not visible; returning empty list",
-                            level="warning",
-                            **self._section_ctx(action="list"),
-                        )
-                        return []
+                    frame = None
             except Exception:
+                frame = None
+
+            if frame is None:
                 # fallback to original behaviour
                 if not self._ensure_sidebar_visible():
                     self.session.emit_signal(
@@ -360,11 +371,12 @@ class ActivitySections:
                         **self._section_ctx(action="list"),
                     )
                     return []
+                frame = self._get_sections_frame()
 
-            frame = self._get_sections_frame()
             items_sel = config.BUILDER_SELECTORS["sections"]["items"]
 
-            sections = frame.find_elements(By.CSS_SELECTOR, items_sel)
+            with self._implicit_wait(0):
+                sections = frame.find_elements(By.CSS_SELECTOR, items_sel)
             self.session.emit_diag(
                 Cat.SECTION,
                 "Found editable sections in sidebar",
@@ -415,7 +427,8 @@ class ActivitySections:
 
         try:
             # Root sidebar container should exist when any sidebar is open.
-            sidebar_list = driver.find_elements(By.CSS_SELECTOR, "div.designer__sidebar")
+            with self._implicit_wait(0):
+                sidebar_list = driver.find_elements(By.CSS_SELECTOR, "div.designer__sidebar")
             if not sidebar_list:
                 return False
 
@@ -424,7 +437,8 @@ class ActivitySections:
                 return False
 
             # The sections panel is explicitly a tab with data-type="sections"
-            tab_list = sidebar.find_elements(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='sections']")
+            with self._implicit_wait(0):
+                tab_list = sidebar.find_elements(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='sections']")
             if not tab_list:
                 return False
 
@@ -725,41 +739,100 @@ class ActivitySections:
         """
         ctx = self._section_ctx(action="select_by_handle")
 
-        li = self._find_section_li_for_handle(handle)
-        if li is None:
-            return None
+        last_err: Exception | None = None
 
-        section_id = self._select(li)
-        if section_id is None:
-            return None
+        for attempt in range(1, 3):
+            li = self._find_section_li_for_handle(handle)
+            if li is None:
+                return None
 
-        # Rebuild handle from the actual li (title/index might have changed)
-        frame = self._get_sections_frame()
-        items_sel = config.BUILDER_SELECTORS["sections"]["items"]
-        sections = frame.find_elements(By.CSS_SELECTOR, items_sel)
-        try:
-            index = sections.index(li)
-        except ValueError:
+            try:
+                section_id = self._select(li)
+            except StaleElementReferenceException as e:
+                last_err = e
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Stale element while selecting section by handle",
+                    section_id=handle.section_id,
+                    attempt=attempt,
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
+                )
+                continue
+            except Exception as e:
+                last_err = e
+                self.session.emit_signal(
+                    Cat.SECTION,
+                    "Unexpected error while selecting section by handle",
+                    section_id=handle.section_id,
+                    attempt=attempt,
+                    exception=str(e),
+                    level="warning",
+                    **ctx,
+                )
+                return None
+
+            if section_id is None:
+                return None
+
+            # Rebuild handle from the actual li (title/index might have changed)
             index = handle.index
+            try:
+                frame = self._get_sections_frame()
+                items_sel = config.BUILDER_SELECTORS["sections"]["items"]
+                sections = frame.find_elements(By.CSS_SELECTOR, items_sel)
 
-        resolved_handle = SectionHandle(
-            section_id=section_id,
-            title=handle.title,
-            index=index,
-        )
-        self.current_section_handle = resolved_handle
-        self.registry.add_or_update_section(resolved_handle)
+                li_fresh = None
+                if handle.section_id:
+                    try:
+                        li_fresh = frame.find_element(
+                            By.CSS_SELECTOR,
+                            f"li#designer__sidebar__item--{handle.section_id}",
+                        )
+                    except Exception:
+                        li_fresh = None
 
-        self.session.emit_diag(
-            Cat.SECTION,
-            "Selected section with handle",
-            section_id=resolved_handle.section_id,
-            section_title=resolved_handle.title,
-            section_index=resolved_handle.index,
-            **ctx,
-        )
-        if resolved_handle.section_id == handle.section_id:
-            return handle
+                if li_fresh is not None:
+                    try:
+                        index = sections.index(li_fresh)
+                    except ValueError:
+                        index = handle.index
+                else:
+                    try:
+                        index = sections.index(li)
+                    except ValueError:
+                        index = handle.index
+            except Exception:
+                index = handle.index
+
+            resolved_handle = SectionHandle(
+                section_id=section_id,
+                title=handle.title,
+                index=index,
+            )
+            self.current_section_handle = resolved_handle
+            self.registry.add_or_update_section(resolved_handle)
+
+            self.session.emit_diag(
+                Cat.SECTION,
+                "Selected section with handle",
+                section_id=resolved_handle.section_id,
+                section_title=resolved_handle.title,
+                section_index=resolved_handle.index,
+                **ctx,
+            )
+            return resolved_handle
+
+        if last_err is not None:
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Failed to select section by handle after retries",
+                section_id=handle.section_id,
+                exception=str(last_err),
+                level="warning",
+                **ctx,
+            )
         return None
 
     def _find_section_li_for_handle(self, handle: SectionHandle):
@@ -999,23 +1072,37 @@ class ActivitySections:
 
         try:
             ch = self.select_by_handle(handle)
-            if not ch:
-                self.session.emit_signal(
+            if ch:
+                self.session.emit_diag(
                     Cat.SECTION,
-                    "select_by_handle succeeded but current_section_handle is None (unexpected)",
-                    level="warning",
+                    "Selected section by id",
+                    section_id=ch.section_id,
+                    section_title=ch.title,
+                    section_index=ch.index,
                     **ctx,
                 )
-                return None            
-            self.session.emit_diag(
+                return self.current_section_handle
+
+            current = self.current_section_handle
+            if current and current.section_id == section_id:
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Selected section by id (current handle already set)",
+                    section_id=current.section_id,
+                    section_title=current.title,
+                    section_index=current.index,
+                    **ctx,
+                )
+                return current
+
+            self.session.emit_signal(
                 Cat.SECTION,
-                "Selected section by id",
-                section_id=ch.section_id,
-                section_title=ch.title,
-                section_index=ch.index,
+                "select_by_id failed to confirm selection",
+                section_id=section_id,
+                level="warning",
                 **ctx,
             )
-            return self.current_section_handle
+            return None
         except Exception as e:
             self.session.emit_signal(
                 Cat.SECTION,
@@ -1459,6 +1546,28 @@ class ActivitySections:
         # Special-case: Information
         # -----------------------------
         if section_title and section_title.strip().lower() == "information":
+            current = self.current_section_handle
+            if current and (
+                current.section_id == "information"
+                or (current.title or "").strip().lower() == "information"
+            ):
+                try:
+                    if self.wait_for_canvas_for_current_section(timeout=3):
+                        self.session.emit_diag(
+                            Cat.SECTION,
+                            "Fast-path: Information section already active and aligned",
+                            section_id=current.section_id,
+                            section_title=current.title,
+                            **ctx,
+                        )
+                        try:
+                            self.registry.add_or_update_section(current)
+                        except Exception:
+                            pass
+                        return current
+                except Exception:
+                    pass
+
             handle = SectionHandle(
                 section_id="information",
                 title="Information",
@@ -1609,6 +1718,35 @@ class ActivitySections:
 
             # After creation/rename, rely on current_section_handle (your existing pattern)
             created_handle = getattr(self, "current_section_handle", None) or new_section
+
+            if created_handle and created_handle.section_id:
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Confirming alignment after create/rename",
+                    section_id=created_handle.section_id,
+                    section_title=created_handle.title,
+                    **ctx,
+                )
+                try:
+                    self.select_by_id(created_handle.section_id)
+                    if not self.wait_for_canvas_for_current_section(timeout=5):
+                        self.session.emit_signal(
+                            Cat.SECTION,
+                            "Timed out waiting for canvas align after create/rename",
+                            section_id=created_handle.section_id,
+                            level="warning",
+                            **ctx,
+                        )
+                except Exception as e:
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        "Post-create alignment confirm failed",
+                        section_id=created_handle.section_id,
+                        exception=str(e),
+                        level="warning",
+                        **ctx,
+                    )
+
             try:
                 self.registry.add_or_update_section(created_handle)
             except Exception:
@@ -2027,38 +2165,22 @@ class ActivitySections:
         )
         return True
 
-    def wait_for_canvas_for_current_section(self, timeout: int = 10) -> bool:
+    def is_canvas_aligned_with_current_section(self) -> bool:
         """
-        Wait until the Activity Builder canvas (create_field_path / designer_fields frame)
-        is aligned with current_section_handle.section_id.
-
-        Best-effort: logs a warning on timeout but does not raise.
+        Fast, non-blocking alignment probe. Returns True only when alignment can be proven.
         """
         driver = self.driver
-        ctx = self._section_ctx(action="canvas_align")
-
-        self.session.counters.inc("section.canvas_align_checks")
-
         handle = self.current_section_handle
         if not handle or not handle.section_id:
-            self.session.emit_signal(
-                Cat.SECTION,
-                "wait_for_canvas_for_current_section called but no current_section_handle or section_id is set",
-                level="warning",
-                **ctx,
-            )
             return False
-
-        wait = self.session.get_wait(timeout)
 
         title = (handle.title or "").strip().lower()
         section_id = (handle.section_id or "").strip()
 
-        # --- SPECIAL CASE: Information ---
-        if section_id == "information" or title == "information":
-            info_fragment = "/sections/information"
-
-            def _canvas_is_information(_):
+        with self._implicit_wait(0):
+            # Information special-case
+            if section_id == "information" or title == "information":
+                info_fragment = "/sections/information"
                 try:
                     frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#designer_fields")
                     src = (frame.get_attribute("src") or "").strip()
@@ -2066,52 +2188,20 @@ class ActivitySections:
                         return True
                 except Exception:
                     pass
-
                 try:
                     url = (driver.current_url or "").strip()
                     if info_fragment in url:
                         return True
                 except Exception:
                     pass
-
                 return False
 
+            # Normal sections: check create_field_path or designer_fields frame src
             try:
-                wait.until(_canvas_is_information)
-                self.session.emit_diag(
-                    Cat.SECTION,
-                    "Canvas now aligned with Information section",
-                    key="SECTION.canvas.aligned.info",
-                    every_s=1.0,
-                    **ctx,
-                )
-                return True
-            except TimeoutException:
-                self.session.emit_signal(
-                    Cat.SECTION,
-                    "Timed out waiting for canvas to align with Information",
-                    info_fragment=info_fragment,
-                    level="warning",
-                    **ctx,
-                )
-                return False
-
-        # --- NORMAL SECTION CASE ---
-        if not section_id:
-            self.session.emit_signal(
-                Cat.SECTION,
-                "Current section handle has no section_id; cannot verify canvas alignment",
-                section_title=handle.title,
-                level="warning",
-                **ctx,
-            )
-            return False
-
-        def _canvas_matches_section(_):
-            try:
-                path_el = driver.find_element(By.CSS_SELECTOR, "input#create_field_path")
-                path = (path_el.get_attribute("value") or "").strip()
-                if f"/sections/{section_id}/fields" in path:
+                create_field_path = driver.find_element(
+                    By.CSS_SELECTOR, "input#create_field_path"
+                ).get_attribute("value") or ""
+                if f"/sections/{section_id}/fields" in create_field_path:
                     return True
             except Exception:
                 pass
@@ -2119,7 +2209,7 @@ class ActivitySections:
             try:
                 frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#designer_fields")
                 src = (frame.get_attribute("src") or "").strip()
-                if src and f"/sections/{section_id}" in src:
+                if f"/sections/{section_id}" in src:
                     return True
             except Exception:
                 pass
@@ -2133,16 +2223,64 @@ class ActivitySections:
 
             return False
 
-        try:
-            wait.until(_canvas_matches_section)
-            self.session.emit_diag(
+    def wait_for_canvas_for_current_section(self, timeout: int = 10) -> bool:
+        """
+        Wait until the Activity Builder canvas (create_field_path / designer_fields frame)
+        is aligned with current_section_handle.section_id.
+
+        Best-effort: logs a warning on timeout but does not raise.
+        """
+        ctx = self._section_ctx(action="canvas_align")
+
+        self.session.counters.inc("section.canvas_align_checks")
+
+        handle = self.current_section_handle
+        if not handle or not handle.section_id:
+            self.session.emit_signal(
                 Cat.SECTION,
-                "Canvas now aligned with section",
-                section_id=section_id,
-                key="SECTION.canvas.aligned",
-                every_s=1.0,
+                "wait_for_canvas_for_current_section called but no current_section_handle or section_id is set",
+                level="warning",
                 **ctx,
             )
+            return False
+    
+        wait = self.session.get_wait(timeout)
+
+        title = (handle.title or "").strip().lower()
+        section_id = (handle.section_id or "").strip()
+
+        if not section_id:
+            self.session.emit_signal(
+                Cat.SECTION,
+                "Current section handle has no section_id; cannot verify canvas alignment",
+                section_title=handle.title,
+                level="warning",
+                **ctx,
+            )
+            return False
+
+        def _canvas_matches_section(_):
+            return self.is_canvas_aligned_with_current_section()
+
+        try:
+            wait.until(_canvas_matches_section)
+            if section_id == "information" or title == "information":
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Canvas now aligned with Information section",
+                    key="SECTION.canvas.aligned.info",
+                    every_s=1.0,
+                    **ctx,
+                )
+            else:
+                self.session.emit_diag(
+                    Cat.SECTION,
+                    "Canvas now aligned with section",
+                    section_id=section_id,
+                    key="SECTION.canvas.aligned",
+                    every_s=1.0,
+                    **ctx,
+                )
             return True
         except TimeoutException:
             self.session.emit_signal(
@@ -2402,4 +2540,3 @@ class ActivitySections:
                 results[title] = -1
 
         return results
-
