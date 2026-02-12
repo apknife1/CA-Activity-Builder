@@ -145,7 +145,8 @@ class ActivitySections:
             try:
                 frame = self._get_sections_frame()
                 items_sel = config.BUILDER_SELECTORS["sections"]["items"]
-                return len(frame.find_elements(By.CSS_SELECTOR, items_sel)) > 0
+                with self._implicit_wait(0):
+                    return len(frame.find_elements(By.CSS_SELECTOR, items_sel)) > 0
             except Exception:
                 return False
 
@@ -462,10 +463,11 @@ class ActivitySections:
         Best-effort retrieval of the visible section title from a <li> element.
         """
         try:
-            title_el = section_el.find_element(
-                By.CSS_SELECTOR,
-                ".designer__sidebar__item__title",
-            )
+            with self._implicit_wait(0):
+                title_el = section_el.find_element(
+                    By.CSS_SELECTOR,
+                    ".designer__sidebar__item__title",
+                )
             text = (title_el.text or "").strip()
             if text:
                 return text
@@ -500,11 +502,14 @@ class ActivitySections:
         if m:
             section_id = m.group(1)
 
-        try:
-            link = section_el.find_element(
+        def _resolve_link(root_el):
+            return root_el.find_element(
                 By.CSS_SELECTOR,
                 ".designer__sidebar__item__link",
             )
+
+        try:
+            link = _resolve_link(section_el)
         except Exception as e:
             self.session.emit_signal(
                 Cat.SECTION,
@@ -516,15 +521,26 @@ class ActivitySections:
             return None
 
         try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center'});",
-                link,
-            )
-            clicked = False
-            if hasattr(self.session, "click_element_safely"):
-                clicked = self.session.click_element_safely(link)
-            if not clicked:
-                driver.execute_script("arguments[0].click();", link)
+            # One stale-retry with refind by li id.
+            for attempt in range(1, 3):
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'});",
+                        link,
+                    )
+                    clicked = False
+                    if hasattr(self.session, "click_element_safely"):
+                        clicked = self.session.click_element_safely(link)
+                    if not clicked:
+                        driver.execute_script("arguments[0].click();", link)
+                    break
+                except (StaleElementReferenceException, WebDriverException) as e:
+                    stale = isinstance(e, StaleElementReferenceException) or ("stale element reference" in str(e).lower())
+                    if not stale or attempt >= 2:
+                        raise
+                    if li_id:
+                        section_el = driver.find_element(By.CSS_SELECTOR, f"li[id='{li_id}']")
+                    link = _resolve_link(section_el)
 
             self.session.emit_diag(
                 Cat.SECTION,
@@ -1374,7 +1390,15 @@ class ActivitySections:
 
         # Current sections
         items_sel = config.BUILDER_SELECTORS["sections"]["items"]
-        before_sections = frame.find_elements(By.CSS_SELECTOR, items_sel)
+        def _list_section_items_now() -> list:
+            try:
+                frame_now = self._get_sections_frame()
+                with self._implicit_wait(0):
+                    return frame_now.find_elements(By.CSS_SELECTOR, items_sel)
+            except Exception:
+                return []
+
+        before_sections = _list_section_items_now()
         before_count = len(before_sections)
         self.session.emit_diag(
             Cat.SECTION,
@@ -1407,7 +1431,7 @@ class ActivitySections:
         # Wait for a new section item to appear
         def new_section_appeared(_):
             try:
-                current = frame.find_elements(By.CSS_SELECTOR, items_sel)
+                current = _list_section_items_now()
                 return len(current) > before_count
             except Exception:
                 return False
@@ -1422,7 +1446,7 @@ class ActivitySections:
                 **ctx,
             )
             # Still attempt to grab current last section
-            current = frame.find_elements(By.CSS_SELECTOR, items_sel)
+            current = _list_section_items_now()
             if not current:
                 return None
             new_li = current[-1]
@@ -1433,7 +1457,7 @@ class ActivitySections:
             return handle
 
         # New section exists; pick the last one
-        current = frame.find_elements(By.CSS_SELECTOR, items_sel)
+        current = _list_section_items_now()
         self.session.emit_diag(
             Cat.SECTION,
             "Sections after creation",
@@ -1718,34 +1742,7 @@ class ActivitySections:
 
             # After creation/rename, rely on current_section_handle (your existing pattern)
             created_handle = getattr(self, "current_section_handle", None) or new_section
-
-            if created_handle and created_handle.section_id:
-                self.session.emit_diag(
-                    Cat.SECTION,
-                    "Confirming alignment after create/rename",
-                    section_id=created_handle.section_id,
-                    section_title=created_handle.title,
-                    **ctx,
-                )
-                try:
-                    self.select_by_id(created_handle.section_id)
-                    if not self.wait_for_canvas_for_current_section(timeout=5):
-                        self.session.emit_signal(
-                            Cat.SECTION,
-                            "Timed out waiting for canvas align after create/rename",
-                            section_id=created_handle.section_id,
-                            level="warning",
-                            **ctx,
-                        )
-                except Exception as e:
-                    self.session.emit_signal(
-                        Cat.SECTION,
-                        "Post-create alignment confirm failed",
-                        section_id=created_handle.section_id,
-                        exception=str(e),
-                        level="warning",
-                        **ctx,
-                    )
+            # Alignment is confirmed by _select_and_confirm() at call sites.
 
             try:
                 self.registry.add_or_update_section(created_handle)
@@ -1753,7 +1750,12 @@ class ActivitySections:
                 pass
             return created_handle
 
-        def _select_and_confirm(handle: Optional[SectionHandle], why: str) -> Optional[SectionHandle]:
+        def _select_and_confirm(
+            handle: Optional[SectionHandle],
+            why: str,
+            *,
+            skip_initial_align_probe: bool = False,
+        ) -> Optional[SectionHandle]:
             """
             Confirm selection + canvas alignment in one place.
             Use short alignment waits; if not aligned quickly, force a sidebar reselect.
@@ -1762,19 +1764,40 @@ class ActivitySections:
                 return None
 
             # 1) Primary selection mechanism
-            try:
-                ok, aligned = self._select_from_current_handle()
-            except Exception as e:
-                self.session.emit_signal(
-                    Cat.SECTION,
-                    "Selection failed",
-                    reason=why,
-                    exception=str(e),
-                    level="warning",
-                    **ctx,
-                )
-                ok = False
-                aligned = False
+            if skip_initial_align_probe:
+                # Freshly-created sections often aren't alignable until we select by id once.
+                # Skip the pre-probe path that can spend ~3s timing out before this click.
+                try:
+                    if getattr(handle, "section_id", None):
+                        ok = self.select_by_id(handle.section_id) is not None
+                    else:
+                        ok = self.select_by_handle(handle) is not None
+                    aligned = False
+                except Exception as e:
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        "Selection failed",
+                        reason=why,
+                        exception=str(e),
+                        level="warning",
+                        **ctx,
+                    )
+                    ok = False
+                    aligned = False
+            else:
+                try:
+                    ok, aligned = self._select_from_current_handle()
+                except Exception as e:
+                    self.session.emit_signal(
+                        Cat.SECTION,
+                        "Selection failed",
+                        reason=why,
+                        exception=str(e),
+                        level="warning",
+                        **ctx,
+                    )
+                    ok = False
+                    aligned = False
 
             if not ok:
                 self.session.emit_signal(
@@ -1856,7 +1879,11 @@ class ActivitySections:
                 return None
 
             # Ensure sidebar selection is real + canvas aligned
-            selected = _select_and_confirm(created, why="created-first-section")
+            selected = _select_and_confirm(
+                created,
+                why="created-first-section",
+                skip_initial_align_probe=True,
+            )
             if selected is None:
                 return None
 
@@ -1948,7 +1975,11 @@ class ActivitySections:
             if not created:
                 return None
 
-            selected = _select_and_confirm(created, why="created-requested-section")
+            selected = _select_and_confirm(
+                created,
+                why="created-requested-section",
+                skip_initial_align_probe=True,
+            )
             if selected is None:
                 return None
 
@@ -1976,7 +2007,11 @@ class ActivitySections:
             if not created:
                 return None
 
-            selected2 = _select_and_confirm(created, why="created-fallback-last")
+            selected2 = _select_and_confirm(
+                created,
+                why="created-fallback-last",
+                skip_initial_align_probe=True,
+            )
             if selected2 is None:
                 return None
 

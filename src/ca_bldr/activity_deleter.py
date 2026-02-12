@@ -1,6 +1,5 @@
 import re
-
-import re
+import time
 from typing import Any
 
 from selenium.webdriver.common.by import By

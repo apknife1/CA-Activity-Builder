@@ -30,6 +30,9 @@ INSTRUMENT_DROPS: bool = True
 INSTRUMENT_UI_STATE: bool = True
 LOG_MODE = os.getenv("CA_LOG_MODE", "live").lower()  # live | debug | trace
 TEMPLATE_SEARCH_INACTIVE_FIRST = os.getenv("CA_TEMPLATE_SEARCH_INACTIVE_FIRST", "false").lower() == "true"
+TEMPLATE_SEARCH_SET_PER_PAGE_100 = os.getenv("CA_TEMPLATE_SEARCH_SET_PER_PAGE_100", "false").lower() == "true"
+TEMPLATE_SEARCH_UPDATE_WAIT_S = float(os.getenv("CA_TEMPLATE_SEARCH_UPDATE_WAIT_S", "3"))
+TABLE_HEADER_DEADLINE_S = float(os.getenv("CA_TABLE_HEADER_DEADLINE_S", "6"))
 LOG_RATE_LIMITS_S = {
     "SECTION.canvas_aligned": 1.0,
     "SIDEBAR.fields_visible": 1.0,

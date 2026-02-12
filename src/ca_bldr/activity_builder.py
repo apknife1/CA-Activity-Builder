@@ -368,9 +368,15 @@ class CAActivityBuilder:
 
     def _fields_sidebar_tab_visible(self) -> bool:
         sel = config.BUILDER_SELECTORS["sidebars"]["fields"]["tab"]
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
         try:
-            el = self.session.driver.find_element(By.CSS_SELECTOR, sel)
-            return el.is_displayed()
+            driver = self.session.driver
+            driver.implicitly_wait(0)
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                return bool(els and els[0].is_displayed())
+            finally:
+                driver.implicitly_wait(restore_wait)
         except Exception:
             return False
 
@@ -397,6 +403,7 @@ class CAActivityBuilder:
 
         driver = self.session.driver
         wait = self.session.get_wait(timeout)
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
 
         def _find_add_new_buttons(root) -> list:
             candidates: list = []
@@ -423,43 +430,54 @@ class CAActivityBuilder:
 
         # Preferred root: the field-settings sidebar tab (matches Add new field button DOM)
         try:
-            field_settings_tab_sel = (
-                config.BUILDER_SELECTORS.get("sidebars", {})
-                .get("field_settings", {})
-                .get("tab", ".designer__sidebar__tab[data-type='field-settings']")
-            )
-            field_settings_tab = driver.find_element(By.CSS_SELECTOR, field_settings_tab_sel)
-            if field_settings_tab.is_displayed():
-                add_btn_sel = (
+            driver.implicitly_wait(0)
+            try:
+                field_settings_tab_sel = (
                     config.BUILDER_SELECTORS.get("sidebars", {})
                     .get("field_settings", {})
-                    .get("add_new_button", "button[onclick*='toggleAddFields']")
+                    .get("tab", ".designer__sidebar__tab[data-type='field-settings']")
                 )
-                candidates = field_settings_tab.find_elements(By.CSS_SELECTOR, add_btn_sel)
-                if not candidates:
-                    candidates = _find_add_new_buttons(field_settings_tab)
-                if candidates:
-                    self.session.emit_diag(
-                        Cat.SIDEBAR,
-                        "Add-new-field button found in field-settings tab",
-                        **ctx,
+                tabs = driver.find_elements(By.CSS_SELECTOR, field_settings_tab_sel)
+                field_settings_tab = tabs[0] if tabs else None
+                if field_settings_tab is not None and field_settings_tab.is_displayed():
+                    add_btn_sel = (
+                        config.BUILDER_SELECTORS.get("sidebars", {})
+                        .get("field_settings", {})
+                        .get("add_new_button", "button[onclick*='toggleAddFields']")
                     )
+                    candidates = field_settings_tab.find_elements(By.CSS_SELECTOR, add_btn_sel)
+                    if not candidates:
+                        candidates = _find_add_new_buttons(field_settings_tab)
+                    if candidates:
+                        self.session.emit_diag(
+                            Cat.SIDEBAR,
+                            "Add-new-field button found in field-settings tab",
+                            **ctx,
+                        )
+            finally:
+                driver.implicitly_wait(restore_wait)
         except Exception:
             pass
 
         # Fallback root: properties panel (legacy)
         if not candidates:
             try:
-                panel = driver.find_element(
-                    By.CSS_SELECTOR, config.BUILDER_SELECTORS["properties"]["root"]
-                )
-                candidates = _find_add_new_buttons(panel)
-                if candidates:
-                    self.session.emit_diag(
-                        Cat.SIDEBAR,
-                        "Add-new-field button found in properties panel",
-                        **ctx,
+                driver.implicitly_wait(0)
+                try:
+                    panels = driver.find_elements(
+                        By.CSS_SELECTOR, config.BUILDER_SELECTORS["properties"]["root"]
                     )
+                    panel = panels[0] if panels else None
+                    if panel is not None:
+                        candidates = _find_add_new_buttons(panel)
+                        if candidates:
+                            self.session.emit_diag(
+                                Cat.SIDEBAR,
+                                "Add-new-field button found in properties panel",
+                                **ctx,
+                            )
+                finally:
+                    driver.implicitly_wait(restore_wait)
             except Exception:
                 self.session.emit_diag(
                     Cat.SIDEBAR,
@@ -2874,6 +2892,15 @@ class CAActivityBuilder:
                 handle, target_el, int(dx), int(dy)
             )
 
+        def _exc_summary(exc: Exception) -> str:
+            """
+            Keep webdriver exception logging to a single-line summary.
+            Some Selenium exceptions include full stacktraces in str(exc),
+            which is noisy for expected/recovered paths.
+            """
+            raw = getattr(exc, "msg", None) or str(exc)
+            return (raw.splitlines()[0] if raw else "").strip()
+
         def _get_wrapper(fid: str) -> WebElement | None:
             try:
                 return driver.find_element(By.CSS_SELECTOR, f"#section-field-{fid}")
@@ -3135,7 +3162,7 @@ class CAActivityBuilder:
                     self.session.emit_diag(
                         Cat.DROP,
                         "Sortable reorder: native drag start failed",
-                        exception=str(e_start),
+                        exception=_exc_summary(e_start),
                         **ctx_zone,
                     )
                     try:
@@ -3178,7 +3205,7 @@ class CAActivityBuilder:
                         self.session.emit_diag(
                             Cat.DROP,
                             "Sortable reorder: native drop out of bounds",
-                            exception=str(e),
+                            exception=_exc_summary(e),
                             dx=dx,
                             dy=dy,
                             **ctx_zone,
@@ -3198,7 +3225,7 @@ class CAActivityBuilder:
                         self.session.emit_diag(
                             Cat.DROP,
                             "Sortable reorder: native drop failed",
-                            exception=str(e_drop),
+                            exception=_exc_summary(e_drop),
                             dx=dx,
                             dy=dy,
                             **ctx_zone,
@@ -3233,7 +3260,7 @@ class CAActivityBuilder:
                     Cat.DROP,
                     "Sortable reorder: drag attempt failed unexpectedly",
                     max_attempts=max_attempts,
-                    exception=str(e),
+                    exception=_exc_summary(e),
                     **ctx_zone,
                 )
                 try:

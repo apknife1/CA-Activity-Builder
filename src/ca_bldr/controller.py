@@ -24,6 +24,7 @@ from src.ca_bldr.instrumentation import Cat
 from .errors import TableResizeError, FieldPropertiesSidebarTimeout
 from .spec_reader import ActivityInstruction
 from .context import AppContext
+from .field_handles import FieldHandle
 from .config_builder import build_field_config
 from .instruction_dump import dump_activity_instruction_json
 from .timing import phase_timer
@@ -1343,24 +1344,15 @@ class ActivityBuildController:
                                 **_ctx_for(step="table_recover_refresh_fail", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
                             )
 
-                        # Recovery Step 2: delete field + recreate + configure
-                        try:
-                            self.deleter.delete_field_by_handle(handle)   # or activity_deleter.delete_field_by_id(handle.field_id)
-                            new_handle = builder.add_field_from_spec(key=field_key, section_title=sec_title, section_index=sec_index)
-                            if new_handle:
-                                editor.configure_field_from_config(handle=new_handle, cfg=cfg, last_successful_handle=last_successful_handle, prop_fault_inject=prop_fault_inject)
-                                consecutive_failures = 0
-                                continue
-                            raise RuntimeError("Recreate returned None")
-                        except Exception as e3:
-                            self.session.emit_signal(
-                                Cat.TABLE,
-                                "Table recovery failed; skipping field",
-                                exception=str(e3),
-                                level="error",
-                                **_ctx_for(step="table_recover_failed", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
-                            )
-                            # fall through to existing failure append/skip logic
+                        # Recovery Step 2 (destructive) intentionally disabled:
+                        # prefer in-place reconfigure only; do not delete/recreate on configure failures.
+                        self.session.emit_signal(
+                            Cat.TABLE,
+                            "In-place table recovery failed; skipping field (delete/recreate disabled)",
+                            level="error",
+                            **_ctx_for(step="table_recover_failed", fi_index=fi_index, handle=handle, sec_title=sec_title, sec_index=sec_index),
+                        )
+                        # fall through to existing failure append/skip logic
 
                     except FieldPropertiesSidebarTimeout as e:
                         self.session.emit_signal(
@@ -1789,7 +1781,7 @@ class ActivityBuildController:
             fi_index = f.get("fi_index")
             requested = f.get("requested") or {}
 
-            if not fi_index or fi_index is None:
+            if fi_index is None:
                 f["last_error"] = "fi_index missing; cannot retry safely"
                 return False
 
@@ -1879,50 +1871,46 @@ class ActivityBuildController:
                     # resolved
                     return True
 
-                # ---- configure retry: re-run configure_field_from_config ----
-                # Needs a way to rebuild config and a handle. If we have field_id, we can
-                # (a) locate element, (b) build a minimal handle-like object OR just re-run
-                # editor.configure_field_from_config if it requires handle. We'll rebuild via fi_index.
+                # ---- configure retry: in-place re-run configure_field_from_config ----
                 if kind in ("configure", "table_resize"):
                     fi = _get_fi_from_index(fi_index)
                     if fi is None:
                         raise RuntimeError(f"{kind} retry requires valid fi_index; got {fi_index}")
 
-                    # If we have a field_id, keep using it (more accurate)
-                    # But configure_field_from_config wants a handle; easiest is to attempt delete+recreate if field_id missing.
-                    if field_id:
-                        # Best effort: delete + recreate + configure.
-                        # (This avoids needing to perfectly reconstruct a handle.)
-                        try:
-                            deleter.delete_field_by_id(str(field_id))
-                        except Exception:
-                            # if delete fails, still try to reconfigure existing by element-only path where possible
-                            pass
+                    if not field_id:
+                        raise RuntimeError(f"{kind} retry requires field_id (missing)")
 
-                    drop_location, anchor_id = _drop_plan_for(fi_index)
+                    handle = self.registry.get_field(str(field_id))
+                    if handle is None:
+                        section_id = ""
+                        try:
+                            sections.ensure_section_ready(section_title=sec_title, index=sec_index)
+                            section_id = sections.current_section_id or (
+                                sections.current_section_handle.section_id if sections.current_section_handle else ""
+                            )
+                        except Exception:
+                            section_id = ""
+                        handle = FieldHandle(
+                            field_id=str(field_id),
+                            section_id=section_id,
+                            field_type_key=fi.field_key,
+                            fi_index=fi_index,
+                            title=(f.get("title") or None),
+                        )
+
                     self.session.emit_diag(
                         Cat.RETRY,
-                        "Configure retry plan",
+                        "Configure retry plan (in-place)",
                         field_key=fi.field_key,
                         section_title=fi.section_title,
                         section_index=fi.section_index,
-                        drop_location=drop_location,
-                        anchor_id=anchor_id,
+                        section_id=handle.section_id,
+                        has_registry_handle=self.registry.get_field(str(field_id)) is not None,
                         **self._ctx(act=act, step="retry_configure_plan", fi=fi_index),
                     )
-                    new_handle = builder.add_field_from_spec(
-                        key=fi.field_key,
-                        section_title=fi.section_title,
-                        section_index=fi.section_index,
-                        drop_location=drop_location,
-                        insert_after_field_id=anchor_id,
-                        fi_index=fi_index,
-                    )
-                    if new_handle is None:
-                        raise RuntimeError("recreate returned None during configure retry")
 
                     cfg = build_field_config(fi)
-                    editor.configure_field_from_config(handle=new_handle, cfg=cfg, last_successful_handle=None)
+                    editor.configure_field_from_config(handle=handle, cfg=cfg, last_successful_handle=None)
 
                     evs = editor.pop_skip_events()
                     if evs:

@@ -99,76 +99,84 @@ class ActivityEditor:
 
     # -------- Field discovery --------
     
-    def get_field_id_from_element(self, field_el) -> Optional[str]:
+    def get_field_id_from_element(self, field_el, *, strict: bool = False) -> Optional[str]:
         """
         Infer the CloudAssess field id (like '27432871') from known id patterns
         inside a field element.
 
-        Now hardened against stale field_el: if the element is stale, we try to
-        re-locate the currently-selected field and extract the id from there.
+        strict=False:
+          - allows selected-field fallback when the incoming element is stale.
+        strict=True:
+          - never falls back to selected-field lookup (used by diff/snapshot paths).
         """
         ctx = self._editor_ctx(kind="field_id")
+        driver = self.driver
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
 
         def _extract_from_root(root_el):
-            # Try model-answer id first
-            try:
-                model_block = root_el.find_element(
-                    By.CSS_SELECTOR,
-                    "[id^='designer__field__model-answer-description--']",
-                )
-                mid = model_block.get_attribute("id") or ""
-                m = FIELD_ID_SUFFIX_RE.search(mid)
-                if m:
-                    return m.group(1)
-            except NoSuchElementException:
-                pass
-
-            # Fall back to main description id
-            try:
-                desc_block = root_el.find_element(
-                    By.CSS_SELECTOR,
-                    "[id^='designer__field__description--']",
-                )
-                did = desc_block.get_attribute("id") or ""
-                m = FIELD_ID_SUFFIX_RE.search(did)
-                if m:
-                    return m.group(1)
-            except NoSuchElementException:
-                pass
-
+            # Description id is the common case; check it first.
+            selectors = (
+                "[id^='designer__field__description--']",
+                "[id^='designer__field__model-answer-description--']",
+            )
+            for sel in selectors:
+                try:
+                    nodes = root_el.find_elements(By.CSS_SELECTOR, sel)
+                except Exception:
+                    nodes = []
+                for node in nodes:
+                    raw = node.get_attribute("id") or ""
+                    m = FIELD_ID_SUFFIX_RE.search(raw)
+                    if m:
+                        return m.group(1)
             return None
 
-        # First attempt: use the element we were given
         try:
-            field_id = _extract_from_root(field_el)
-            if field_id:
-                return field_id
-        except StaleElementReferenceException:
-            self.session.emit_diag(
-                Cat.CONFIGURE,
-                "Field element became stale while extracting field id; attempting to re-locate selected field.",
-                **ctx,
-            )
+            driver.implicitly_wait(0)
+            # First attempt: use the element we were given.
+            try:
+                field_id = _extract_from_root(field_el)
+                if field_id:
+                    return field_id
+            except StaleElementReferenceException:
+                if strict:
+                    return None
+                self.session.emit_diag(
+                    Cat.CONFIGURE,
+                    "Field element became stale while extracting field id; attempting selected-field fallback.",
+                    **ctx,
+                )
 
-        # Second attempt: re-locate the currently selected field in the canvas
-        try:
-            driver = self.driver
-            # Adjust selector if needed: this assumes a selected field has a distinct class
-            selected_root = driver.find_element(
+            if strict:
+                return None
+
+            # Non-strict fallback: re-locate currently selected/active field.
+            selected_roots = driver.find_elements(
                 By.CSS_SELECTOR,
                 ".designer__field.designer__field--active, .designer__field--selected",
             )
-            field_id = _extract_from_root(selected_root)
+            if not selected_roots:
+                return None
+            field_id = _extract_from_root(selected_roots[0])
             if field_id:
                 return field_id
-        except (NoSuchElementException, StaleElementReferenceException) as e:
+        except Exception as e:
+            if strict:
+                return None
             self.session.emit_signal(
                 Cat.CONFIGURE,
-                f"Could not re-locate selected field after stale reference: {e}",
+                f"Could not infer field id from active/selected fallback: {e}",
                 level="error",
                 **ctx,
             )
+        finally:
+            try:
+                driver.implicitly_wait(restore_wait)
+            except Exception:
+                pass
 
+        if strict:
+            return None
         self.session.emit_diag(
             Cat.CONFIGURE,
             "Could not infer field id for field element.",
@@ -344,35 +352,9 @@ class ActivityEditor:
     def try_get_field_id_strict(self, field_el) -> Optional[str]:
         """
         Strict id extraction for snapshot/diff logic.
-        Never falls back to '.designer__field--selected' because that can lie during DOM churn.
         """
         try:
-            # reuse the internal logic but without the selected-field fallback
-            # (copy the _extract_from_root inner helper from get_field_id_from_element)
-            def _extract_from_root(root_el):
-                try:
-                    model_block = root_el.find_element(By.CSS_SELECTOR, "[id^='designer__field__model-answer-description--']")
-                    mid = model_block.get_attribute("id") or ""
-                    m = FIELD_ID_SUFFIX_RE.search(mid)
-                    if m:
-                        return m.group(1)
-                except NoSuchElementException:
-                    pass
-
-                try:
-                    desc_block = root_el.find_element(By.CSS_SELECTOR, "[id^='designer__field__description--']")
-                    did = desc_block.get_attribute("id") or ""
-                    m = FIELD_ID_SUFFIX_RE.search(did)
-                    if m:
-                        return m.group(1)
-                except NoSuchElementException:
-                    pass
-
-                return None
-
-            return _extract_from_root(field_el)
-        except StaleElementReferenceException:
-            return None
+            return self.get_field_id_from_element(field_el, strict=True)
         except Exception:
             return None
         
@@ -737,6 +719,14 @@ class ActivityEditor:
                 cat=Cat.PROPS,
                 properties=",".join(requested_props),
             )
+
+        if handle.field_type_key == "interactive_table" and isinstance(cfg, TableConfig):
+            t_step = time.monotonic()
+            self._verify_table_after_properties_and_recover_once(
+                handle=handle,
+                cfg=cfg,
+            )
+            _emit_step_timing("verify_table_post_props", t_step, cat=Cat.TABLE)
 
         # 5) Model answer content (canvas Froala)
         if model_answer_html and field_id:
@@ -1266,6 +1256,345 @@ class ActivityEditor:
         # Re-apply and let _set_froala_block do its persisted+verified routine
         field_el = self.get_field_by_id(fid) if fid else None
         self.set_field_body(field_el, desired_html)
+
+    def _read_table_cell_text_for_probe(self, cell) -> str:
+        """
+        Read normalized visible/editable text from a dynamic table cell.
+        This is a read-only probe helper used for post-config verification.
+        """
+        driver = self.driver
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
+
+        def _find_all_fast(root, selector: str):
+            try:
+                driver.implicitly_wait(0)
+                return root.find_elements(By.CSS_SELECTOR, selector)
+            finally:
+                try:
+                    driver.implicitly_wait(restore_wait)
+                except Exception:
+                    pass
+
+        def _norm(s: str | None) -> str:
+            return self._norm_text(s)
+
+        # Prefer the actual editor input where possible.
+        for sel in ("textarea[name='cell_title']", "input[name='cell_title']"):
+            controls = _find_all_fast(cell, sel)
+            if controls:
+                try:
+                    return _norm(controls[0].get_attribute("value") or "")
+                except Exception:
+                    pass
+
+        # Fallbacks for contenteditable/label-based cells.
+        for sel in (
+            "[contenteditable='true']",
+            ".field__editable-label",
+            ".designer__field__editable-label",
+            ".designer__field__editable-label *",
+        ):
+            nodes = _find_all_fast(cell, sel)
+            for n in nodes:
+                try:
+                    txt = _norm(n.get_attribute("textContent") or n.text or "")
+                except Exception:
+                    txt = ""
+                if txt:
+                    return txt
+
+        try:
+            return _norm(cell.text or "")
+        except Exception:
+            return ""
+
+    def _probe_table_persistence(
+        self,
+        *,
+        field_id: str | None,
+        cfg: TableConfig,
+        phase: str,
+        allow_refind: bool = True,
+        turbo_idle_timeout: float = 3.0,
+        tries: int = 3,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """
+        Probe whether configured table headers/row labels are still present.
+        Returns (status, mismatches) where status is one of PROBE_* constants.
+        """
+        expected_headers = [self._norm_text(h or "") for h in (cfg.column_headers or [])]
+        expected_row_labels = [self._norm_text(r or "") for r in (cfg.row_labels or [])]
+
+        if not expected_headers and not expected_row_labels:
+            return PROBE_PRESENT, []
+
+        ctx = self._editor_ctx(field_id=field_id, kind="table_probe", stage=phase)
+        selectors = config.BUILDER_SELECTORS["table"]
+        last_reason = None
+
+        for attempt in range(1, tries + 1):
+            field_el = None
+            if allow_refind and field_id:
+                try:
+                    field_el = self.get_field_by_id(field_id)
+                except Exception as e:
+                    last_reason = f"refind:{type(e).__name__}"
+                    time.sleep(0.12)
+                    continue
+            if field_el is None:
+                last_reason = "no_field_el"
+                time.sleep(0.12)
+                continue
+
+            self._wait_turbo_idle(timeout=turbo_idle_timeout)
+
+            try:
+                table_root = self._get_dynamic_table_root(field_el)
+                body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+            except StaleElementReferenceException:
+                last_reason = "stale_table"
+                time.sleep(0.12)
+                continue
+            except Exception as e:
+                last_reason = f"table_root:{type(e).__name__}"
+                time.sleep(0.12)
+                continue
+
+            if not body_rows:
+                last_reason = "no_body_rows"
+                time.sleep(0.12)
+                continue
+
+            mismatches: list[dict[str, Any]] = []
+
+            if expected_headers:
+                try:
+                    header_cells = body_rows[0].find_elements(By.CSS_SELECTOR, "th, td")
+                except Exception as e:
+                    header_cells = []
+                    last_reason = f"header_cells:{type(e).__name__}"
+
+                dom_offset = 1 if len(header_cells) == len(expected_headers) + 1 else 0
+
+                for idx, expected in enumerate(expected_headers):
+                    td_index = idx + dom_offset
+                    if td_index >= len(header_cells):
+                        mismatches.append(
+                            {
+                                "part": "column_header",
+                                "index": idx,
+                                "td_index": td_index,
+                                "expected": expected,
+                                "actual": "<missing-cell>",
+                            }
+                        )
+                        continue
+                    actual = self._read_table_cell_text_for_probe(header_cells[td_index])
+                    if self._norm_text(actual) != expected:
+                        mismatches.append(
+                            {
+                                "part": "column_header",
+                                "index": idx,
+                                "td_index": td_index,
+                                "expected": expected,
+                                "actual": self._norm_text(actual),
+                            }
+                        )
+
+            if expected_row_labels:
+                for idx, expected in enumerate(expected_row_labels):
+                    body_row = idx + 1  # row 0 is header row
+                    if body_row >= len(body_rows):
+                        mismatches.append(
+                            {
+                                "part": "row_label",
+                                "index": idx,
+                                "row": body_row,
+                                "expected": expected,
+                                "actual": "<missing-row>",
+                            }
+                        )
+                        continue
+
+                    try:
+                        cells = body_rows[body_row].find_elements(By.CSS_SELECTOR, "th, td")
+                    except Exception:
+                        cells = []
+
+                    if len(cells) < 2:
+                        mismatches.append(
+                            {
+                                "part": "row_label",
+                                "index": idx,
+                                "row": body_row,
+                                "expected": expected,
+                                "actual": "<missing-data-cell>",
+                            }
+                        )
+                        continue
+
+                    actual = self._read_table_cell_text_for_probe(cells[1])  # first data column
+                    if self._norm_text(actual) != expected:
+                        mismatches.append(
+                            {
+                                "part": "row_label",
+                                "index": idx,
+                                "row": body_row,
+                                "expected": expected,
+                                "actual": self._norm_text(actual),
+                            }
+                        )
+
+            if not mismatches:
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    (
+                        f"Table probe ({phase}): present "
+                        f"(field_id={field_id!r} attempt={attempt} headers={len(expected_headers)} rows={len(expected_row_labels)})."
+                    ),
+                    **ctx,
+                )
+                return PROBE_PRESENT, []
+
+            sample = mismatches[:5]
+            self.session.emit_signal(
+                Cat.TABLE,
+                (
+                    f"Table probe ({phase}): MISSING "
+                    f"(field_id={field_id!r} attempt={attempt} mismatch_count={len(mismatches)} sample={sample})."
+                ),
+                level="warning",
+                **ctx,
+            )
+            return PROBE_MISSING, mismatches
+
+        self.session.emit_diag(
+            Cat.TABLE,
+            (
+                f"Table probe ({phase}): UNKNOWN "
+                f"(field_id={field_id!r} headers={len(expected_headers)} rows={len(expected_row_labels)} "
+                f"last_reason={last_reason!r})."
+            ),
+            **ctx,
+        )
+        return PROBE_UNKNOWN, []
+
+    def _verify_table_after_properties_and_recover_once(
+        self,
+        *,
+        handle,
+        cfg: TableConfig,
+    ) -> None:
+        """
+        Post-properties guard for interactive tables.
+        Verifies configured headers/row labels persisted; if not, re-applies once.
+        """
+        if not (cfg.column_headers or cfg.row_labels):
+            return
+
+        fid = getattr(handle, "field_id", None)
+        title = getattr(cfg, "title", None)
+        ctx = self._editor_ctx(field_id=fid, kind="table_probe", stage="post-props")
+
+        result, mismatches = self._probe_table_persistence(
+            field_id=fid,
+            cfg=cfg,
+            phase="post-props",
+            allow_refind=True,
+            tries=3,
+        )
+        if result == PROBE_PRESENT:
+            return
+
+        if result == PROBE_UNKNOWN:
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Post-props table probe unknown (field_id={fid!r}). Skipping recovery.",
+                level="warning",
+                **ctx,
+            )
+            return
+
+        self.session.emit_signal(
+            Cat.TABLE,
+            (
+                f"Table content LOST after properties (definite) field_id={fid!r}. "
+                f"Re-applying table headers/row labels once. mismatch_count={len(mismatches)}"
+            ),
+            level="warning",
+            **ctx,
+        )
+
+        try:
+            field_el = self.get_field_by_id(fid) if fid else None
+        except Exception as e:
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Could not re-find table field for recovery: {type(e).__name__}: {e}",
+                level="warning",
+                **ctx,
+            )
+            field_el = None
+
+        if field_el is not None:
+            if cfg.column_headers:
+                try:
+                    self._set_table_column_headers(field_el, cfg.column_headers)
+                except Exception as e:
+                    self.session.emit_signal(
+                        Cat.TABLE,
+                        f"Table recovery: re-apply column headers failed: {type(e).__name__}: {e}",
+                        level="warning",
+                        **ctx,
+                    )
+            if cfg.row_labels:
+                try:
+                    self._set_table_row_labels(field_el, cfg.row_labels)
+                except Exception as e:
+                    self.session.emit_signal(
+                        Cat.TABLE,
+                        f"Table recovery: re-apply row labels failed: {type(e).__name__}: {e}",
+                        level="warning",
+                        **ctx,
+                    )
+
+        result2, mismatches2 = self._probe_table_persistence(
+            field_id=fid,
+            cfg=cfg,
+            phase="post-props-recover",
+            allow_refind=True,
+            tries=2,
+        )
+        if result2 == PROBE_PRESENT:
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"Table content restored after post-props recovery (field_id={fid!r}).",
+                **ctx,
+            )
+            return
+
+        sample = mismatches2[:5]
+        self.session.emit_signal(
+            Cat.TABLE,
+            (
+                f"Table persistence verify failed after recovery (field_id={fid!r}) "
+                f"result={result2} mismatch_count={len(mismatches2)} sample={sample}"
+            ),
+            level="warning",
+            **ctx,
+        )
+        self._record_config_skip(
+            kind="configure",
+            reason=f"table persistence verify failed after recovery ({result2})",
+            retryable=False,
+            field_id=fid,
+            field_title=title,
+            requested={
+                "table_part": "post_props_verify",
+                "mismatch_count": len(mismatches2),
+                "mismatch_sample": sample,
+            },
+        )
 
         # signature used for containment checks (Froala normalizes HTML)
     def _froala_sig(self,s: str, max_len: int = 60) -> str:
@@ -1949,6 +2278,7 @@ class ActivityEditor:
         driver = self.driver
         wait = self.session.get_wait(timeout)
         ctx = self._editor_ctx(kind="field_settings")
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
 
         def _defocus():
             try:
@@ -1975,19 +2305,27 @@ class ActivityEditor:
 
         def _tab_visible(_):
             try:
-                tab = driver.find_element(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='field-settings']")
-                return tab.is_displayed()
+                driver.implicitly_wait(0)
+                try:
+                    tab = driver.find_element(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='field-settings']")
+                    return tab.is_displayed()
+                finally:
+                    driver.implicitly_wait(restore_wait)
             except Exception:
                 return False
 
         def _frame_loaded(_):
             # Use the looser “open for field” check (now non-fatal on id confirm)
             try:
-                frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
-                controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
-                if not controls:
-                    return False
-                return self._is_field_settings_open_for_field(field_el)
+                driver.implicitly_wait(0)
+                try:
+                    frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
+                    controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
+                    if not controls:
+                        return False
+                    return self._is_field_settings_open_for_field(field_el)
+                finally:
+                    driver.implicitly_wait(restore_wait)
             except Exception:
                 return False
 
@@ -2235,6 +2573,7 @@ class ActivityEditor:
         """
         driver = self.driver
         props = config.BUILDER_SELECTORS["properties"]
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
 
         missed: dict[str, str] = {}  # knob -> reason
 
@@ -2277,9 +2616,13 @@ class ActivityEditor:
 
         def _get_loaded_frame_or_none():
             try:
-                frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
-                controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
-                return frame if controls else None
+                driver.implicitly_wait(0)
+                try:
+                    frame = driver.find_element(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
+                    controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
+                    return frame if controls else None
+                finally:
+                    driver.implicitly_wait(restore_wait)
             except Exception:
                 return None
             
@@ -2361,7 +2704,7 @@ class ActivityEditor:
 
                     # try to open sidebar for this field
                     if self._ensure_field_active(field_el):
-                        self._open_field_settings_sidebar(field_el, pivot_el=pivot_el, force_reopen=True)
+                        self._open_field_settings_sidebar(field_el, pivot_el=pivot_el, force_reopen=False)
                         frame = self._get_field_settings_frame()  # may throw TimeoutException internally
                         saw_loaded_frame = True
 
@@ -2773,6 +3116,7 @@ class ActivityEditor:
                     props["model_answer_toggle"],
                     enable_model_answer,
                     root=frame,
+                    timeout=1.5,
                     expected_field_id=fid,
                     expected_title=title,
                     field_el=field_el,
@@ -2794,6 +3138,7 @@ class ActivityEditor:
                     props["assessor_comments_toggle"],
                     enable_assessor_comments,
                     root=frame,
+                    timeout=1.5,
                     expected_field_id=fid,
                     expected_title=title,
                     field_el=field_el,
@@ -3337,7 +3682,9 @@ class ActivityEditor:
                 t_step = time.monotonic()
                 try:
                     fresh = _fresh_field_el()
-                    fn(fresh)
+                    result = fn(fresh)
+                    if result is False:
+                        raise RuntimeError(f"Table stage '{stage_name}' reported incomplete apply")
                     self.session.counters.inc(f"editor.table_stage_{stage_name}_success")
                     self.session.emit_diag(
                         Cat.TABLE,
@@ -3523,6 +3870,19 @@ class ActivityEditor:
         table_selectors = config.BUILDER_SELECTORS["table"]
         ctx = self._editor_ctx(kind="table_resize")
 
+        def _emit_resize_timing(step: str, start: float, **extra) -> None:
+            try:
+                self.session.emit_diag(
+                    Cat.TABLE,
+                    "Step timing",
+                    step=step,
+                    elapsed_s=round(time.monotonic() - start, 3),
+                    **ctx,
+                    **extra,
+                )
+            except Exception:
+                pass
+
         def get_shape():
             """
             Return (table_root, header_cells, body_rows, data_cols, body_row_count).
@@ -3567,7 +3927,11 @@ class ActivityEditor:
             except Exception:
                 pass
 
-            ActionChains(driver).move_to_element(elem).pause(0.1).click().perform()
+            ActionChains(driver).move_to_element(elem).pause(0.05).click().perform()
+
+        # Heuristic: skip costly canvas reset after clean/successful add clicks.
+        # Re-enable reset immediately after any timeout/stale/fallback path.
+        reset_policy = {"force_next": True}
 
         def click_add_action(
             *,
@@ -3588,12 +3952,23 @@ class ActivityEditor:
             5) proceed; outer poll loop will confirm.
             """
             # Cheap overlay cleanup (helps when a cell editor/tooltip steals focus)
-            try:
-                self._reset_canvas_ui_state()
-            except Exception:
-                pass
+            t_reset = time.monotonic()
+            did_reset = False
+            if reset_policy["force_next"]:
+                try:
+                    self._reset_canvas_ui_state()
+                    did_reset = True
+                except Exception:
+                    pass
+            _emit_resize_timing(
+                f"table_{kind}_add_reset",
+                t_reset,
+                target=target_value,
+                did_reset=did_reset,
+            )
 
             # Ensure visible
+            t_scroll = time.monotonic()
             try:
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block:'center', inline:'center'});",
@@ -3601,6 +3976,7 @@ class ActivityEditor:
                 )
             except Exception:
                 pass
+            _emit_resize_timing(f"table_{kind}_add_scroll", t_scroll, target=target_value)
 
             def _shape_value():
                 # Reuse get_shape() to avoid stale
@@ -3608,52 +3984,122 @@ class ActivityEditor:
                 return (r if kind == "row" else c)
 
             before = None
+            t_before_shape = time.monotonic()
             try:
                 before = _shape_value()
             except Exception:
                 before = None
+            _emit_resize_timing(
+                f"table_{kind}_add_before_shape",
+                t_before_shape,
+                target=target_value,
+                before=before,
+            )
 
             # 1) Pointer click
+            t_pointer_click = time.monotonic()
             try:
-                ActionChains(driver).move_to_element(button_el).pause(0.1).click().perform()
+                ActionChains(driver).move_to_element(button_el).pause(0.05).click().perform()
             except Exception:
                 pass
+            _emit_resize_timing(f"table_{kind}_add_pointer_click", t_pointer_click, target=target_value)
 
             # Quick verify
+            t_pointer_verify = time.monotonic()
+            pointer_polls = 0
+            stale_seen = False
             quick_deadline = time.time() + 1.2
             while time.time() < quick_deadline:
                 try:
+                    pointer_polls += 1
                     now = _shape_value()
                     if now >= target_value:
+                        _emit_resize_timing(
+                            f"table_{kind}_add_pointer_verify",
+                            t_pointer_verify,
+                            target=target_value,
+                            result="target_reached",
+                            polls=pointer_polls,
+                        )
+                        reset_policy["force_next"] = stale_seen
                         return
                     # If at least changed vs before, we consider it "triggered"
                     if before is not None and now != before:
+                        _emit_resize_timing(
+                            f"table_{kind}_add_pointer_verify",
+                            t_pointer_verify,
+                            target=target_value,
+                            result="shape_changed",
+                            polls=pointer_polls,
+                        )
+                        reset_policy["force_next"] = stale_seen
                         return
                 except StaleElementReferenceException:
+                    stale_seen = True
                     time.sleep(0.1)
                 except Exception:
                     time.sleep(0.1)
                 time.sleep(0.1)
+            # Pointer phase timed out; force reset next iteration.
+            reset_policy["force_next"] = True
+            _emit_resize_timing(
+                f"table_{kind}_add_pointer_verify",
+                t_pointer_verify,
+                target=target_value,
+                result="timeout",
+                polls=pointer_polls,
+            )
 
             # 2) JS click button
+            t_js_click = time.monotonic()
             try:
                 driver.execute_script("arguments[0].click();", button_el)
             except Exception:
                 pass
+            _emit_resize_timing(f"table_{kind}_add_js_click", t_js_click, target=target_value)
 
+            t_js_verify = time.monotonic()
+            js_polls = 0
             quick_deadline = time.time() + 1.0
             while time.time() < quick_deadline:
                 try:
+                    js_polls += 1
                     now = _shape_value()
                     if now >= target_value:
+                        _emit_resize_timing(
+                            f"table_{kind}_add_js_verify",
+                            t_js_verify,
+                            target=target_value,
+                            result="target_reached",
+                            polls=js_polls,
+                        )
+                        reset_policy["force_next"] = True
                         return
                     if before is not None and now != before:
+                        _emit_resize_timing(
+                            f"table_{kind}_add_js_verify",
+                            t_js_verify,
+                            target=target_value,
+                            result="shape_changed",
+                            polls=js_polls,
+                        )
+                        reset_policy["force_next"] = True
                         return
                 except Exception:
                     time.sleep(0.1)
                 time.sleep(0.1)
+            _emit_resize_timing(
+                f"table_{kind}_add_js_verify",
+                t_js_verify,
+                target=target_value,
+                result="timeout",
+                polls=js_polls,
+            )
+            reset_policy["force_next"] = True
 
             # 3) Click wrapper div
+            t_wrapper_click = time.monotonic()
+            wrapper_clicked = False
             try:
                 wrapper = table_root.find_element(By.CSS_SELECTOR, wrapper_css)
                 try:
@@ -3664,8 +4110,16 @@ class ActivityEditor:
                 except Exception:
                     pass
                 driver.execute_script("arguments[0].click();", wrapper)
+                wrapper_clicked = True
             except Exception:
                 pass
+            _emit_resize_timing(
+                f"table_{kind}_add_wrapper_click",
+                t_wrapper_click,
+                target=target_value,
+                clicked=wrapper_clicked,
+            )
+            reset_policy["force_next"] = True
 
         # --- Initial shape --------------------------------------------------
         table_root, header_cells, body_rows, current_cols, current_rows = get_shape()
@@ -3680,6 +4134,7 @@ class ActivityEditor:
 
         # --- Grow columns ---------------------------------------------------
         while current_cols < cols:
+            t_col_iter = time.monotonic()
             try:
                 self.session.emit_diag(
                     Cat.TABLE,
@@ -3715,6 +4170,7 @@ class ActivityEditor:
 
             deadline = time.time() + timeout
             poll_i = 0  # ✅ reset per add attempt
+            t_col_poll = time.monotonic()
 
             # Poll until data column count increases
             while time.time() < deadline:
@@ -3725,6 +4181,7 @@ class ActivityEditor:
                     continue
 
                 last_seen_cols = new_cols
+                poll_i += 1
                 # ✅ log first poll + every 10th poll
                 if poll_i == 1 or poll_i % 10 == 0:
                     self.session.emit_diag(
@@ -3747,8 +4204,22 @@ class ActivityEditor:
                 )
                 break
 
+            _emit_resize_timing(
+                "table_col_poll",
+                t_col_poll,
+                target=target_cols,
+                polls=poll_i,
+                reached=current_cols >= target_cols,
+            )
+            _emit_resize_timing(
+                "table_col_iter_total",
+                t_col_iter,
+                target=target_cols,
+            )
+
         # --- Grow rows ------------------------------------------------------
         while current_rows < rows:
+            t_row_iter = time.monotonic()
             try:
                 table_root, header_cells, body_rows, current_cols, current_rows = get_shape()
                 last_seen_rows = current_rows
@@ -3780,6 +4251,7 @@ class ActivityEditor:
 
             deadline = time.time() + timeout
             poll_i = 0  # ✅ reset per add attempt
+            t_row_poll = time.monotonic()
 
             # Poll until body row count increases
             while time.time() < deadline:
@@ -3790,6 +4262,7 @@ class ActivityEditor:
                     continue
 
                 last_seen_rows = new_rows
+                poll_i += 1
                 # ✅ log first poll + every 10th poll
                 if poll_i == 1 or poll_i % 10 == 0:
                     self.session.emit_diag(
@@ -3811,6 +4284,19 @@ class ActivityEditor:
                     **ctx,
                 )
                 break
+
+            _emit_resize_timing(
+                "table_row_poll",
+                t_row_poll,
+                target=target_rows,
+                polls=poll_i,
+                reached=current_rows >= target_rows,
+            )
+            _emit_resize_timing(
+                "table_row_iter_total",
+                t_row_iter,
+                target=target_rows,
+            )
 
         # Final measure (fresh)
         try:
@@ -3848,7 +4334,7 @@ class ActivityEditor:
 
         return cells[cell_index]
 
-    def _set_table_column_headers(self, field_el, column_headers: list[str]) -> None:
+    def _set_table_column_headers(self, field_el, column_headers: list[str]) -> bool:
         """
         Set the column headers using the first body row as the header row.
 
@@ -3860,6 +4346,19 @@ class ActivityEditor:
         selectors = config.BUILDER_SELECTORS["table"]
         max_attempts = 3
         ctx = self._editor_ctx(kind="table_headers")
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
+
+        def _find_all_fast(root, selector: str):
+            try:
+                driver.implicitly_wait(0)
+                return root.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                return []
+            finally:
+                try:
+                    driver.implicitly_wait(restore_wait)
+                except Exception:
+                    pass
 
         header_row_index = 0  # first body row acts as header row
         self.session.emit_diag(
@@ -3867,6 +4366,7 @@ class ActivityEditor:
             f"Setting {len(column_headers)} column header(s) on first body row.",
             **ctx,
         )
+        stage_ok = True
 
         # 0) Mark row 0 as heading (best effort, but do it once)
         try:
@@ -3888,10 +4388,10 @@ class ActivityEditor:
 
         def _get_header_row_tds():
             table_root = self._get_dynamic_table_root(field_el)
-            rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+            rows = _find_all_fast(table_root, selectors["body_rows"])
             if len(rows) <= header_row_index:
                 return None
-            return rows[header_row_index].find_elements(By.CSS_SELECTOR, "td")
+            return _find_all_fast(rows[header_row_index], "td")
 
         # 1) Wait until the header row exists and has at least *some* cells.
         #    We do a small baseline wait here, then we derive exact expectations below.
@@ -3914,7 +4414,7 @@ class ActivityEditor:
                 level="warning",
                 **ctx,
             )
-            return
+            return False
 
         # If DOM has one extra cell, assume it's a non-editable leading cell.
         # Example: len(tds)=5 but headers=4 -> dom_offset=1, write into td[1..4]
@@ -3930,7 +4430,7 @@ class ActivityEditor:
         )
 
         # 3) For each header cell: stabilise UI + re-find td + write (bounded time)
-        PER_HEADER_DEADLINE_S = 6.0
+        PER_HEADER_DEADLINE_S = float(getattr(config, "TABLE_HEADER_DEADLINE_S", 6.0))
 
         for offset, header_text in enumerate(column_headers):
             target_td_index = offset + dom_offset
@@ -3966,14 +4466,16 @@ class ActivityEditor:
 
                     # Preferred: locate the dynamic cell container inside this td
                     # and use your unified cell writer (which now includes contenteditable fallback).
-                    cell = None
-                    try:
-                        cell = td.find_element(By.CSS_SELECTOR, selectors["body_cells"])
-                    except NoSuchElementException:
-                        # Some DOMs may not nest the div; fall back to td itself.
-                        cell = td
+                    cells = _find_all_fast(td, selectors["body_cells"])
+                    # Some DOMs may not nest the div; fall back to td itself.
+                    cell = cells[0] if cells else td
 
-                    ok = self._set_table_cell_text(cell, header_text, retries=3)
+                    ok = self._set_table_cell_text(
+                        cell,
+                        header_text,
+                        retries=3,
+                        allow_column_level_fallback=True,
+                    )
                     if ok:
                         self.session.emit_diag(
                             Cat.TABLE,
@@ -4005,6 +4507,7 @@ class ActivityEditor:
                     time.sleep(0.15)
 
             if not success:
+                stage_ok = False
                 self.session.emit_signal(
                     Cat.TABLE,
                     f"Could not set column header {header_text!r} (td_index={target_td_index} dom_offset={dom_offset}).",
@@ -4025,8 +4528,9 @@ class ActivityEditor:
                         "value": header_text,
                     },
                 )
+        return stage_ok
 
-    def _set_table_row_labels(self, field_el, row_labels: list[str]) -> None:
+    def _set_table_row_labels(self, field_el, row_labels: list[str]) -> bool:
         """
         Set row labels in the first *data* column of body rows.
 
@@ -4038,6 +4542,20 @@ class ActivityEditor:
         """
         selectors = config.BUILDER_SELECTORS["table"]
         ctx = self._editor_ctx(kind="table_row_labels")
+        driver = self.driver
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
+
+        def _find_all_fast(root, selector: str):
+            try:
+                driver.implicitly_wait(0)
+                return root.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                return []
+            finally:
+                try:
+                    driver.implicitly_wait(restore_wait)
+                except Exception:
+                    pass
 
         # Best effort: make row-label column "heading" type
         try:
@@ -4055,6 +4573,7 @@ class ActivityEditor:
             f"Setting {len(row_labels)} row labels via dynamic table cells.",
             **ctx,
         )
+        stage_ok = True
 
         for offset, label in enumerate(row_labels):
             label_text = label or ""
@@ -4066,7 +4585,7 @@ class ActivityEditor:
             for attempt in range(1, max_attempts + 1):
                 try:
                     table_root = self._get_dynamic_table_root(field_el)
-                    body_rows = table_root.find_elements(By.CSS_SELECTOR, selectors["body_rows"])
+                    body_rows = _find_all_fast(table_root, selectors["body_rows"])
                     if not body_rows:
                         self.session.emit_signal(
                             Cat.TABLE,
@@ -4074,7 +4593,7 @@ class ActivityEditor:
                             level="warning",
                             **ctx,
                         )
-                        return
+                        return False
 
                     if target_row_index >= len(body_rows):
                         self.session.emit_diag(
@@ -4082,10 +4601,10 @@ class ActivityEditor:
                             f"Skipping row label {label_text!r}: no body row at index {target_row_index} (rows={len(body_rows)}).",
                             **ctx,
                         )
-                        return  # nothing further to do
+                        return False  # table shape did not match requested labels
 
                     row = body_rows[target_row_index]
-                    cells = row.find_elements(By.CSS_SELECTOR, "th, td")
+                    cells = _find_all_fast(row, "th, td")
 
                     # Need at least control + first data column
                     if len(cells) < 2:
@@ -4099,6 +4618,7 @@ class ActivityEditor:
                     data_cell = cells[1]  # first data column
                     ok = self._set_table_cell_text(data_cell, label, retries=3)
                     if not ok:
+                        stage_ok = False
                         self.session.emit_signal(
                             Cat.TABLE,
                             f"Could not set row label {label!r} at cell_index={target_row_index} (no editable control).",
@@ -4153,6 +4673,7 @@ class ActivityEditor:
                         level="warning",
                         **ctx,
                     )
+                    stage_ok = False
                     break
 
                 except Exception as e:
@@ -4165,12 +4686,21 @@ class ActivityEditor:
                         level="warning",
                         **ctx,
                     )
+                    stage_ok = False
                     if attempt < max_attempts:
                         time.sleep(0.15)
                         continue
                     break
+        return stage_ok
 
-    def _set_table_cell_text(self, cell, text: str, *, retries: int = 2) -> bool:
+    def _set_table_cell_text(
+        self,
+        cell,
+        text: str,
+        *,
+        retries: int = 2,
+        allow_column_level_fallback: bool = False,
+    ) -> bool:
         """
         Set the text for a single dynamic table cell (Turbo/Stimulus-safe).
 
@@ -4178,6 +4708,7 @@ class ActivityEditor:
         1) textarea[name='cell_title'] OR input[name='cell_title']
         2) [contenteditable='true'] within the cell
         3) label-like nodes (.field__editable-label / .designer__field__editable-label ...)
+        4) optional table-level fallback (headers only)
 
         Stale handling:
         - If the *cell reference* goes stale mid-attempt, we can't "refresh" it here.
@@ -4186,12 +4717,90 @@ class ActivityEditor:
         """
         driver = self.session.driver
         ctx = self._editor_ctx(kind="table_cell")
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
+        expected = " ".join((text or "").split())
+
+        def _find_all_fast(root, selector: str):
+            try:
+                driver.implicitly_wait(0)
+                return root.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                return []
+            finally:
+                try:
+                    driver.implicitly_wait(restore_wait)
+                except Exception:
+                    pass
+
+        def _find_one_fast(root, by, selector):
+            try:
+                driver.implicitly_wait(0)
+                return root.find_element(by, selector)
+            except Exception:
+                return None
+            finally:
+                try:
+                    driver.implicitly_wait(restore_wait)
+                except Exception:
+                    pass
 
         def _dismiss_overlays_best_effort():
             try:
                 driver.switch_to.active_element.send_keys("\u001b")  # ESC
             except Exception:
                 pass
+
+        def _norm(s: str | None) -> str:
+            return " ".join((s or "").split())
+
+        def _exc_summary(exc: Exception) -> str:
+            raw = getattr(exc, "msg", None) or str(exc)
+            return (raw.splitlines()[0] if raw else "").strip()
+
+        def _read_value(el) -> str:
+            try:
+                tag = (el.tag_name or "").lower()
+            except Exception:
+                tag = ""
+            try:
+                if tag in {"input", "textarea"}:
+                    return _norm(el.get_attribute("value") or "")
+            except Exception:
+                pass
+            try:
+                return _norm(el.get_attribute("textContent") or "")
+            except Exception:
+                return ""
+
+        def _verify_written(preferred_el=None) -> bool:
+            try:
+                if preferred_el is not None:
+                    if _read_value(preferred_el) == expected:
+                        return True
+            except Exception:
+                pass
+
+            selectors_to_check = (
+                "textarea[name='cell_title']",
+                "input[name='cell_title']",
+                "[contenteditable='true']",
+                ".field__editable-label",
+                ".designer__field__editable-label",
+                ".designer__field__editable-label *",
+            )
+            for sel in selectors_to_check:
+                for el in _find_all_fast(cell, sel):
+                    if _read_value(el) == expected:
+                        return True
+
+            # Last-resort check against rendered cell text.
+            try:
+                cell_text = _norm(cell.text or "")
+            except Exception:
+                cell_text = ""
+            if expected:
+                return expected in cell_text
+            return cell_text == ""
 
         def _js_set_value(el) -> bool:
             try:
@@ -4212,7 +4821,7 @@ class ActivityEditor:
             except Exception as e:
                 self.session.emit_diag(
                     Cat.TABLE,
-                    f"[table] JS value-set failed: {e}",
+                    f"[table] JS value-set failed: {_exc_summary(e)}",
                     **ctx,
                 )
                 return False
@@ -4236,7 +4845,7 @@ class ActivityEditor:
             except Exception as e:
                 self.session.emit_diag(
                     Cat.TABLE,
-                    f"[table] JS textContent-set failed: {e}",
+                    f"[table] JS textContent-set failed: {_exc_summary(e)}",
                     **ctx,
                 )
                 return False
@@ -4249,31 +4858,65 @@ class ActivityEditor:
                 # 1) Primary: textarea/input name=cell_title
                 control = None
                 for sel in ("textarea[name='cell_title']", "input[name='cell_title']"):
-                    els = cell.find_elements(By.CSS_SELECTOR, sel)
+                    els = _find_all_fast(cell, sel)
                     if els:
                         control = els[0]
                         break
 
-                if control is not None and _js_set_value(control):
+                if control is not None:
+                    if _js_set_value(control) and _verify_written(control):
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            f"[table] cell_title set via {control.tag_name} (attempt {attempt}/{retries}).",
+                            **ctx,
+                        )
+                        return True
                     self.session.emit_diag(
                         Cat.TABLE,
-                        f"[table] cell_title set via {control.tag_name} (attempt {attempt}/{retries}).",
+                        f"[table] cell_title write did not verify (attempt {attempt}/{retries}).",
                         **ctx,
                     )
-                    return True
 
                 # 2) Fallback: contenteditable within cell
-                eds = cell.find_elements(By.CSS_SELECTOR, "[contenteditable='true']")
+                eds = _find_all_fast(cell, "[contenteditable='true']")
                 if eds:
                     try:
                         driver.execute_script("arguments[0].click();", eds[0])  # wake click
                     except Exception:
                         pass
 
-                    if _js_set_textcontent(eds[0]):
+                    if _js_set_textcontent(eds[0]) and _verify_written(eds[0]):
                         self.session.emit_diag(
                             Cat.TABLE,
                             f"[table] cell set via contenteditable (attempt {attempt}/{retries}).",
+                            **ctx,
+                        )
+                        return True
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"[table] contenteditable write did not verify (attempt {attempt}/{retries}).",
+                        **ctx,
+                    )
+
+                # Give Turbo a short beat before escalating to broader fallbacks.
+                if control is None and not eds:
+                    time.sleep(0.12)
+                    for sel in ("textarea[name='cell_title']", "input[name='cell_title']"):
+                        els = _find_all_fast(cell, sel)
+                        if not els:
+                            continue
+                        if _js_set_value(els[0]) and _verify_written(els[0]):
+                            self.session.emit_diag(
+                                Cat.TABLE,
+                                f"[table] cell_title set via delayed retry ({attempt}/{retries}).",
+                                **ctx,
+                            )
+                            return True
+                    eds_retry = _find_all_fast(cell, "[contenteditable='true']")
+                    if eds_retry and _js_set_textcontent(eds_retry[0]) and _verify_written(eds_retry[0]):
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            f"[table] contenteditable set via delayed retry ({attempt}/{retries}).",
                             **ctx,
                         )
                         return True
@@ -4284,7 +4927,7 @@ class ActivityEditor:
                     ".designer__field__editable-label",
                     ".designer__field__editable-label *",
                 ):
-                    els = cell.find_elements(By.CSS_SELECTOR, sel)
+                    els = _find_all_fast(cell, sel)
                     if not els:
                         continue
 
@@ -4294,35 +4937,43 @@ class ActivityEditor:
                     except Exception:
                         pass
 
-                    if _js_set_textcontent(target):
+                    if _js_set_textcontent(target) and _verify_written(target):
                         self.session.emit_diag(
                             Cat.TABLE,
                             f"[table] cell set via '{sel}' (attempt {attempt}/{retries}).",
                             **ctx,
                         )
                         return True
+                    self.session.emit_diag(
+                        Cat.TABLE,
+                        f"[table] fallback '{sel}' write did not verify (attempt {attempt}/{retries}).",
+                        **ctx,
+                    )
 
-                # 4) Checkbox column header fallback (column-level label)
-                try:
-                    # climb to table root
-                    table = cell.find_element(By.XPATH, "ancestor::table")
-                    labels = table.find_elements(By.CSS_SELECTOR, ".field__editable-label")
-
-                    if labels:
-                        # heuristic: checkbox column header is last label
-                        target = labels[-1]
-                        driver.execute_script("arguments[0].click();", target)
-                        if _js_set_textcontent(target):
+                # 4) Optional checkbox column header fallback (column-level label)
+                if allow_column_level_fallback:
+                    try:
+                        table = _find_one_fast(cell, By.XPATH, "ancestor::table")
+                        labels = _find_all_fast(table, ".field__editable-label") if table else []
+                        if labels:
+                            target = labels[-1]
+                            driver.execute_script("arguments[0].click();", target)
+                            if _js_set_textcontent(target) and _verify_written(target):
+                                self.session.emit_diag(
+                                    Cat.TABLE,
+                                    "[table] cell set via column-level editable-label.",
+                                    **ctx,
+                                )
+                                return True
                             self.session.emit_diag(
                                 Cat.TABLE,
-                                "[table] cell set via column-level editable-label.",
+                                f"[table] column-level fallback did not verify (attempt {attempt}/{retries}).",
                                 **ctx,
                             )
-                            return True
-                except StaleElementReferenceException:
-                    continue
-                except Exception:
-                    pass
+                    except StaleElementReferenceException:
+                        continue
+                    except Exception:
+                        pass
 
             except StaleElementReferenceException:
                 self.session.emit_diag(

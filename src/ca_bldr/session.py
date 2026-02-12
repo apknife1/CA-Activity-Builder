@@ -877,6 +877,7 @@ class CASession:
     ) -> UIProbeSnapshot:
         self.counters.inc("ui_probe_calls")
         driver = self.driver
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
 
         out: UIProbeSnapshot = {
             "label": label,
@@ -892,94 +893,101 @@ class CASession:
             "froala_tooltips": None,
             "field_class": None,
         }
-
-        # --- infer expected from field_el (best effort) ---
         try:
-            if field_el is not None:
-                if out["expected"]["title"] is None:
+            driver.implicitly_wait(0)
+
+            # --- infer expected from field_el (best effort) ---
+            try:
+                if field_el is not None:
+                    if out["expected"]["title"] is None:
+                        try:
+                            t = field_el.find_element(By.CSS_SELECTOR, "h2.field__editable-label").text
+                            out["expected"]["title"] = (t or "").strip() or None
+                        except Exception:
+                            pass
+
+                    if out["expected"]["field_id"] is None:
+                        try:
+                            any_id = driver.execute_script(
+                                """
+                                const root = arguments[0];
+                                if (!root) return "";
+                                const node = root.querySelector("[id*='--']");
+                                return node ? (node.id || "") : "";
+                                """,
+                                field_el,
+                            ) or ""
+                            m = re.search(r"--(\d+)$", any_id)
+                            if m:
+                                out["expected"]["field_id"] = m.group(1)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # --- active element summary ---
+            try:
+                ae = driver.switch_to.active_element
+                if ae is not None:
+                    out["active_element"] = (ae.get_attribute("outerHTML") or "")[:220]
+            except Exception:
+                out["active_element"] = None
+
+            # --- field-settings sidebar tab visible? ---
+            try:
+                tabs = driver.find_elements(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='field-settings']")
+                out["field_settings_tab"] = {
+                    "present": len(tabs),
+                    "displayed": bool(tabs and tabs[0].is_displayed()),
+                }
+            except Exception:
+                out["field_settings_tab"] = {"present": None, "displayed": None}
+
+            # --- field settings frame + observed field id ---
+            try:
+                frames = driver.find_elements(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
+                frame_info: FieldSettingsFrameInfo = {"present": len(frames), "controls": None}
+
+                if frames:
+                    frame = frames[0]
                     try:
-                        t = field_el.find_element(By.CSS_SELECTOR, "h2.field__editable-label").text
-                        out["expected"]["title"] = (t or "").strip() or None
-                    except Exception:
-                        pass
+                        controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
+                        frame_info["controls"] = len(controls)
+                    except:
+                        frame_info["controls"] = None
 
-                if out["expected"]["field_id"] is None:
-                    try:
-                        any_id = driver.execute_script(
-                            """
-                            const root = arguments[0];
-                            if (!root) return "";
-                            const node = root.querySelector("[id*='--']");
-                            return node ? (node.id || "") : "";
-                            """,
-                            field_el,
-                        ) or ""
-                        m = re.search(r"--(\d+)$", any_id)
-                        if m:
-                            out["expected"]["field_id"] = m.group(1)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    html = frame.get_attribute("innerHTML") or ""
+                    m = re.search(r"/fields/(\d+)\.turbo_stream", html)
+                    out["observed_field_id"] = m.group(1) if m else None
 
-        # --- active element summary ---
-        try:
-            ae = driver.switch_to.active_element
-            if ae is not None:
-                out["active_element"] = (ae.get_attribute("outerHTML") or "")[:220]
-        except Exception:
-            out["active_element"] = None
+                    if include_frame_html_snippet:
+                        frame_info["html_snippet"] = html[:frame_html_snippet_len]
 
-        # --- field-settings sidebar tab visible? ---
-        try:
-            tabs = driver.find_elements(By.CSS_SELECTOR, ".designer__sidebar__tab[data-type='field-settings']")
-            out["field_settings_tab"] = {
-                "present": len(tabs),
-                "displayed": bool(tabs and tabs[0].is_displayed()),
-            }
-        except Exception:
-            out["field_settings_tab"] = {"present": None, "displayed": None}
+                out["field_settings_frame"] = frame_info
+            except Exception:
+                out["field_settings_frame"] = {"present": None, "controls": None}
+                out["observed_field_id"] = None
 
-        # --- field settings frame + observed field id ---
-        try:
-            frames = driver.find_elements(By.CSS_SELECTOR, "turbo-frame#field_settings_frame")
-            frame_info: FieldSettingsFrameInfo = {"present": len(frames), "controls": None}
+            # --- overlays hint ---
+            try:
+                tips = driver.find_elements(By.CSS_SELECTOR, ".fr-tooltip")
+                out["froala_tooltips"] = len(tips)
+            except Exception:
+                out["froala_tooltips"] = None
 
-            if frames:
-                frame = frames[0]
-                try:
-                    controls = frame.find_elements(By.CSS_SELECTOR, "input, select, textarea, button")
-                    frame_info["controls"] = len(controls)
-                except:
-                    frame_info["controls"] = None
+            # --- field root class ---
+            try:
+                if field_el is not None:
+                    out["field_class"] = (field_el.get_attribute("class") or "")[:180]
+            except Exception:
+                out["field_class"] = None
 
-                html = frame.get_attribute("innerHTML") or ""
-                m = re.search(r"/fields/(\d+)\.turbo_stream", html)
-                out["observed_field_id"] = m.group(1) if m else None
-
-                if include_frame_html_snippet:
-                    frame_info["html_snippet"] = html[:frame_html_snippet_len]
-
-            out["field_settings_frame"] = frame_info
-        except Exception:
-            out["field_settings_frame"] = {"present": None, "controls": None}
-            out["observed_field_id"] = None
-
-        # --- overlays hint ---
-        try:
-            tips = driver.find_elements(By.CSS_SELECTOR, ".fr-tooltip")
-            out["froala_tooltips"] = len(tips)
-        except Exception:
-            out["froala_tooltips"] = None
-
-        # --- field root class ---
-        try:
-            if field_el is not None:
-                out["field_class"] = (field_el.get_attribute("class") or "")[:180]
-        except Exception:
-            out["field_class"] = None
-
-        return out
+            return out
+        finally:
+            try:
+                driver.implicitly_wait(restore_wait)
+            except Exception:
+                pass
 
     def log_ui_probe(self, probe: UIProbeSnapshot, *, level: str = "info") -> None:
         """
@@ -1018,12 +1026,6 @@ class CASession:
     def _norm_title(self,s: str) -> str:
         return re.sub(r"\s+", " ", (s or "").strip()).casefold()
     
-    def find_activity_template_by_title_any_status(self, title: str) -> TemplateMatch | None:
-        m = self.find_activity_template_by_title(title, status="active")
-        if m:
-            return m
-        return self.find_activity_template_by_title(title, status="inactive")
-    
     def find_activity_template_by_title(self, title: str, status: str = "active", *, max_pages: int = 4) -> TemplateMatch | None:
         """
         Find an Activity Template by exact title match on /activity_templates.
@@ -1056,38 +1058,61 @@ class CASession:
         sel = config.TEMPLATES_SELECTORS  # or config.TEMPLATES_SELECTORS
         wait = self.wait  # WebDriverWait instance
         driver = self.driver
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
+        search_update_timeout_s = max(
+            1.0,
+            min(float(config.WAIT_TIME), float(getattr(config, "TEMPLATE_SEARCH_UPDATE_WAIT_S", 3.0))),
+        )
+
+        def _find_rows_fast():
+            """
+            Probe result rows without paying implicit-wait penalties when the list is empty.
+            """
+            try:
+                driver.implicitly_wait(0)
+                return driver.find_elements(By.CSS_SELECTOR, sel["rows"])
+            except Exception:
+                return []
+            finally:
+                try:
+                    driver.implicitly_wait(restore_wait)
+                except Exception:
+                    pass
 
         # Sentinel: results frame present
         t_step = time.monotonic()
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
         _emit_search_step("page_sentinel_wait", t_step)
 
-        # Optional: set results per page = 100 (reduces paging overhead)
-        try:
-            t_step = time.monotonic()
-            per_page = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["per_page_select"])))
-            current = per_page.get_attribute("value") or ""
-            if current != "100":
-                Select(per_page).select_by_value("100")
-                self.counters.inc("templates.per_page_set")
-            else:
-                self.counters.inc("templates.per_page_already")
-            _emit_search_step("per_page_select", t_step, current=current, target="100")
-            # Changing items triggers a turbo stream update; best-effort prove by waiting for frame to be ready again
-            t_step = time.monotonic()
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
-            _emit_search_step("per_page_update_wait", t_step)
-        except Exception as e:
-            _emit_search_step("per_page_select_failed", t_step, exc=type(e).__name__)
-            self.emit_diag(
-                Cat.NAV,
-                f"Could not set results per page (continuing): {e}",
-                **ctx,
-            )
+        # Optional: set results per page = 100 (disabled by default for exact-title lookups)
+        if getattr(config, "TEMPLATE_SEARCH_SET_PER_PAGE_100", False):
+            try:
+                t_step = time.monotonic()
+                per_page = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["per_page_select"])))
+                current = per_page.get_attribute("value") or ""
+                if current != "100":
+                    Select(per_page).select_by_value("100")
+                    self.counters.inc("templates.per_page_set")
+                else:
+                    self.counters.inc("templates.per_page_already")
+                _emit_search_step("per_page_select", t_step, current=current, target="100")
+                # Changing items triggers a turbo stream update; best-effort prove by waiting for frame to be ready again
+                t_step = time.monotonic()
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
+                _emit_search_step("per_page_update_wait", t_step)
+            except Exception as e:
+                _emit_search_step("per_page_select_failed", t_step, exc=type(e).__name__)
+                self.emit_diag(
+                    Cat.NAV,
+                    f"Could not set results per page (continuing): {e}",
+                    **ctx,
+                )
+        else:
+            _emit_search_step("per_page_select_skipped", time.monotonic())
 
         # Grab a "before" element to prove update after typing
         before_first_row = None
-        rows = driver.find_elements(By.CSS_SELECTOR, sel["rows"])
+        rows = _find_rows_fast()
         if rows:
             before_first_row = rows[0]
 
@@ -1102,12 +1127,18 @@ class CASession:
         if before_first_row is not None:
             try:
                 t_step = time.monotonic()
-                WebDriverWait(driver, 6).until(EC.staleness_of(before_first_row))
-                _emit_search_step("search_update_wait", t_step, mode="staleness")
+                WebDriverWait(driver, search_update_timeout_s).until(EC.staleness_of(before_first_row))
+                _emit_search_step("search_update_wait", t_step, mode="staleness", timeout_s=search_update_timeout_s)
             except Exception:
                 # If staleness didn't happen (sometimes it reuses nodes), we still proceed,
                 # but we avoid long waits; we'll scan what is present now.
-                _emit_search_step("search_update_wait", t_step, mode="staleness", ok=False)
+                _emit_search_step(
+                    "search_update_wait",
+                    t_step,
+                    mode="staleness",
+                    ok=False,
+                    timeout_s=search_update_timeout_s,
+                )
                 pass
         else:
             # No rows beforehand; just wait for either rows to appear or some stable frame presence
@@ -1115,9 +1146,10 @@ class CASession:
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel["page_sentinel"])))
             _emit_search_step("search_update_wait", t_step, mode="sentinel")
 
-        def scan_current_page(label: str) -> TemplateMatch | None:
+        def scan_current_page(label: str, rows_override=None) -> TemplateMatch | None:
             t_scan = time.monotonic()
-            rows = driver.find_elements(By.CSS_SELECTOR, sel["rows"])
+            rows = rows_override if rows_override is not None else _find_rows_fast()
+            row_count = len(rows)
             for r in rows:
                 try:
                     title_a = r.find_element(By.CSS_SELECTOR, sel["row_title_link"])
@@ -1148,15 +1180,20 @@ class CASession:
                         template_id=template_id,
                         status=status,
                     )
-                    _emit_search_step(f"scan_{label}", t_scan, rows=len(rows), match=True)
+                    _emit_search_step(f"scan_{label}", t_scan, rows=row_count, match=True)
                     return match
                 except Exception:
                     continue
-            _emit_search_step(f"scan_{label}", t_scan, rows=len(rows), match=False)
+            _emit_search_step(f"scan_{label}", t_scan, rows=row_count, match=False)
             return None
 
         # First scan (usually sufficient because search filters globally)
-        match = scan_current_page("page_1")
+        current_rows = _find_rows_fast()
+        if (not current_rows) or (len(current_rows) == 0):
+            _emit_search_step("scan_page_1_empty_short_circuit", time.monotonic())
+            return None
+
+        match = scan_current_page("page_1", rows_override=current_rows)
         if match:
             return match
 
@@ -1169,17 +1206,21 @@ class CASession:
                 break
 
             # Prove update by staleness of a row (or the button itself)
-            rows = driver.find_elements(By.CSS_SELECTOR, sel["rows"])
+            rows = _find_rows_fast()
             before = rows[0] if rows else next_btn
 
             t_step = time.monotonic()
             self.click_element_safely(next_btn)  # your safe click
 
             try:
-                WebDriverWait(driver, 6).until(EC.staleness_of(before))
+                WebDriverWait(driver, search_update_timeout_s).until(EC.staleness_of(before))
             except Exception:
                 pass
-            _emit_search_step(f"paginate_wait_page_{page_idx}", t_step)
+            _emit_search_step(
+                f"paginate_wait_page_{page_idx}",
+                t_step,
+                timeout_s=search_update_timeout_s,
+            )
 
             match = scan_current_page(f"page_{page_idx}")
             if match:
@@ -1192,20 +1233,25 @@ class CASession:
         Locate the right-arrow pagination button in the table footer.
         Uses the icon reference '#arrow-right' which is stable in your HTML.
         """
+        restore_wait = float(getattr(config, "IMPLICIT_WAIT", 3))
         try:
-            return driver.find_element(
-                By.CSS_SELECTOR,
-                ".table__footer a.btn--icon svg use[xlink\\:href='/icons.svg#arrow-right']"
-            )
-        except Exception:
-            pass
+            driver.implicitly_wait(0)
+            try:
+                return driver.find_element(
+                    By.CSS_SELECTOR,
+                    ".table__footer a.btn--icon svg use[xlink\\:href='/icons.svg#arrow-right']"
+                )
+            except Exception:
+                pass
 
-        # More robust: find the <a> that *contains* the arrow-right use element
-        try:
-            use_el = driver.find_element(By.CSS_SELECTOR, ".table__footer use[xlink\\:href='/icons.svg#arrow-right']")
-            return use_el.find_element(By.XPATH, "./ancestor::a[1]")
-        except Exception:
-            return None
+            # More robust: find the <a> that *contains* the arrow-right use element
+            try:
+                use_el = driver.find_element(By.CSS_SELECTOR, ".table__footer use[xlink\\:href='/icons.svg#arrow-right']")
+                return use_el.find_element(By.XPATH, "./ancestor::a[1]")
+            except Exception:
+                return None
+        finally:
+            driver.implicitly_wait(restore_wait)
 
     def _is_disabled(self, a_el) -> bool:
         cls = (a_el.get_attribute("class") or "")
