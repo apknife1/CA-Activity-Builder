@@ -1319,13 +1319,20 @@ class ActivityEditor:
         tries: int = 3,
     ) -> tuple[str, list[dict[str, Any]]]:
         """
-        Probe whether configured table headers/row labels are still present.
+        Probe whether configured table headers/row labels/cell_overrides are still present.
         Returns (status, mismatches) where status is one of PROBE_* constants.
         """
         expected_headers = [self._norm_text(h or "") for h in (cfg.column_headers or [])]
         expected_row_labels = [self._norm_text(r or "") for r in (cfg.row_labels or [])]
+        expected_overrides: list[tuple[int, int, str]] = []
+        for (r, c), cell_cfg in (cfg.cell_overrides or {}).items():
+            if cell_cfg is None:
+                continue
+            if cell_cfg.text is None:
+                continue
+            expected_overrides.append((r, c, self._norm_text(cell_cfg.text)))
 
-        if not expected_headers and not expected_row_labels:
+        if not expected_headers and not expected_row_labels and not expected_overrides:
             return PROBE_PRESENT, []
 
         ctx = self._editor_ctx(field_id=field_id, kind="table_probe", stage=phase)
@@ -1445,12 +1452,58 @@ class ActivityEditor:
                             }
                         )
 
+            if expected_overrides:
+                for row_idx, col_idx, expected in expected_overrides:
+                    if row_idx >= len(body_rows):
+                        mismatches.append(
+                            {
+                                "part": "cell_override",
+                                "row": row_idx,
+                                "col": col_idx,
+                                "expected": expected,
+                                "actual": "<missing-row>",
+                            }
+                        )
+                        continue
+
+                    try:
+                        cells = body_rows[row_idx].find_elements(By.CSS_SELECTOR, "th, td")
+                    except Exception:
+                        cells = []
+
+                    dom_col_idx = col_idx + 1  # control column offset
+                    if dom_col_idx >= len(cells):
+                        mismatches.append(
+                            {
+                                "part": "cell_override",
+                                "row": row_idx,
+                                "col": col_idx,
+                                "expected": expected,
+                                "actual": "<missing-cell>",
+                            }
+                        )
+                        continue
+
+                    actual = self._read_table_cell_text_for_probe(cells[dom_col_idx])
+                    actual_norm = self._norm_text(actual)
+                    if actual_norm != expected:
+                        mismatches.append(
+                            {
+                                "part": "cell_override",
+                                "row": row_idx,
+                                "col": col_idx,
+                                "expected": expected,
+                                "actual": actual_norm,
+                            }
+                        )
+
             if not mismatches:
                 self.session.emit_diag(
                     Cat.TABLE,
                     (
                         f"Table probe ({phase}): present "
-                        f"(field_id={field_id!r} attempt={attempt} headers={len(expected_headers)} rows={len(expected_row_labels)})."
+                        f"(field_id={field_id!r} attempt={attempt} headers={len(expected_headers)} "
+                        f"rows={len(expected_row_labels)} overrides={len(expected_overrides)})."
                     ),
                     **ctx,
                 )
@@ -1473,6 +1526,7 @@ class ActivityEditor:
             (
                 f"Table probe ({phase}): UNKNOWN "
                 f"(field_id={field_id!r} headers={len(expected_headers)} rows={len(expected_row_labels)} "
+                f"overrides={len(expected_overrides)} "
                 f"last_reason={last_reason!r})."
             ),
             **ctx,
@@ -1487,9 +1541,9 @@ class ActivityEditor:
     ) -> None:
         """
         Post-properties guard for interactive tables.
-        Verifies configured headers/row labels persisted; if not, re-applies once.
+        Verifies configured headers/row labels/overrides persisted; if not, re-applies once.
         """
-        if not (cfg.column_headers or cfg.row_labels):
+        if not (cfg.column_headers or cfg.row_labels or cfg.cell_overrides):
             return
 
         fid = getattr(handle, "field_id", None)
@@ -1557,6 +1611,28 @@ class ActivityEditor:
                         level="warning",
                         **ctx,
                     )
+            if cfg.cell_overrides:
+                for (r, c), cell_cfg in (cfg.cell_overrides or {}).items():
+                    try:
+                        table_root = self._get_dynamic_table_root(field_el)
+                        ok = self._apply_table_cell_override(table_root, r, c, cell_cfg)
+                        if not ok:
+                            self.session.emit_signal(
+                                Cat.TABLE,
+                                f"Table recovery: override re-apply failed at (r={r},c={c}).",
+                                level="warning",
+                                **ctx,
+                            )
+                    except Exception as e:
+                        self.session.emit_signal(
+                            Cat.TABLE,
+                            (
+                                f"Table recovery: override re-apply error at (r={r},c={c}): "
+                                f"{type(e).__name__}: {e}"
+                            ),
+                            level="warning",
+                            **ctx,
+                        )
 
         result2, mismatches2 = self._probe_table_persistence(
             field_id=fid,
@@ -1593,6 +1669,9 @@ class ActivityEditor:
                 "table_part": "post_props_verify",
                 "mismatch_count": len(mismatches2),
                 "mismatch_sample": sample,
+                # Full detail payload for manual correction workflows.
+                # Each entry includes expected/actual plus row/col/index context.
+                "mismatch_details": mismatches2,
             },
         )
 
@@ -2952,6 +3031,38 @@ class ActivityEditor:
             })
             return     
 
+        # --- marking_type (question only) ---
+        try:
+            if marking_type is not None:
+                # Apply first so question-specific visibility controls are in their
+                # final rendered state before we attempt radio writes.
+                script = """
+                    var frame = arguments[0];
+                    var value = arguments[1];
+                    var select = frame.querySelector('select[name="marking_type"]');
+                    if (!select) return false;
+                    select.value = value;
+                    var event = new Event('change', { bubbles: true });
+                    select.dispatchEvent(event);
+                    return true;
+                """
+                self.session.emit_diag(
+                    Cat.PROPS,
+                    f"Setting marking_type to '{marking_type}'...",
+                    **self._editor_ctx(field_id=fid, kind="properties"),
+                )
+                t_step = time.monotonic()
+                ok = driver.execute_script(script, frame, marking_type)
+                _emit_prop_step("props_marking_type", t_step, desired=marking_type, ok=ok)
+                if not ok:
+                    missed["marking_type"] = "select[name='marking_type'] not found or change not applied"
+        except Exception as e:
+            self.session.emit_diag(
+                Cat.PROPS,
+                f"marking_type not set/available: {e}",
+                **self._editor_ctx(field_id=fid, kind="properties"),
+            )
+
         # --- hide_in_report ---
         try:
             if hide_in_report is not None:
@@ -3076,37 +3187,6 @@ class ActivityEditor:
                 **self._editor_ctx(field_id=fid, kind="properties"),
             )
             missed["required_checkbox"] = f"exception: {type(e).__name__}: {e}"
-
-        # --- marking_type (question only) ---
-        try:
-            if marking_type is not None:
-                # This is choices.js; simplest is to set the underlying select value and fire change
-                script = """
-                    var frame = arguments[0];
-                    var value = arguments[1];
-                    var select = frame.querySelector('select[name="marking_type"]');
-                    if (!select) return false;
-                    select.value = value;
-                    var event = new Event('change', { bubbles: true });
-                    select.dispatchEvent(event);
-                    return true;
-                """
-                self.session.emit_diag(
-                    Cat.PROPS,
-                    f"Setting marking_type to '{marking_type}'...",
-                    **self._editor_ctx(field_id=fid, kind="properties"),
-                )
-                t_step = time.monotonic()
-                ok = driver.execute_script(script, frame, marking_type)
-                _emit_prop_step("props_marking_type", t_step, desired=marking_type, ok=ok)
-                if not ok:
-                    missed["marking_type"] = "select[name='marking_type'] not found or change not applied"
-        except Exception as e:
-            self.session.emit_diag(
-                Cat.PROPS,
-                f"marking_type not set/available: {e}",
-                **self._editor_ctx(field_id=fid, kind="properties"),
-            )
 
         # --- model_answer switch ---
         try:
@@ -3738,29 +3818,29 @@ class ActivityEditor:
 
                 if attempt < attempts:
                     time.sleep(sleep_s)
-                self.session.emit_signal(
-                    Cat.TABLE,
-                    f"Table stage {stage_name} giving up after {attempts} attempts.",
-                    level="warning",
-                    **ctx_stage,
-                )
-                self.session.counters.inc(f"editor.table_stage_{stage_name}_gave_up")
-                self.session.emit_diag(
-                    Cat.TABLE,
-                    f"Table stage '{stage_name}' gave up after {attempts} attempts",
-                    **ctx_stage,
-                )
-                
-                # Record a configure skip event for controller
-                self._record_config_skip(
-                    kind="configure",
-                    reason=f"table stage '{stage_name}' failed after {attempts} attempts",
-                    retryable=True,
-                    field_id=field_id,
-                    field_title=(getattr(config, "title", None) or None),  # careful: config is TableConfig here
-                    requested={"stage": stage_name},
-                )
-                
+
+            self.session.emit_signal(
+                Cat.TABLE,
+                f"Table stage {stage_name} giving up after {attempts} attempts.",
+                level="warning",
+                **ctx_stage,
+            )
+            self.session.counters.inc(f"editor.table_stage_{stage_name}_gave_up")
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"Table stage '{stage_name}' gave up after {attempts} attempts",
+                **ctx_stage,
+            )
+
+            # Record a configure skip event for controller
+            self._record_config_skip(
+                kind="configure",
+                reason=f"table stage '{stage_name}' failed after {attempts} attempts",
+                retryable=True,
+                field_id=field_id,
+                field_title=(getattr(config, "title", None) or None),  # careful: config is TableConfig here
+                requested={"stage": stage_name},
+            )
             return False
 
         # ---- 1) Dimensions ----
@@ -3807,8 +3887,8 @@ class ActivityEditor:
         # ---- 5) Per-cell overrides ----
         if config.cell_overrides:
             def _apply_overrides(fresh_field):
-                table_root = self._get_dynamic_table_root(fresh_field)
                 for (r, c), cell_cfg in (config.cell_overrides or {}).items():
+                    table_root = self._get_dynamic_table_root(fresh_field)
                     self.session.emit_diag(
                         Cat.TABLE,
                         f"Applying cell_override at (r={r},c={c}) text={cell_cfg.text!r}",
@@ -3820,6 +3900,9 @@ class ActivityEditor:
                         f"cell_override result at (r={r},c={c}): ok={ok}",
                         **self._editor_ctx(kind="table_override"),
                     )
+                    if not ok:
+                        return False
+                return True
 
             _run_stage("cell_overrides", _apply_overrides, attempts=3)
 
@@ -4700,6 +4783,7 @@ class ActivityEditor:
         *,
         retries: int = 2,
         allow_column_level_fallback: bool = False,
+        require_persistent_control: bool = False,
     ) -> bool:
         """
         Set the text for a single dynamic table cell (Turbo/Stimulus-safe).
@@ -4709,6 +4793,10 @@ class ActivityEditor:
         2) [contenteditable='true'] within the cell
         3) label-like nodes (.field__editable-label / .designer__field__editable-label ...)
         4) optional table-level fallback (headers only)
+
+        If require_persistent_control=True:
+        - only textarea/input cell_title writes are accepted as success
+        - label/contenteditable fallbacks are skipped because they can be non-persistent
 
         Stale handling:
         - If the *cell reference* goes stale mid-attempt, we can't "refresh" it here.
@@ -4850,18 +4938,64 @@ class ActivityEditor:
                 )
                 return False
 
+        def _find_persistent_control():
+            for sel in ("textarea[name='cell_title']", "input[name='cell_title']"):
+                els = _find_all_fast(cell, sel)
+                if els:
+                    return els[0]
+            return None
+
+        def _activate_cell_for_persistent_control():
+            # Best-effort activation loop; keep it gentle to avoid triggering
+            # modal/editor overlays that can hijack clicks during cell overrides.
+            for _ in range(2):
+                control = _find_persistent_control()
+                if control is not None:
+                    return control
+                _dismiss_overlays_best_effort()
+                try:
+                    driver.execute_script(
+                        """
+                        try {
+                          const ae = document.activeElement;
+                          if (ae && ae !== document.body && typeof ae.blur === 'function') {
+                            ae.blur();
+                          }
+                        } catch (e) {}
+                        """,
+                    )
+                except Exception:
+                    pass
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                        cell,
+                    )
+                except Exception:
+                    pass
+                try:
+                    target = _find_one_fast(
+                        cell,
+                        By.CSS_SELECTOR,
+                        ".field__editable-label, .designer__field__editable-label, [contenteditable='true']",
+                    ) or cell
+                    driver.execute_script("arguments[0].click();", target)
+                except Exception:
+                    pass
+                time.sleep(0.10)
+            return _find_persistent_control()
+
         for attempt in range(1, retries + 1):
             _dismiss_overlays_best_effort()
 
             # NOTE: Don't return False on stale; just retry the whole attempt.
             try:
                 # 1) Primary: textarea/input name=cell_title
-                control = None
-                for sel in ("textarea[name='cell_title']", "input[name='cell_title']"):
-                    els = _find_all_fast(cell, sel)
-                    if els:
-                        control = els[0]
-                        break
+                control = (
+                    _activate_cell_for_persistent_control()
+                    if require_persistent_control
+                    else _find_persistent_control()
+                )
 
                 if control is not None:
                     if _js_set_value(control) and _verify_written(control):
@@ -4876,6 +5010,20 @@ class ActivityEditor:
                         f"[table] cell_title write did not verify (attempt {attempt}/{retries}).",
                         **ctx,
                     )
+
+                if require_persistent_control:
+                    if control is None:
+                        self.session.emit_diag(
+                            Cat.TABLE,
+                            (
+                                f"[table] persistent cell_title control unavailable "
+                                f"(attempt {attempt}/{retries})."
+                            ),
+                            **ctx,
+                        )
+                    if attempt < retries:
+                        time.sleep(0.10)
+                    continue
 
                 # 2) Fallback: contenteditable within cell
                 eds = _find_all_fast(cell, "[contenteditable='true']")
@@ -5448,38 +5596,24 @@ class ActivityEditor:
 
         cell = cells[dom_col_idx]
 
+        text_ok = True
         if cell_cfg.text is not None:
-            # 1) Try to activate the cell first
-            try:
-                self.session.click_element_safely(cell)  # or JS click
-            except Exception:
-                try:
-                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell)
-                    self.driver.execute_script("arguments[0].click();", cell)
-                except Exception:
-                    pass
-
-            # 2) Re-query inputs after activation (important)
-            inputs = cell.find_elements(By.CSS_SELECTOR, "textarea[name='cell_title'], input[name='cell_title']")
-            if inputs:
-                try:
-                    self.session.clear_and_type(inputs[0], cell_cfg.text)
-                    return True
-                except Exception:
-                    # fall through
-                    pass
-
-            # 3) Fallback: set text via editable label (same style as row-label fallback)
-            labels = cell.find_elements(By.CSS_SELECTOR, ".field__editable-label")
-            if labels:
-                self.session.clear_and_type(labels[0], cell_cfg.text)
-                return True
+            text_ok = self._set_table_cell_text(
+                cell,
+                cell_cfg.text,
+                retries=3,
+            )
     
+        type_ok = True
         if cell_cfg.cell_type is not None:
             # TODO: similar to column_types; depends on CA's UI
-            pass
+            self.session.emit_diag(
+                Cat.TABLE,
+                f"Skipping unsupported table cell_type override {cell_cfg.cell_type!r}.",
+                **self._editor_ctx(kind="table_override"),
+            )
 
-        return False
+        return text_ok and type_ok
 
     def _wait_for_header_editors_ready(self, field_el, timeout: int = 4) -> bool:
         """
